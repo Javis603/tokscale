@@ -891,6 +891,31 @@ fn reset_credits_from_response(response: ResetCreditsResponse) -> Option<UsageRe
         })
 }
 
+/// Decide whether to issue the extra detail GET for reset credits.
+///
+/// The detail endpoint is only worth hitting when the cheap inline summary
+/// already tells us there is at least one available credit to enrich. When the
+/// summary is absent or reports zero credits we skip the call entirely: there
+/// is nothing to enrich, and firing the request on every periodic TUI refresh
+/// would roughly double backend request volume per Codex account and raise
+/// rate-limit risk.
+fn should_fetch_reset_details(summary: Option<&UsageResetCredits>) -> bool {
+    summary.is_some_and(|credits| credits.available_count > 0)
+}
+
+/// Merge the cheap summary count with an optional detail response.
+///
+/// The detail response is only allowed to *replace* the summary when it carries
+/// a concrete count (`Some`). A detail body whose `available_count` is null maps
+/// to `None`; in that case we keep the known summary count rather than silently
+/// dropping it (which would make the Reset button show nothing).
+fn merge_reset_credits(
+    summary: Option<UsageResetCredits>,
+    details: Option<UsageResetCredits>,
+) -> Option<UsageResetCredits> {
+    details.or(summary)
+}
+
 fn json_scalar_string(value: Option<serde_json::Value>) -> Option<String> {
     match value? {
         serde_json::Value::Null => None,
@@ -962,11 +987,7 @@ async fn fetch_with_auth_async(
     }
 
     let mut reset_credits = reset_credits_from_summary(resp.rate_limit_reset_credits.as_ref());
-    let should_fetch_reset_details = reset_credits
-        .as_ref()
-        .map(|credits| credits.available_count > 0)
-        .unwrap_or(true);
-    if should_fetch_reset_details {
+    if should_fetch_reset_details(reset_credits.as_ref()) {
         if let Ok(details) = fetch_reset_credits(
             &client,
             &effective_access_token,
@@ -974,7 +995,9 @@ async fn fetch_with_auth_async(
         )
         .await
         {
-            reset_credits = reset_credits_from_response(details);
+            // Only let the detail response replace the summary when it carries a
+            // concrete count; a null detail count must not drop a known summary.
+            reset_credits = merge_reset_credits(reset_credits, reset_credits_from_response(details));
         }
     }
 
@@ -1506,6 +1529,69 @@ mod tests {
         assert_eq!(response.credits.len(), 1);
         assert_eq!(response.credits[0].id.as_deref(), Some("credit_1"));
         Ok(())
+    }
+
+    #[test]
+    fn merge_reset_credits_preserves_summary_when_detail_count_is_null() {
+        // Summary reports a known non-zero count; the detail body's
+        // available_count is null (-> None). The summary count must survive so
+        // the Reset button still shows it.
+        let summary = Some(UsageResetCredits {
+            available_count: 2,
+            credits: Vec::new(),
+        });
+        let details = reset_credits_from_response(
+            parse_chatgpt_json_body(r#"{"available_count":null}"#).unwrap(),
+        );
+        assert!(details.is_none());
+
+        let merged = merge_reset_credits(summary, details);
+        assert_eq!(merged.expect("summary preserved").available_count, 2);
+    }
+
+    #[test]
+    fn merge_reset_credits_prefers_detail_when_present() {
+        let summary = Some(UsageResetCredits {
+            available_count: 2,
+            credits: Vec::new(),
+        });
+        let details = reset_credits_from_response(
+            parse_chatgpt_json_body(
+                r#"{"available_count":1,"credits":[{"id":"credit_1","status":"available"}]}"#,
+            )
+            .unwrap(),
+        );
+
+        let merged = merge_reset_credits(summary, details).expect("detail applied");
+        assert_eq!(merged.available_count, 1);
+        assert_eq!(merged.credits.len(), 1);
+        assert_eq!(merged.credits[0].id.as_deref(), Some("credit_1"));
+    }
+
+    #[test]
+    fn merge_reset_credits_returns_detail_when_summary_absent() {
+        let details = Some(UsageResetCredits {
+            available_count: 3,
+            credits: Vec::new(),
+        });
+        let merged = merge_reset_credits(None, details).expect("detail used");
+        assert_eq!(merged.available_count, 3);
+    }
+
+    #[test]
+    fn should_fetch_reset_details_only_when_summary_has_credits() {
+        // Absent summary: do NOT fire the extra round-trip on every refresh.
+        assert!(!should_fetch_reset_details(None));
+        // Summary present but zero credits: nothing to enrich, skip.
+        assert!(!should_fetch_reset_details(Some(&UsageResetCredits {
+            available_count: 0,
+            credits: Vec::new(),
+        })));
+        // Summary present with available credits: enrich via detail call.
+        assert!(should_fetch_reset_details(Some(&UsageResetCredits {
+            available_count: 1,
+            credits: Vec::new(),
+        })));
     }
 
     #[test]
