@@ -145,8 +145,10 @@ impl SourceFingerprint {
     /// until the next checkpoint rewrites the snapshot, so the source-message
     /// cache must invalidate when either file changes.
     pub(crate) fn from_jcode_path(path: &Path) -> Option<Self> {
-        let related_paths =
-            std::iter::once((".journal.jsonl".to_string(), jcode_journal_path(path)));
+        let related_paths = std::iter::once((
+            ".journal.jsonl".to_string(),
+            crate::sessions::jcode::jcode_journal_path(path),
+        ));
         Self::from_path_with_related(path, related_paths)
     }
 
@@ -207,17 +209,6 @@ impl SourceFingerprint {
             related_files,
         })
     }
-}
-
-fn jcode_journal_path(path: &Path) -> PathBuf {
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return append_path_suffix(path, ".journal.jsonl");
-    };
-    let journal_name = file_name
-        .strip_suffix(".json")
-        .map(|stem| format!("{stem}.journal.jsonl"))
-        .unwrap_or_else(|| format!("{file_name}.journal.jsonl"));
-    path.with_file_name(journal_name)
 }
 
 impl RelatedFileFingerprint {
