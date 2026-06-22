@@ -478,17 +478,32 @@ const CLUSTER_STOPWORDS: &[&str] = &[
 /// punctuation/ellipsis, collapse whitespace, drop generic verbs/stopwords.
 /// The returned tokens are deduplicated and sorted so two titles with the same
 /// significant words (in any order) produce equal sets.
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe20..=0xfe2f
+    )
+}
+
 fn significant_tokens(title: &str) -> Vec<String> {
     let mut tokens: Vec<String> = title
-        .chars()
-        // Map punctuation/ellipsis to spaces; keep alphanumerics. This also
-        // strips a trailing "…" or "..." that the on-device model often emits.
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        // Full Unicode case folding (NOT to_ascii_lowercase): the tokens
-        // themselves keep non-ASCII characters, so case-folding must cover them
-        // too — otherwise "Café"/"café" or "İ"/"i̇" produce distinct tokens.
         .to_lowercase()
+        .chars()
+        // Lowercase before filtering: Unicode lowercase can expand a character
+        // into a base letter plus combining mark (e.g. "İ" -> "i" + dot).
+        // Dropping combining marks here keeps case-only variants token-equal.
+        // Other punctuation/ellipsis maps to spaces, stripping trailing "…" or
+        // "..." that the on-device model often emits.
+        .filter_map(|c| {
+            if c.is_alphanumeric() {
+                Some(c)
+            } else if is_combining_mark(c) {
+                None
+            } else {
+                Some(' ')
+            }
+        })
+        .collect::<String>()
         .split_whitespace()
         .map(|t| t.to_string())
         .filter(|t| !CLUSTER_STOPWORDS.contains(&t.as_str()))
@@ -1366,7 +1381,7 @@ mod tests {
 
     #[test]
     fn cluster_titles_merges_near_duplicates() {
-        let entries = vec![
+        let entries = [
             titled_entry("a", "Enhance API Security"),
             titled_entry("b", "Enhance API security with JWT auth middleware"),
             titled_entry("c", "Add JWT auth middleware"),
@@ -1394,7 +1409,7 @@ mod tests {
 
     #[test]
     fn cluster_titles_keeps_unrelated_apart() {
-        let entries = vec![
+        let entries = [
             titled_entry("a", "Add JWT auth middleware"),
             titled_entry("b", "Update database migration scripts"),
             titled_entry("c", "Refactor pricing service cache"),
@@ -1415,7 +1430,7 @@ mod tests {
     fn cluster_label_prefers_most_frequent_then_shortest() {
         // Two identical long titles + one shorter variant: frequency wins, so the
         // repeated long title is the label even though a shorter one exists.
-        let entries = vec![
+        let entries = [
             titled_entry("a", "Add JWT auth middleware"),
             titled_entry("b", "Add JWT auth middleware"),
             titled_entry("c", "JWT auth"),
@@ -1514,6 +1529,11 @@ mod tests {
             significant_tokens("café münchën stratégie")
         );
         assert!(significant_tokens("Café").contains(&"café".to_string()));
+        assert_eq!(
+            significant_tokens("İstanbul API"),
+            significant_tokens("i\u{307}stanbul api")
+        );
+        assert!(significant_tokens("İstanbul").contains(&"istanbul".to_string()));
     }
 
     #[test]
