@@ -31,10 +31,6 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut pending_turn_start = false;
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
-    // File-global monotonic ordinal: every usage row across the whole session
-    // gets a unique value so distinct calls with identical token counts never
-    // collide in the dedup key.
-    let mut usage_ordinal: u64 = 0;
 
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else {
@@ -80,11 +76,15 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
         };
 
         let mut turn_start_assigned = false;
-        for usage in usages.iter() {
-            // Advance the file-global ordinal for every usage row we inspect so
-            // each row earns a unique dedup key even across `modelUsage` arrays.
-            let usage_index = usage_ordinal;
-            usage_ordinal += 1;
+        for (usage_index, usage) in usages.iter().enumerate() {
+            // The uniqueness suffix is the row's position *within this event's*
+            // `modelUsage` array, not a file-global counter. This keeps the
+            // dedup key derived from the event itself so a replayed identical
+            // event reproduces the same key (and is collapsed by the in-file
+            // `seen` set and the cross-file `should_keep_deduped_message`
+            // filter), while multiple distinct rows inside one event still get
+            // distinct indices. Genuinely-distinct LLM calls differ in their
+            // `timestampMs` (already in the key), so they stay separate.
             let Some(model_raw) = string_field(usage, "model") else {
                 continue;
             };
@@ -295,14 +295,15 @@ mod tests {
 
     #[test]
     fn distinct_usage_rows_with_identical_tokens_are_both_counted() {
-        // Two separate LLM response events with byte-for-byte identical token
-        // counts. With the old per-`modelUsage` `usage_index` (which reset to 0
-        // on every row), both produced the same dedup key and the second was
-        // dropped. The file-global ordinal must keep them distinct.
+        // Two separate LLM response events with identical token counts but
+        // distinct `timestampMs` (the realistic shape of #727: back-to-back
+        // calls returning the same usage). Both must be counted. The original
+        // #727 bug dropped the second because the per-`modelUsage` index reset
+        // to 0; here the differing timestamp keeps the keys distinct.
         let content = format!(
             "{}\n{}\n",
             usage_event(1_750_000_000_000, "gpt-5", 100, 50),
-            usage_event(1_750_000_000_000, "gpt-5", 100, 50),
+            usage_event(1_750_000_001_000, "gpt-5", 100, 50),
         );
         let messages = parse_events(&content);
 
@@ -322,9 +323,33 @@ mod tests {
     }
 
     #[test]
+    fn replayed_identical_event_is_deduplicated_to_one() {
+        // Junie can append/replay the exact same `LlmResponseMetadataEvent`.
+        // A byte-for-byte replayed event (same timestamp, model, and tokens)
+        // must collapse to a single counted row — otherwise the same tokens
+        // and cost are double-counted. The dedup suffix is derived from the
+        // event's own within-array index, so the replay reproduces the same
+        // dedup key and is dropped by the `seen` set.
+        let content = format!(
+            "{}\n{}\n",
+            usage_event(1_750_000_000_000, "gpt-5", 100, 50),
+            usage_event(1_750_000_000_000, "gpt-5", 100, 50),
+        );
+        let messages = parse_events(&content);
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "a replayed identical usage event must collapse to a single row"
+        );
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 50);
+    }
+
+    #[test]
     fn identical_rows_within_one_event_are_both_counted() {
         // Multiple identical rows inside a single `modelUsage` array must also
-        // each survive thanks to the file-global ordinal.
+        // each survive: they get distinct within-event indices (0 and 1).
         let content = "{\"timestampMs\":1750000000000,\"event\":{\"agentEvent\":{\"kind\":\"LlmResponseMetadataEvent\",\"modelUsage\":[{\"model\":\"gpt-5\",\"inputTokens\":100,\"outputTokens\":50},{\"model\":\"gpt-5\",\"inputTokens\":100,\"outputTokens\":50}]}}}\n";
         let messages = parse_events(content);
         assert_eq!(messages.len(), 2);
