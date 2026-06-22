@@ -119,6 +119,7 @@
   - [Trae 命令](#trae-命令)
   - [Warp/Oz 命令](#warpoz-命令)
   - [任务归因报告](#任务归因报告)
+  - [订阅使用量](#订阅使用量)
   - [示例输出](#示例输出--light-版本)
   - [配置](#配置)
   - [环境变量](#环境变量)
@@ -338,7 +339,7 @@ tokscale --client opencode,claude --week --json
 
 可用值：`opencode`、`claude`、`codex`、`copilot`、`gemini`、`cursor`、`amp`、`codebuff`、`droid`、`openclaw`、`hermes`、`pi`、`kimi`、`qwen`、`roocode`、`kilocode`、`kilo`、`mux`、`crush`、`goose`、`antigravity`、`antigravity-cli`、`zed`、`kiro`、`trae`、`warp`、`cline`、`gjc`、`grok`、`jcode`、`micode`、`commandcode`、`junie`、`synthetic`。
 
-> **弃用通知**：旧的单客户端选项（`--opencode`、`--claude`、`--codex` 等）出于向后兼容仍然可用，但已从 `--help` 中隐藏，将在下一个主要版本中移除。请尽量迁移到 `--client`。在交互式终端中使用旧选项时会输出一行警告。
+> **破坏性变更（v3.2.0）**：单客户端布尔选项（`--opencode`、`--claude`、`--codex` 等）已被移除，现在会直接报错。请改用规范的 `--client`/`-c` 选项——例如 `tokscale --client opencode,claude`。
 
 ### 日期筛选
 
@@ -618,6 +619,87 @@ tokscale report --workspace my-project --client opencode
     Implement JWT refresh flow
 ```
 
+### 订阅使用量
+
+Tokscale 可以获取并显示您在各 AI 提供商上的实时订阅配额。它会显示您已使用了多少套餐额度，以及限额何时重置。
+
+```bash
+# 显示所有已检测到提供商的订阅使用量
+tokscale usage
+
+# 以 JSON 输出（用于脚本）
+tokscale usage --json
+
+# 轻量终端输出（无 TUI）
+tokscale usage --light
+```
+
+在 TUI 中，切换到 **Usage** 标签即可查看订阅数据。使用 `[Refresh]` 刷新订阅配额。键盘刷新快捷键 `r` 使用相同的刷新路径。
+
+> **注意**：订阅配额和余额均为**供应商上报**——tokscale 调用每个提供商自己的配额端点，并原样呈现其返回结果。这些数字反映的是提供商上报的值（也就是其官方仪表板上显示的值），并未与 tokscale 自身的使用量跟踪进行独立核对。
+
+#### 支持的提供商
+
+| 提供商 | 认证方式 | 指标 | 设置 |
+|----------|-------------|---------|-------|
+| **Claude** | OAuth（凭据文件或 macOS 钥匙串） | Session（5 小时）、Weekly、Opus 配额 | 运行 `claude` 登录 |
+| **Codex**（OpenAI） | OAuth（`~/.config/codex/auth.json`、`~/.codex/auth.json`，或已保存的 Tokscale 账号） | Session、Weekly 配额 | 在 TUI Usage 标签中使用 `[Add Codex]`，运行 `codex` 登录，或用 `tokscale codex import --name work` 导入现有认证 |
+| **Z.ai** | API key（环境变量） | Token 限额、Web Searches | 设置 `ZAI_API_KEY` 或 `GLM_API_KEY` |
+| **Amp** | API key（`~/.local/share/amp/secrets.json`） | 免费额度余额、Credits | 运行 `amp` 登录 |
+| **GitHub Copilot** | GitHub token（钥匙串或 `~/.config/gh/hosts.yml`） | Premium interactions、Chat 配额 | 运行 `gh auth login` |
+| **Grok Build** | OAuth（`~/.grok/auth.json`） | Credits、订阅套餐 | 运行 `grok login` |
+| **Kimi** | OAuth（`~/.kimi/credentials/kimi-code.json`） | Session、Weekly 配额 | 运行 `kimi` 登录 |
+| **MiniMax** | API key（环境变量） | 各模型的 Prompt 配额 | 设置 `MINIMAX_API_KEY` 或 `MINIMAX_API_TOKEN` |
+| **MiniMax Token Plan** | API key（环境变量） | 区间 + 每周剩余百分比配额（按区域：CN minimaxi.com + Global minimax.io） | 设置 `MINIMAX_TOKEN_PLAN_CN_KEY` 和/或 `MINIMAX_TOKEN_PLAN_GLOBAL_KEY` |
+
+提供商会被自动检测——仅显示具有有效凭据的提供商。如果缺少某个提供商，请确认您已登录或设置了所需的环境变量。
+
+#### Codex 多账号使用量
+
+Tokscale 可以保存多个 Codex OAuth 账号用于订阅使用量显示。TUI Usage 标签会将已保存的账号归并到一个 **Codex** 区块下。活动账号以 `*` 标记；非活动账号可通过 `[Use]` 选中；移除账号使用 `[Remove]` 后接 `[Confirm]`。
+
+要在不离开 TUI 的情况下添加账号，请在 Usage 标签中点击 `[Add Codex]`。Tokscale 会用一个临时的 `CODEX_HOME` 启动 `codex login`，在 Usage 标签中显示登录输出，将生成的认证导入 Tokscale 的账号存储，然后刷新使用量。这样可保持登录隔离，且不会切换当前的 Codex 认证；当您希望 Tokscale 将某个已保存账号写入真正的 Codex 认证文件时，点击该账号上的 `[Use]`。
+
+CLI 命令仍然可用于脚本化或手动的账号管理：
+
+```bash
+# 将当前 Codex 认证保存为命名的 Tokscale 账号
+tokscale codex import --name work
+
+# 列出已保存的 Codex 账号
+tokscale codex accounts
+tokscale codex accounts --json
+
+# 切换活动 Codex 账号并写入 Codex auth.json
+tokscale codex switch work
+
+# 停止跟踪某个已保存的 Codex 账号（仅从 Tokscale 的存储中移除——
+# codex CLI 自身的 auth.json/登录状态永远不会被改动）
+tokscale codex remove personal
+
+# 检查活动账号或指定账号的订阅使用量
+tokscale codex status
+tokscale codex status --name personal --json
+```
+
+当存在已保存的 Codex 账号时，`tokscale usage --json` 会为每个 Codex 条目包含结构化的账号元数据，TUI 会将这些条目显示在一个 Codex 分组下。若无已保存的账号，Tokscale 会回退到当前的 Codex 认证发现路径（`CODEX_HOME/auth.json`、`~/.config/codex/auth.json`、`~/.codex/auth.json`，然后是 macOS 钥匙串）。
+
+#### 示例输出
+
+```
+╭──────────────────────────────────────────────────────────╮
+│ Session    85% left  [=========---] resets in 2h 15m     │
+│ Weekly     72% left  [========----] resets Fri 3pm       │
+│ Plan     Max 20x                                         │
+╰──────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Session    40% left  [=====-------] resets in 4h 30m     │
+│ Weekly     90% left  [==========--] resets Mon 12am      │
+│ Account  user@example.com                                │
+│ Plan     Pro                                             │
+╰──────────────────────────────────────────────────────────╯
+```
+
 ### 示例输出（`--light` 版本）
 
 <img alt="CLI Light" src="./.github/assets/cli-light.png" />
@@ -679,6 +761,7 @@ Minutely 标签按分钟显示 Token 使用情况，最适合用于诊断突发�
 |----------|---------|-------------|
 | `TOKSCALE_NATIVE_TIMEOUT_MS` | `300000`（5 分钟） | 覆盖 `nativeTimeoutMs` 配置 |
 | `TOKSCALE_CONFIG_DIR` | unset | 覆盖配置目录根（`settings.json`、`star-cache.json`、`cache/`、`antigravity-cache/`、`trae-cache/` 的存放位置）。建议使用绝对路径；相对路径将基于进程 CWD 解析。适用于 CI 沙箱或固定到非默认位置。设置后，tokscale 不会回退到 macOS 旧路径（`~/Library/Application Support/tokscale/`）。 |
+| `TOKSCALE_FM_DEBUG` | unset | 设置后，会将 Apple Foundation Models 的诊断信息（macOS 版本门槛、dlopen dylib 路径、加载/符号错误）打印到 stderr，以说明本机端 apple-fm 为何启用或未启用。 |
 
 ```bash
 # 示例：为非常大的数据集增加超时时间
@@ -761,7 +844,7 @@ tokscale sources --json
 - **交互式提示**：悬停查看详细的每日分解
 - **每日分解面板**：点击查看每个来源和模型的详情
 - **年份筛选**：在年份之间导航
-- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Command Code、Synthetic）
+- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Command Code、Junie、Synthetic）
 - **统计面板**：总成本、Token、活跃天数、连续记录
 - **FOUC 防护**：在 React 水合前应用主题（无闪烁）
 
@@ -1074,6 +1157,7 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Antigravity | `~/.config/tokscale/antigravity-cache/sessions/` | — | `tokscale antigravity sync` 目前仅支持 macOS / Linux |
 | Trae | `~/.config/tokscale/trae-cache/sessions/` | `%APPDATA%\tokscale\trae-cache\sessions\` | 通过 `tokscale trae sync` 同步一次；凭据会从已安装的任意 Trae IDE 或 Trae Solo 桌面端自动发现 |
 | Grok Build | `~/.grok/sessions/` | `%USERPROFILE%\.grok\sessions\` | 可通过 `GROK_HOME` 环境变量配置；解析 `updates.jsonl` 会话更新 |
+| Jcode | `~/.jcode/sessions/` | `%USERPROFILE%\.jcode\sessions\` | 可通过 `JCODE_HOME` 环境变量配置；解析 `session_*.json` 快照以及 `session_*.journal.jsonl` sidecar |
 | MiMo Code | `~/.local/share/micode/` | `%USERPROFILE%\.local\share\micode\` | 使用 XDG 数据目录；SQLite 数据库 `mimocode.db` |
 | Gajae-Code | `~/.gjc/agent/sessions/` | `%USERPROFILE%\.gjc\agent\sessions\` | 可通过 `GJC_CODING_AGENT_DIR`（也可用 `GJC_CONFIG_DIR`/`PI_CONFIG_DIR`；Linux/macOS 上 `$XDG_DATA_HOME/gjc/sessions/` 亦支持）配置 |
 | Junie | `~/.junie/sessions/` | `%USERPROFILE%\.junie\sessions\` | 所有平台使用相同的 home 相对路径；解析 `events.jsonl` 使用事件 |
@@ -1275,6 +1359,12 @@ Trae 数据不会被根命令自动获取。先运行一次 `tokscale trae login
 位置：`$GROK_HOME/sessions/*/*/updates.jsonl`（回退：`~/.grok/sessions/*/*/updates.jsonl`）
 
 Grok Build 数据直接从本地会话更新解析。当前日志只公开累积 `totalTokens` 计数器，没有稳定的 input/output 拆分，因此 Tokscale 将每个 turn 的正向增量记录为 input token。`grok-composer-2.5-fast` 会临时映射到 Composer 2.5 Fast 价格 override，直到专用公开价格可用。
+
+### Jcode
+
+位置：`$JCODE_HOME/sessions/session_*.json`（回退：`~/.jcode/sessions/session_*.json`）以及匹配的 `session_*.journal.jsonl` sidecar。
+
+Jcode 数据直接从本地会话快照解析。Tokscale 读取助手消息的 `messages[].token_usage` 字段（`input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` 和 `reasoning_output_tokens`），不会伪造其他客户端的身份。匹配的 journal sidecar 会在去重前合并进同一会话流，因此在 Jcode 将其检查点写入快照之前，最近追加的消息也会被包含进来。去重使用稳定的消息 ID 进行重放去重；缺少 ID 的畸形/自定义记录则使用作用域内的回退 key。
 
 ### OpenClaw
 

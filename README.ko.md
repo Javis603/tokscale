@@ -119,6 +119,7 @@ AI 지원 개발 시대에 **토큰은 새로운 에너지**입니다. 토큰은
   - [Trae 명령어](#trae-명령어)
   - [Warp/Oz 명령어](#warpoz-명령어)
   - [작업 기반 리포트](#작업-기반-리포트)
+  - [구독 사용량](#구독-사용량)
   - [예시 출력](#예시-출력---light-버전)
   - [설정](#설정)
   - [환경 변수](#환경-변수)
@@ -337,7 +338,7 @@ tokscale --client opencode,claude --week --json
 
 가능한 값: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `commandcode`, `junie`, `synthetic`.
 
-> **Deprecation 안내**: 기존 단일 클라이언트 플래그 (`--opencode`, `--claude`, `--codex` 등)는 하위 호환성을 위해 여전히 동작하지만 `--help`에서 숨겨졌으며 다음 메이저 릴리스에서 제거됩니다. 가능한 한 `--client`로 마이그레이션하세요. 인터랙티브 터미널에서 레거시 플래그를 사용하면 한 줄 경고가 출력됩니다.
+> **Breaking change (v3.2.0):** 클라이언트별 boolean 플래그(`--opencode`, `--claude`, `--codex` 등)는 제거되었으며 이제 오류를 발생시킵니다. 대신 정식 `--client`/`-c` 플래그를 사용하세요 — 예: `tokscale --client opencode,claude`.
 
 ### 날짜 필터링
 
@@ -614,6 +615,87 @@ tokscale report --workspace my-project --client opencode
     Implement JWT refresh flow
 ```
 
+### 구독 사용량
+
+Tokscale은 여러 AI 프로바이더에 걸친 실시간 구독 할당량을 가져와 표시할 수 있습니다. 이를 통해 플랜을 얼마나 사용했는지와 한도가 언제 초기화되는지 확인할 수 있습니다.
+
+```bash
+# 감지된 모든 프로바이더의 구독 사용량 표시
+tokscale usage
+
+# JSON으로 출력 (스크립팅용)
+tokscale usage --json
+
+# 가벼운 터미널 출력 (TUI 없음)
+tokscale usage --light
+```
+
+TUI에서는 **Usage** 탭으로 이동해 구독 데이터를 확인하세요. `[Refresh]`로 구독 할당량을 새로고침할 수 있습니다. 키보드 새로고침 단축키 `r`도 동일한 새로고침 경로를 사용합니다.
+
+> **참고**: 구독 할당량과 잔액은 **벤더가 보고한 값**입니다 — tokscale은 각 프로바이더의 자체 할당량 엔드포인트를 호출하고 그 응답을 그대로 표시합니다. 표시되는 수치는 프로바이더가 보고하는 값(공식 대시보드에 나타나는 값과 동일)이며, tokscale 자체 사용량 추적과 독립적으로 검증되지 않습니다.
+
+#### 지원 프로바이더
+
+| 프로바이더 | 인증 방식 | 지표 | 설정 |
+|----------|-------------|---------|-------|
+| **Claude** | OAuth (자격 증명 파일 또는 macOS Keychain) | 세션(5시간), 주간, Opus 할당량 | `claude`를 실행해 로그인 |
+| **Codex** (OpenAI) | OAuth (`~/.config/codex/auth.json`, `~/.codex/auth.json`, 또는 저장된 Tokscale 계정) | 세션, 주간 할당량 | TUI Usage 탭에서 `[Add Codex]`를 사용하거나, `codex`를 실행해 로그인하거나, `tokscale codex import --name work`로 기존 인증을 가져오기 |
+| **Z.ai** | API 키 (환경 변수) | 토큰 한도, 웹 검색 | `ZAI_API_KEY` 또는 `GLM_API_KEY` 설정 |
+| **Amp** | API 키 (`~/.local/share/amp/secrets.json`) | 무료 티어 잔액, 크레딧 | `amp`를 실행해 로그인 |
+| **GitHub Copilot** | GitHub 토큰 (keychain 또는 `~/.config/gh/hosts.yml`) | 프리미엄 상호작용, 채팅 할당량 | `gh auth login` 실행 |
+| **Grok Build** | OAuth (`~/.grok/auth.json`) | 크레딧, 구독 플랜 | `grok login` 실행 |
+| **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | 세션, 주간 할당량 | `kimi`를 실행해 로그인 |
+| **MiniMax** | API 키 (환경 변수) | 모델별 프롬프트 할당량 | `MINIMAX_API_KEY` 또는 `MINIMAX_API_TOKEN` 설정 |
+| **MiniMax Token Plan** | API 키 (환경 변수) | 구간 + 주간 잔여 비율 할당량 (지역별: CN minimaxi.com + Global minimax.io) | `MINIMAX_TOKEN_PLAN_CN_KEY` 및/또는 `MINIMAX_TOKEN_PLAN_GLOBAL_KEY` 설정 |
+
+프로바이더는 자동 감지됩니다 — 유효한 자격 증명이 있는 프로바이더만 표시됩니다. 프로바이더가 보이지 않으면 로그인했는지 또는 필요한 환경 변수를 설정했는지 확인하세요.
+
+#### Codex 다중 계정 사용량
+
+Tokscale은 구독 사용량 표시를 위해 여러 Codex OAuth 계정을 저장할 수 있습니다. TUI Usage 탭은 저장된 계정들을 하나의 **Codex** 섹션 아래에 묶습니다. 활성 계정은 `*`로 표시되고, 비활성 계정은 `[Use]`로 선택할 수 있으며, 계정 삭제는 `[Remove]` 후 `[Confirm]`으로 진행합니다.
+
+TUI를 벗어나지 않고 계정을 추가하려면 Usage 탭에서 `[Add Codex]`를 클릭하세요. Tokscale은 임시 `CODEX_HOME`으로 `codex login`을 시작하고, 로그인 출력을 Usage 탭에 표시한 뒤, 결과 인증을 Tokscale의 저장 계정 스토어로 가져오고, 사용량을 새로고침합니다. 이렇게 하면 로그인이 격리되며 현재 Codex 인증을 전환하지 않습니다. Tokscale이 실제 Codex 인증 파일에 특정 계정을 쓰게 하려면 저장된 계정에서 `[Use]`를 클릭하세요.
+
+스크립트 기반 또는 수동 계정 관리를 위한 CLI 명령도 계속 제공됩니다:
+
+```bash
+# 현재 Codex 인증을 이름 있는 Tokscale 계정으로 저장
+tokscale codex import --name work
+
+# 저장된 Codex 계정 목록
+tokscale codex accounts
+tokscale codex accounts --json
+
+# 활성 Codex 계정 전환 및 Codex auth.json 기록
+tokscale codex switch work
+
+# 저장된 Codex 계정 추적 중지 (Tokscale 스토어에서만 제거 —
+# codex CLI 자체의 auth.json/로그인은 절대 건드리지 않음)
+tokscale codex remove personal
+
+# 활성 또는 이름 있는 계정의 구독 사용량 확인
+tokscale codex status
+tokscale codex status --name personal --json
+```
+
+저장된 Codex 계정이 있으면 `tokscale usage --json`은 각 Codex 항목에 대한 구조화된 계정 메타데이터를 포함하며 TUI는 해당 항목들을 하나의 Codex 그룹 아래에 표시합니다. 저장된 계정이 없으면 Tokscale은 현재 Codex 인증 탐색 경로(`CODEX_HOME/auth.json`, `~/.config/codex/auth.json`, `~/.codex/auth.json`, 그리고 macOS Keychain)로 폴백합니다.
+
+#### 예시 출력
+
+```
+╭──────────────────────────────────────────────────────────╮
+│ Session    85% left  [=========---] resets in 2h 15m     │
+│ Weekly     72% left  [========----] resets Fri 3pm       │
+│ Plan     Max 20x                                         │
+╰──────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Session    40% left  [=====-------] resets in 4h 30m     │
+│ Weekly     90% left  [==========--] resets Mon 12am      │
+│ Account  user@example.com                                │
+│ Plan     Pro                                             │
+╰──────────────────────────────────────────────────────────╯
+```
+
 ### 예시 출력 (`--light` 버전)
 
 <img alt="CLI Light" src="./.github/assets/cli-light.png" />
@@ -675,6 +757,7 @@ Minutely 탭은 토큰 사용량을 분 단위로 표시하며, 버스트 패턴
 |----------|---------|-------------|
 | `TOKSCALE_NATIVE_TIMEOUT_MS` | `300000` (5분) | `nativeTimeoutMs` 설정 오버라이드 |
 | `TOKSCALE_CONFIG_DIR` | unset | 설정 디렉토리 루트(`settings.json`, `star-cache.json`, `cache/`, `antigravity-cache/`, `trae-cache/` 위치)를 오버라이드합니다. 절대 경로 권장; 상대 경로는 프로세스 CWD 기준으로 해석됩니다. CI 샌드박스나 비기본 위치를 고정할 때 유용합니다. 설정되면 tokscale은 macOS 레거시 경로(`~/Library/Application Support/tokscale/`)로 폴백하지 않습니다. |
+| `TOKSCALE_FM_DEBUG` | unset | 설정되면 Apple Foundation Models 진단 정보(macOS 버전 게이트, dlopen dylib 경로, 로드/심볼 오류)를 stderr로 출력하여 온디바이스 apple-fm이 동작했는지 또는 동작하지 않았는지 이유를 설명합니다. |
 
 ```bash
 # 예시: 매우 큰 데이터셋에 대한 타임아웃 증가
@@ -757,7 +840,7 @@ tokscale sources --json
 - **인터랙티브 툴팁**: 호버 시 상세 일별 분석 표시
 - **일별 분석 패널**: 클릭하여 소스별, 모델별 세부사항 확인
 - **연도 필터링**: 연도 간 탐색
-- **소스 필터링**: 플랫폼별 필터 (OpenCode, Claude, Codex, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Command Code, Synthetic)
+- **소스 필터링**: 플랫폼별 필터 (OpenCode, Claude, Codex, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Command Code, Junie, Synthetic)
 - **통계 패널**: 총 비용, 토큰, 활동 일수, 연속 기록
 - **FOUC 방지**: React 하이드레이션 전 테마 적용 (깜빡임 없음)
 
@@ -1271,6 +1354,12 @@ Trae 데이터는 루트 명령에서 자동으로 가져오지 않습니다. �
 위치: `$GROK_HOME/sessions/*/*/updates.jsonl` (폴백: `~/.grok/sessions/*/*/updates.jsonl`)
 
 Grok Build 데이터는 로컬 세션 업데이트에서 직접 파싱됩니다. 현재 로그는 안정적인 input/output 분리 없이 누적 `totalTokens` 카운터를 노출하므로, Tokscale은 턴별 양수 증가분을 input 토큰으로 기록합니다. `grok-composer-2.5-fast`는 전용 공개 가격이 생길 때까지 Composer 2.5 Fast 가격 override에 임시 매핑됩니다.
+
+### Jcode
+
+위치: `$JCODE_HOME/sessions/session_*.json` (폴백: `~/.jcode/sessions/session_*.json`) 및 매칭되는 `session_*.journal.jsonl` 사이드카.
+
+Jcode 데이터는 로컬 세션 스냅샷에서 직접 파싱됩니다. Tokscale은 다른 클라이언트 신원을 위장하지 않고 어시스턴트의 `messages[].token_usage` 필드(`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `reasoning_output_tokens`)를 읽습니다. 매칭되는 저널 사이드카는 중복 제거 전에 동일한 세션 스트림으로 병합되므로, Jcode가 스냅샷에 체크포인트로 반영하기 전까지 최근에 추가된 메시지도 포함됩니다. 재생(replay) 중복 제거에는 안정적인 메시지 ID를 사용하며, ID가 없는 잘못된/커스텀 레코드는 범위가 한정된 폴백 키를 사용합니다.
 
 ### OpenClaw
 
