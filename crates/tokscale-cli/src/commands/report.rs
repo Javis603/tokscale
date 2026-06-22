@@ -1139,12 +1139,14 @@ fn print_session_list(entries: &[WikiEntry]) {
 /// message instead of metadata only.
 ///
 /// File-keyed clients (claude, codex, gemini) live as one transcript file per
-/// session, indexed here by `session_id` (the file stem). OpenCode sessions live
-/// as rows inside a shared SQLite database, so every opencode database is kept as
-/// a candidate and the extractor selects the matching session internally.
+/// session, indexed here by `(client, session_id)`. The client is part of the
+/// key so cross-client `session_id` collisions can't feed one client's file to
+/// another client's extractor. OpenCode sessions live as rows inside a shared
+/// SQLite database, so every opencode database is kept as a candidate and the
+/// extractor selects the matching session internally.
 #[derive(Default)]
 struct SessionPathIndex {
-    by_session_id: HashMap<String, Vec<PathBuf>>,
+    by_client_session: HashMap<(String, String), Vec<PathBuf>>,
     opencode_dbs: Vec<PathBuf>,
 }
 
@@ -1154,18 +1156,23 @@ impl SessionPathIndex {
         if client == "opencode" {
             return self.opencode_dbs.clone();
         }
-        self.by_session_id
-            .get(session_id)
+        self.by_client_session
+            .get(&(client.to_string(), session_id.to_string()))
             .cloned()
             .unwrap_or_default()
     }
 }
 
-/// Scan local client data once and index every session file by `session_id`
-/// (file stem) plus the OpenCode databases, so per-session content extraction
-/// never has to re-walk the filesystem. Scanning is best-effort: any client the
-/// summarizer can't extract simply yields no candidates and falls back to
-/// metadata-only.
+/// Scan local client data once and index every session file by
+/// `(client, session_id)` plus the OpenCode databases, so per-session content
+/// extraction never has to re-walk the filesystem. Scanning is best-effort: any
+/// client the summarizer can't extract simply yields no candidates and falls
+/// back to metadata-only.
+///
+/// The `session_id` used as the key must match how the wiki populates its
+/// entries. For most clients that is the file stem, but Gemini transcripts derive
+/// the id from the in-file `sessionId`/`session_id` field, so they are keyed by
+/// the parsed id (with the stem kept as a fallback alias).
 fn build_session_path_index(opts: &ReportOptions) -> SessionPathIndex {
     let home_dir = opts
         .home_dir
@@ -1181,18 +1188,37 @@ fn build_session_path_index(opts: &ReportOptions) -> SessionPathIndex {
         &opts.scanner_settings,
     );
 
-    let mut by_session_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    for (_client, path) in scan.all_files() {
+    let mut by_client_session: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
+    for (client, path) in scan.all_files() {
+        let client_str = client.as_str().to_string();
+        let mut session_ids: Vec<String> = Vec::new();
+
+        if client == tokscale_core::ClientId::Gemini {
+            // Gemini's wiki session_id comes from inside the file, not the stem.
+            if let Some(id) =
+                tokscale_core::sessions::gemini::gemini_session_id_for_file(&path)
+            {
+                session_ids.push(id);
+            }
+        }
+        // Always keep the file stem as a key/alias so stem-keyed clients work and
+        // Gemini lookups still resolve if the wiki used the stem.
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            by_session_id
-                .entry(stem.to_string())
+            session_ids.push(stem.to_string());
+        }
+
+        session_ids.sort();
+        session_ids.dedup();
+        for session_id in session_ids {
+            by_client_session
+                .entry((client_str.clone(), session_id))
                 .or_default()
-                .push(path);
+                .push(path.clone());
         }
     }
 
     SessionPathIndex {
-        by_session_id,
+        by_client_session,
         opencode_dbs: scan.opencode_dbs.clone(),
     }
 }
@@ -1503,10 +1529,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut by_session_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        by_session_id.insert(session_id.to_string(), vec![path]);
+        let mut by_client_session: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
+        by_client_session.insert(("claude".to_string(), session_id.to_string()), vec![path]);
         let index = SessionPathIndex {
-            by_session_id,
+            by_client_session,
             opencode_dbs: Vec::new(),
         };
 
@@ -1532,10 +1558,13 @@ mod tests {
         let path = dir.path().join(format!("{session_id}.jsonl"));
         std::fs::write(&path, "garbage\n").unwrap();
 
-        let mut by_session_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        by_session_id.insert(session_id.to_string(), vec![path]);
+        let mut by_client_session: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
+        by_client_session.insert(
+            ("some-unsupported-client".to_string(), session_id.to_string()),
+            vec![path],
+        );
         let index = SessionPathIndex {
-            by_session_id,
+            by_client_session,
             opencode_dbs: Vec::new(),
         };
 
@@ -1555,5 +1584,81 @@ mod tests {
         let content = extract_content_for_session(&entry, &index);
         assert!(content.first_user_message.is_none());
         assert_eq!(content.client, "claude");
+    }
+
+    #[test]
+    fn session_path_index_isolates_clients_with_same_session_id() {
+        // Two different clients share a session_id. Keying by (client, id) must
+        // route each lookup to that client's own file, never the other's.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_path = dir.path().join("claude.jsonl");
+        let codex_path = dir.path().join("codex.jsonl");
+        std::fs::write(&claude_path, "claude-bytes").unwrap();
+        std::fs::write(&codex_path, "codex-bytes").unwrap();
+
+        let mut by_client_session: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
+        by_client_session.insert(("claude".to_string(), "shared".to_string()), vec![claude_path.clone()]);
+        by_client_session.insert(("codex".to_string(), "shared".to_string()), vec![codex_path.clone()]);
+        let index = SessionPathIndex {
+            by_client_session,
+            opencode_dbs: Vec::new(),
+        };
+
+        assert_eq!(index.candidates_for("claude", "shared"), vec![claude_path]);
+        assert_eq!(index.candidates_for("codex", "shared"), vec![codex_path]);
+        // Lookup for a client without a matching key returns nothing.
+        assert!(index.candidates_for("gemini", "shared").is_empty());
+    }
+
+    #[test]
+    fn build_session_path_index_keys_gemini_by_inner_session_id() {
+        // A Gemini chat recording's wiki session_id is the in-file `sessionId`,
+        // not the filename stem. The index must key by that inner id so the
+        // summarizer lookup resolves and surfaces the real first prompt.
+        let home = tempfile::tempdir().unwrap();
+        let chats = home
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("projhash")
+            .join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let inner_id = "b8d9ab56-e7da-4dca-abc1-eb61158bed4f";
+        let file = chats.join("session-2026-06-08T19-53-b8d9ab56.json");
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"sessionId":"{inner_id}","messages":[{{"type":"user","content":"Hello Gemini"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let opts = ReportOptions {
+            json: false,
+            since: None,
+            until: None,
+            workspace: None,
+            client: None,
+            no_summarize: false,
+            summarizer: String::new(),
+            rebuild: false,
+            home_dir: Some(home.path().to_string_lossy().into_owned()),
+            scanner_settings: Default::default(),
+            today: false,
+            week: false,
+            month: false,
+        };
+        let index = build_session_path_index(&opts);
+
+        // Lookup by the wiki session_id (inner id) must find the file.
+        let candidates = index.candidates_for("gemini", inner_id);
+        assert!(
+            candidates.iter().any(|p| p == &file),
+            "expected gemini index keyed by inner sessionId, candidates={candidates:?}"
+        );
+
+        let entry = entry_for(inner_id, "gemini");
+        let content = extract_content_for_session(&entry, &index);
+        assert_eq!(content.first_user_message.as_deref(), Some("Hello Gemini"));
     }
 }

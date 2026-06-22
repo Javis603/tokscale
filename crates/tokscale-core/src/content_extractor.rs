@@ -124,6 +124,24 @@ pub fn extract_claudecode_content(jsonl_path: &Path, session_id: &str) -> Option
     })
 }
 
+/// System-injected `user_message` bodies the Codex harness writes alongside real
+/// human turns. They open with one of these tags (after trimming) and must not be
+/// reported as the user's first prompt. Mirrors the detection in
+/// `sessions::codex` — matching specific tags (not any leading `<`) avoids
+/// dropping legitimate prompts that happen to start with markup.
+const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
+    "<environment_context>",
+    "<system-reminder>",
+    "<user_instructions>",
+];
+
+fn codex_message_is_human_turn(message: &str) -> bool {
+    let trimmed = message.trim_start();
+    !CODEX_SYSTEM_INJECTED_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
 pub fn extract_codex_content(jsonl_path: &Path, session_id: &str) -> Option<SessionContent> {
     let file = std::fs::File::open(jsonl_path).ok()?;
     let reader = BufReader::new(file);
@@ -143,20 +161,37 @@ pub fn extract_codex_content(jsonl_path: &Path, session_id: &str) -> Option<Sess
             Err(_) => continue,
         };
 
-        let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let entry_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let payload = value.get("payload");
+        let payload_type = payload
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
 
-        if msg_type == "user_message" || msg_type == "input" {
-            let text = value
-                .get("content")
-                .or_else(|| value.get("text"))
-                .or_else(|| value.get("payload").and_then(|p| p.get("content")))
-                .and_then(|v| v.as_str())
-                .map(|s| truncate(s, MAX_CONTENT_CHARS));
+        // Current on-disk format: an `event_msg` entry whose payload is a
+        // `user_message`, with the human text in `payload.message`.
+        let is_user_message = (entry_type == "event_msg" && payload_type == "user_message")
+            // Tolerate older/top-level shapes that may still appear in the wild.
+            || entry_type == "user_message"
+            || entry_type == "input";
 
-            if text.is_some() {
+        if !is_user_message {
+            continue;
+        }
+
+        let text = payload
+            .and_then(|p| p.get("message"))
+            .or_else(|| value.get("content"))
+            .or_else(|| value.get("text"))
+            .or_else(|| payload.and_then(|p| p.get("content")))
+            .and_then(|v| v.as_str());
+
+        if let Some(t) = text {
+            // Skip harness-injected context blocks; only real human turns count.
+            if !t.trim().is_empty() && codex_message_is_human_turn(t) {
                 return Some(SessionContent {
                     session_id: session_id.to_string(),
-                    first_user_message: text,
+                    first_user_message: Some(truncate(t, MAX_CONTENT_CHARS)),
                     client: "codex".to_string(),
                 });
             }
@@ -170,37 +205,79 @@ pub fn extract_codex_content(jsonl_path: &Path, session_id: &str) -> Option<Sess
     })
 }
 
+/// Pull the first non-empty user message out of a parsed Gemini message object.
+/// Gemini chat recordings store user turns as `{"type":"user","content":"..."}`;
+/// some variants use `text` instead of `content` or `role` instead of `type`.
+fn gemini_user_text(msg: &Value) -> Option<String> {
+    let role = msg
+        .get("type")
+        .or_else(|| msg.get("role"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if role != "user" && role != "human" {
+        return None;
+    }
+    let text = msg
+        .get("content")
+        .or_else(|| msg.get("text"))
+        .and_then(|v| v.as_str())?;
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(truncate(text, MAX_CONTENT_CHARS))
+    }
+}
+
 pub fn extract_gemini_content(json_path: &Path, session_id: &str) -> Option<SessionContent> {
+    let none = || SessionContent {
+        session_id: session_id.to_string(),
+        first_user_message: None,
+        client: "gemini".to_string(),
+    };
+    let found = |text: String| SessionContent {
+        session_id: session_id.to_string(),
+        first_user_message: Some(text),
+        client: "gemini".to_string(),
+    };
+
     let content = std::fs::read_to_string(json_path).ok()?;
-    let value: Value = serde_json::from_str(&content).ok()?;
 
-    let messages = value.get("messages").and_then(|m| m.as_array())?;
+    // Chat-recording format: a single JSON document with a `messages` array.
+    if let Ok(value) = serde_json::from_str::<Value>(&content) {
+        if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
+            for msg in messages {
+                if let Some(text) = gemini_user_text(msg) {
+                    return Some(found(text));
+                }
+            }
+            return Some(none());
+        }
+    }
 
-    for msg in messages {
-        let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if msg_type == "user" || msg_type == "human" {
-            let text = msg
-                .get("text")
-                .or_else(|| msg.get("content"))
-                .and_then(|v| v.as_str());
-
-            if let Some(t) = text {
-                if !t.trim().is_empty() {
-                    return Some(SessionContent {
-                        session_id: session_id.to_string(),
-                        first_user_message: Some(truncate(t, MAX_CONTENT_CHARS)),
-                        client: "gemini".to_string(),
-                    });
+    // Headless / line-delimited JSONL: scan each line for a user turn. Telemetry
+    // (`init`/`result`/token-count) lines carry no user text and are skipped.
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(text) = gemini_user_text(&value) {
+            return Some(found(text));
+        }
+        // Some recordings nest the turns under a `messages` array per line.
+        if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
+            for msg in messages {
+                if let Some(text) = gemini_user_text(msg) {
+                    return Some(found(text));
                 }
             }
         }
     }
 
-    Some(SessionContent {
-        session_id: session_id.to_string(),
-        first_user_message: None,
-        client: "gemini".to_string(),
-    })
+    Some(none())
 }
 
 pub fn metadata_only_content(session_id: &str, client: &str) -> SessionContent {
@@ -242,9 +319,14 @@ pub fn extract_session_content(
     for path in candidate_paths {
         if let Some(content) = extractor(path, session_id) {
             // A real extractor can still return `Some` with `first_user_message:
-            // None` (e.g. the file parsed but held no user message); keep
-            // scanning the remaining candidates for one that does.
-            if content.first_user_message.is_some() {
+            // None` (or an empty/whitespace-only string — e.g. the file parsed
+            // but held no usable user message); keep scanning the remaining
+            // candidates for one that yields real text.
+            if content
+                .first_user_message
+                .as_deref()
+                .is_some_and(|m| !m.trim().is_empty())
+            {
                 return content;
             }
         }
@@ -352,5 +434,107 @@ mod tests {
             extract_session_content("codex", "sess", &[PathBuf::from("/definitely/missing.jsonl")]);
         assert!(content.first_user_message.is_none());
         assert_eq!(content.client, "codex");
+    }
+
+    #[test]
+    fn extract_codex_content_parses_current_event_msg_format() {
+        // Current on-disk shape: event_msg / payload.type == user_message, with
+        // the human text in payload.message.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"environment_context"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"<environment_context>cwd=/tmp</environment_context>"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"Refactor the parser"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let content = extract_codex_content(&path, "sess").unwrap();
+        // The system-injected user_message must be skipped; the real prompt wins.
+        assert_eq!(
+            content.first_user_message.as_deref(),
+            Some("Refactor the parser")
+        );
+        assert_eq!(content.client, "codex");
+    }
+
+    #[test]
+    fn extract_codex_content_skips_only_injected_returns_none() {
+        // A transcript with only harness-injected context yields no human turn.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"<system-reminder>be concise</system-reminder>"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let content = extract_codex_content(&path, "sess").unwrap();
+        assert!(content.first_user_message.is_none());
+    }
+
+    #[test]
+    fn extract_gemini_content_parses_chat_recording_format() {
+        // Chat recording: single JSON doc with a messages array; user turns use
+        // {"type":"user","content":"..."}.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-2026.json");
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"b8d9ab56","messages":[{"type":"user","content":"Review the patch"},{"type":"gemini","content":"sure"}]}"#,
+        )
+        .unwrap();
+
+        let content = extract_gemini_content(&path, "b8d9ab56").unwrap();
+        assert_eq!(content.first_user_message.as_deref(), Some("Review the patch"));
+        assert_eq!(content.client, "gemini");
+    }
+
+    #[test]
+    fn extract_gemini_content_empty_user_text_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-2026.json");
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"x","messages":[{"type":"user","content":"   "}]}"#,
+        )
+        .unwrap();
+
+        let content = extract_gemini_content(&path, "x").unwrap();
+        assert!(content.first_user_message.is_none());
+    }
+
+    #[test]
+    fn extract_session_content_empty_message_keeps_scanning_to_real_text() {
+        // First candidate parses but its only user message is whitespace; the
+        // dispatcher must not accept it as success and must fall through to the
+        // second candidate that holds real text.
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.jsonl");
+        std::fs::write(
+            &empty,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"   "}]}}
+"#,
+        )
+        .unwrap();
+        let real = dir.path().join("real.jsonl");
+        std::fs::write(
+            &real,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Real prompt"}]}}
+"#,
+        )
+        .unwrap();
+
+        let content = extract_session_content("claude", "sess", &[empty, real]);
+        assert_eq!(content.first_user_message.as_deref(), Some("Real prompt"));
     }
 }
