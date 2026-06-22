@@ -299,6 +299,7 @@ pub fn get_provider_from_model(model: &str) -> &'static str {
         || model_lower.contains("sonnet")
         || model_lower.contains("opus")
         || model_lower.contains("haiku")
+        || model_lower.contains("fable")
     {
         "anthropic"
     } else if model_lower.contains("gpt")
@@ -521,6 +522,24 @@ mod tests {
         let last = get_provider_shade("anthropic", 6);
         let past_end = get_provider_shade("anthropic", 99);
         assert_eq!(last, past_end);
+    }
+
+    #[test]
+    fn fable_is_recognized_as_anthropic() {
+        assert_eq!(get_provider_from_model("fable-5"), "anthropic");
+        assert_eq!(get_provider_from_model("claude-fable-5"), "anthropic");
+        assert_eq!(get_provider_from_model("claude-fable-5[1m]"), "anthropic");
+    }
+
+    #[test]
+    fn fable_gets_same_base_color_as_opus() {
+        // Fable is a flagship Claude model and must render in the Anthropic
+        // palette at the same base level as Opus — not the gray UNKNOWN shade.
+        let fable = get_model_color("fable-5");
+        let opus = get_model_color("claude-opus-4-1");
+        assert_eq!(fable, opus);
+        assert_eq!(fable, get_model_color("claude-fable-5"));
+        assert_ne!(fable, get_model_color("some-unknown-model"));
     }
 
     #[test]
