@@ -436,7 +436,7 @@ Create `custom-pricing.json` in Tokscale's config directory (`~/.config/tokscale
 
 ```json
 {
-  "$schema": "https://tokscale.dev/custom-pricing.schema.json",
+  "$schema": "https://tokscale.ai/custom-pricing.schema.json",
   "models": {
     "accounts/fireworks/routers/kimi-k2p6-turbo": {
       "input_cost_per_million_tokens": 2.00,
@@ -501,7 +501,7 @@ tokscale submit
 TOKSCALE_API_TOKEN=tt_xxx tokscale submit
 
 # Revoke a token: visit Settings > API Tokens on the leaderboard site
-# (https://tokscale.com/settings) and click "Revoke" on the token row.
+# (https://tokscale.ai/settings) and click "Revoke" on the token row.
 # Revocation takes effect immediately — subsequent requests with that
 # token will get HTTP 401 "Invalid API token".
 
