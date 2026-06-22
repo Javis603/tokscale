@@ -42,7 +42,11 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 ///
 /// Source order:
 ///   1. env var `SAKANA_SESSION_COOKIE`
-///   2. file `~/.config/tokscale/sakana-session` (raw cookie string, trimmed)
+///   2. file `<config dir>/sakana-session` (raw cookie string, trimmed)
+///
+/// The config dir is resolved via the canonical `crate::paths::get_config_dir()`
+/// so `TOKSCALE_CONFIG_DIR` / XDG overrides are honored (matching every other
+/// provider, e.g. `codex.rs`), instead of hardcoding `~/.config/tokscale`.
 ///
 /// Empty / whitespace-only values are treated as absent.
 fn session_cookie() -> Option<String> {
@@ -53,8 +57,7 @@ fn session_cookie() -> Option<String> {
         }
     }
 
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let path = home.join(".config").join("tokscale").join("sakana-session");
+    let path = crate::paths::get_config_dir().join("sakana-session");
     if let Ok(content) = std::fs::read_to_string(&path) {
         let trimmed = content.trim();
         if !trimmed.is_empty() {
@@ -91,16 +94,26 @@ struct ParsedWindow {
 /// Heuristic: does this HTML look like a logged-out / login page rather than the
 /// authenticated billing console?
 ///
-/// The reliable positive signal is the presence of the billing data markers
-/// ("Billing" plus a "$/mo" price or a "% used" quota). Their ABSENCE means we
-/// did not get the billing page (login redirect, 401 body, or error page). We key
-/// off marker absence rather than sign-in strings on purpose: a valid logged-in
-/// page can legitimately contain "/login" / "Sign in" references (auth nav,
-/// callbacks), which would otherwise false-flag a working session as expired.
+/// We key off marker ABSENCE rather than sign-in strings on purpose: a valid
+/// logged-in page can legitimately contain "/login" / "Sign in" references (auth
+/// nav, callbacks), which would otherwise false-flag a working session.
+///
+/// However, the bare substrings "Billing" + ("/mo" | "% used") are too weak: an
+/// error page, a redirect shell, or a partially-rendered page can carry those
+/// tokens (e.g. inside script/RSC noise) yet contain no real billing data,
+/// producing a bogus empty card instead of a needs-auth signal. So we require a
+/// STRONGER positive signal — a real window label (`>5-hour<` / `>Weekly<`) or a
+/// concrete `$NN/mo` price match — before trusting the page. A price-only shell
+/// (price present but NO quota windows) is caught downstream in `parse_billing`,
+/// which treats a windowless parse as not logged in. This stays conservative: a
+/// genuine billing page always renders quota windows.
 fn looks_logged_out(html: &str) -> bool {
-    let has_billing_markers =
-        html.contains("Billing") && (html.contains("/mo") || html.contains("% used"));
-    !has_billing_markers
+    if !html.contains("Billing") {
+        return true;
+    }
+    let has_real_window = !find_window_label_positions(html).is_empty();
+    let has_real_price = find_monthly_price(html).is_some();
+    !(has_real_window || has_real_price)
 }
 
 // ── Parsing helpers (plain str, no regex) ──
@@ -187,7 +200,13 @@ fn find_plan(html: &str, price_idx: Option<usize>) -> Option<String> {
     best.map(|(_, tier)| tier.to_string())
 }
 
-/// Collect all `(\d{1,3})% used` percentages in document order.
+/// Collect all `(\d+(\.\d+)?)% used` percentages in document order.
+///
+/// The number immediately preceding `%` is parsed in full as an `f64`,
+/// INCLUDING a single decimal point (e.g. `7.5% used` -> 7.5). A previous
+/// version walked back over at most 3 *digits*, which silently truncated
+/// decimals — `7.5%` captured only `5` and reported `5.0`, confidently wrong.
+/// Values are clamped to the sane percentage range `0..=100`.
 fn find_used_percents(html: &str) -> Vec<f64> {
     const NEEDLE: &str = "% used";
     let bytes = html.as_bytes();
@@ -195,15 +214,29 @@ fn find_used_percents(html: &str) -> Vec<f64> {
     let mut search_from = 0usize;
     while let Some(rel) = html[search_from..].find(NEEDLE) {
         let pct_sign = search_from + rel; // index of '%'
-                                          // Walk backwards over up to 3 digits immediately preceding '%'.
+
+        // Walk backwards over the contiguous numeric run immediately preceding
+        // '%': ASCII digits plus a single decimal point. Stop at the first
+        // non-numeric byte (or a second '.').
         let mut start = pct_sign;
-        let mut count = 0;
-        while start > 0 && count < 3 && bytes[start - 1].is_ascii_digit() {
-            start -= 1;
-            count += 1;
+        let mut seen_dot = false;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b.is_ascii_digit() {
+                start -= 1;
+            } else if b == b'.' && !seen_dot {
+                seen_dot = true;
+                start -= 1;
+            } else {
+                break;
+            }
         }
-        if count > 0 {
-            if let Ok(v) = html[start..pct_sign].parse::<f64>() {
+
+        // Reject a run that is just "." (no digits) or has a leading/trailing
+        // dot that won't parse as f64; `parse` enforces the rest.
+        let token = &html[start..pct_sign];
+        if token.bytes().any(|b| b.is_ascii_digit()) {
+            if let Ok(v) = token.parse::<f64>() {
                 out.push(v.clamp(0.0, 100.0));
             }
         }
@@ -382,12 +415,26 @@ fn parse_billing(html: &str) -> Result<ParsedBilling> {
     let monthly_price = price.map(|(p, _)| p);
     let price_idx = price.map(|(_, i)| i);
     let plan = find_plan(html, price_idx);
+    let next_renewal = find_next_renewal(html);
+    let windows = parse_windows(html);
+
+    // Defense in depth: the real billing console ALWAYS renders quota windows.
+    // A parse that recovered no windows is not a usable billing page — even when
+    // a price/plan was scraped. An expired-cookie/error shell can legitimately
+    // carry `Billing` + a spaced price like `$20 / mo` (so `find_monthly_price`
+    // succeeds and `looks_logged_out` is satisfied) while containing zero quota
+    // windows. Accepting that would emit a Sakana result with a plan and zero
+    // metrics instead of asking the user to refresh the cookie. Require actual
+    // quota-window data before trusting the page.
+    if windows.is_empty() {
+        anyhow::bail!("NEEDS_AUTH");
+    }
 
     Ok(ParsedBilling {
         plan,
         monthly_price,
-        next_renewal: find_next_renewal(html),
-        windows: parse_windows(html),
+        next_renewal,
+        windows,
     })
 }
 
@@ -453,8 +500,8 @@ async fn fetch_billing_html(client: &reqwest::Client, cookie: &str) -> Result<St
 pub fn fetch() -> Result<UsageOutput> {
     let cookie = session_cookie().ok_or_else(|| {
         anyhow::anyhow!(
-            "No Sakana session cookie. Set SAKANA_SESSION_COOKIE or write \
-             ~/.config/tokscale/sakana-session."
+            "No Sakana session cookie. Set SAKANA_SESSION_COOKIE or write a \
+             `sakana-session` file in the tokscale config dir."
         )
     })?;
 
@@ -692,6 +739,125 @@ mod tests {
     fn percents_parse_in_document_order() {
         let pcts = find_used_percents("a 55% used b 19% used c 100% used");
         assert_eq!(pcts, vec![55.0, 19.0, 100.0]);
+    }
+
+    #[test]
+    fn decimal_percents_parse_in_full() {
+        // Regression: the old digit-walk captured at most 3 trailing digits and
+        // dropped the decimal point, so "7.5%" reported 5.0. Full f64 parse now.
+        assert_eq!(find_used_percents("7.5% used"), vec![7.5]);
+        // Integer case still works.
+        assert_eq!(find_used_percents("42% used"), vec![42.0]);
+        // Mixed decimal + integer, document order, including a >3-char number.
+        assert_eq!(
+            find_used_percents("a 7.5% used b 100% used c 12.25% used"),
+            vec![7.5, 100.0, 12.25]
+        );
+        // Clamp out-of-range values to a sane percentage.
+        assert_eq!(find_used_percents("250.5% used"), vec![100.0]);
+    }
+
+    #[test]
+    fn decimal_percent_flows_through_parse() {
+        let html = r#"
+<html><body>
+  <nav>Billing</nav>
+  <div class="plan-card"><span>Standard</span><span>$20 / mo</span></div>
+  <div class="window"><span>5-hour</span><span>7.5% used</span></div>
+  <div class="window"><span>Weekly</span><span>19% used</span></div>
+</body></html>
+"#;
+        let parsed = parse_billing(html).expect("should parse");
+        assert_eq!(parsed.windows[0].used_percent, 7.5);
+        assert_eq!(parsed.windows[1].used_percent, 19.0);
+    }
+
+    // An error / shell page that happens to carry the weak substrings
+    // ("Billing", "/mo", "% used") inside script noise but has NO real window
+    // label and NO concrete $NN/mo price. This previously yielded an empty,
+    // all-zero card; it must now be treated as needs-auth.
+    const WEAK_MARKERS_ERROR_PAGE: &str = r#"
+<html><body>
+  <h1>Something went wrong</h1>
+  <script>self.__next_f.push([1,"...Billing strings like /mo and 0% used in RSC noise..."])</script>
+</body></html>
+"#;
+
+    #[test]
+    fn weak_marker_error_page_returns_needs_auth() {
+        let err = parse_billing(WEAK_MARKERS_ERROR_PAGE).expect_err("must error, not empty card");
+        assert!(
+            err.to_string().contains("NEEDS_AUTH"),
+            "expected NEEDS_AUTH, got: {err}"
+        );
+    }
+
+    // An expired-cookie / error shell that still carries `Billing` and a spaced
+    // plan price (`$20 / mo`) — so `find_monthly_price` succeeds and
+    // `looks_logged_out` is satisfied — but contains NO quota windows. This must
+    // be treated as needs-auth: a price-only page is NOT a usable billing page,
+    // and we must ask the user to refresh the cookie rather than emit a Sakana
+    // result with a plan and zero metrics. Regression for review feedback.
+    const PRICE_ONLY_NO_WINDOWS: &str = r#"
+<html><body>
+  <h1>Session expired</h1>
+  <nav>Billing</nav>
+  <div class="plan-card"><span>Standard</span><span>$20 / mo</span></div>
+</body></html>
+"#;
+
+    #[test]
+    fn price_only_no_windows_returns_needs_auth() {
+        // Sanity: the price marker really does satisfy `looks_logged_out`, so the
+        // downstream guard is the thing under test.
+        assert!(
+            !looks_logged_out(PRICE_ONLY_NO_WINDOWS),
+            "price marker should pass the cheap logged-out heuristic"
+        );
+        let err =
+            parse_billing(PRICE_ONLY_NO_WINDOWS).expect_err("price-only shell must be needs-auth");
+        assert!(
+            err.to_string().contains("NEEDS_AUTH"),
+            "expected NEEDS_AUTH, got: {err}"
+        );
+    }
+
+    // Verifies fix (2): the cookie file is resolved via the canonical config
+    // dir, which honors `TOKSCALE_CONFIG_DIR`, instead of hardcoding
+    // `~/.config/tokscale`. Serial because it mutates process-global env.
+    #[test]
+    #[serial_test::serial]
+    fn session_cookie_reads_from_overridden_config_dir() {
+        use std::env;
+
+        let prev_dir = env::var_os("TOKSCALE_CONFIG_DIR");
+        let prev_cookie = env::var_os("SAKANA_SESSION_COOKIE");
+
+        let tmp = env::temp_dir().join(format!("tokscale-sakana-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("sakana-session"), "  cookie-from-file  \n").unwrap();
+
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", &tmp);
+            // Ensure the env-var source does not short-circuit the file read.
+            env::remove_var("SAKANA_SESSION_COOKIE");
+        }
+
+        let got = session_cookie();
+
+        unsafe {
+            match prev_dir {
+                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
+                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
+            }
+            match prev_cookie {
+                Some(v) => env::set_var("SAKANA_SESSION_COOKIE", v),
+                None => env::remove_var("SAKANA_SESSION_COOKIE"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(got.as_deref(), Some("cookie-from-file"));
     }
 
     #[test]

@@ -381,19 +381,89 @@ pub fn get_provider_display_name(provider: &str) -> String {
     if let Some(name) = config.get_provider_display_name(provider) {
         return name.to_string();
     }
-    match provider.to_lowercase().as_str() {
-        "anthropic" => "Anthropic".to_string(),
+
+    // Merged Models rows store multiple providers as a ", "-joined string
+    // (aggregate_model_usage_entries sorts + dedups + joins). Map EACH segment
+    // independently and rejoin, otherwise a prefix/brand branch below would
+    // match the whole string and silently drop the rest — e.g.
+    // "openai, openrouter" must render "OpenAI, OpenRouter", not just "OpenAI".
+    if provider.contains(", ") {
+        return provider
+            .split(", ")
+            .map(|segment| map_single_provider(segment, &config))
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+
+    map_single_provider(provider, &config)
+}
+
+/// Display name for a SINGLE provider id (no comma-joined lists — the public
+/// `get_provider_display_name` splits those first).
+fn map_single_provider(provider: &str, config: &TokscaleConfig) -> String {
+    if let Some(name) = config.get_provider_display_name(provider) {
+        return name.to_string();
+    }
+    let lower = provider.to_lowercase();
+    match lower.as_str() {
+        "anthropic" => return "Anthropic".to_string(),
+        "google" => return "Google".to_string(),
+        "cursor" => return "Cursor".to_string(),
+        "deepseek" => return "DeepSeek".to_string(),
+        "xai" => return "xAI".to_string(),
+        "meta" => return "Meta".to_string(),
+        "mistral" => return "Mistral".to_string(),
+        "cohere" => return "Cohere".to_string(),
+        "opencode" => return "OpenCode".to_string(),
+        "openrouter" => return "OpenRouter".to_string(),
+        // `canonical_provider` rewrites `google-vertex` → `google_vertex`, so
+        // accept both spellings here.
+        "google-vertex" | "google_vertex" => return "Google Vertex".to_string(),
+        _ => {}
+    }
+
+    // Brand families: any provider id that starts with these stems collapses to
+    // the brand name. Covers `openai`, `openai-codex`, `kimi`, `kimi-code`,
+    // `kimi-for-coding`, etc. without enumerating every variant.
+    if lower.starts_with("openai") {
+        return "OpenAI".to_string();
+    }
+    if lower.starts_with("kimi") {
+        return "Kimi".to_string();
+    }
+    if lower.starts_with("github-cop") || lower.contains("copilot") {
+        return "GitHub Copilot".to_string();
+    }
+
+    // Smart fallback: split on `-`, `_`, and whitespace, title-case each word,
+    // and map known acronyms/brands per word. So unknown multi-word providers
+    // like `google-vertex` → "Google Vertex" and `some-new-provider` →
+    // "Some New Provider".
+    smart_titlecase(provider)
+}
+
+/// Title-cases a provider/brand identifier word-by-word, splitting on `-`, `_`,
+/// and whitespace. Per-word acronym/brand overrides (e.g. `ai` → "AI",
+/// `gpt` → "GPT") win over plain capitalization. Empty input yields an empty
+/// string; runs of separators are collapsed.
+fn smart_titlecase(s: &str) -> String {
+    s.split(['-', '_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(titlecase_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn titlecase_word(word: &str) -> String {
+    match word.to_lowercase().as_str() {
+        "ai" => "AI".to_string(),
+        "gpt" => "GPT".to_string(),
         "openai" => "OpenAI".to_string(),
-        "google" => "Google".to_string(),
-        "cursor" => "Cursor".to_string(),
-        "deepseek" => "DeepSeek".to_string(),
         "xai" => "xAI".to_string(),
-        "meta" => "Meta".to_string(),
-        "mistral" => "Mistral".to_string(),
-        "cohere" => "Cohere".to_string(),
-        "opencode" => "OpenCode".to_string(),
-        s if s.starts_with("github-cop") || s.contains("copilot") => "GitHub Copilot".to_string(),
-        _ => capitalize_first(provider),
+        "vertex" => "Vertex".to_string(),
+        "llm" => "LLM".to_string(),
+        "api" => "API".to_string(),
+        _ => capitalize_first(word),
     }
 }
 
@@ -561,6 +631,109 @@ mod tests {
         // But genuine fable tokens still resolve to Anthropic.
         assert_eq!(get_provider_from_model("fable-5"), "anthropic");
         assert_eq!(get_provider_from_model("claude-fable-5[1m]"), "anthropic");
+    }
+
+    #[test]
+    fn provider_display_name_target_cases() {
+        // The four cases the user reported as rendering wrong.
+        assert_eq!(get_provider_display_name("openai"), "OpenAI");
+        assert_eq!(get_provider_display_name("kimi-for-coding"), "Kimi");
+        assert_eq!(get_provider_display_name("google-vertex"), "Google Vertex");
+        assert_eq!(get_provider_display_name("opencode"), "OpenCode");
+    }
+
+    #[test]
+    fn provider_display_name_openai_family() {
+        // Any openai* id collapses to the brand name.
+        assert_eq!(get_provider_display_name("openai"), "OpenAI");
+        assert_eq!(get_provider_display_name("openai-codex"), "OpenAI");
+        assert_eq!(get_provider_display_name("OpenAI"), "OpenAI");
+    }
+
+    #[test]
+    fn provider_display_name_kimi_family() {
+        assert_eq!(get_provider_display_name("kimi"), "Kimi");
+        assert_eq!(get_provider_display_name("kimi-code"), "Kimi");
+        assert_eq!(get_provider_display_name("kimi-for-coding"), "Kimi");
+    }
+
+    #[test]
+    fn provider_display_name_google_vertex_both_spellings() {
+        // `canonical_provider` rewrites the hyphen to an underscore, so both
+        // spellings must map to the same clean label.
+        assert_eq!(get_provider_display_name("google-vertex"), "Google Vertex");
+        assert_eq!(get_provider_display_name("google_vertex"), "Google Vertex");
+    }
+
+    #[test]
+    fn provider_display_name_smart_fallback_multiword() {
+        // Unknown multi-word providers get split + title-cased instead of the
+        // old naive capitalize-first ("Some-new-provider").
+        assert_eq!(
+            get_provider_display_name("some-new-provider"),
+            "Some New Provider"
+        );
+        assert_eq!(
+            get_provider_display_name("some_new_provider"),
+            "Some New Provider"
+        );
+    }
+
+    #[test]
+    fn provider_display_name_known_regressions() {
+        assert_eq!(get_provider_display_name("anthropic"), "Anthropic");
+        assert_eq!(get_provider_display_name("google"), "Google");
+        assert_eq!(get_provider_display_name("xai"), "xAI");
+        assert_eq!(get_provider_display_name("deepseek"), "DeepSeek");
+        assert_eq!(get_provider_display_name("meta"), "Meta");
+        assert_eq!(get_provider_display_name("mistral"), "Mistral");
+        assert_eq!(get_provider_display_name("cohere"), "Cohere");
+        assert_eq!(get_provider_display_name("cursor"), "Cursor");
+        assert_eq!(
+            get_provider_display_name("github-copilot"),
+            "GitHub Copilot"
+        );
+        assert_eq!(get_provider_display_name("copilot"), "GitHub Copilot");
+    }
+
+    #[test]
+    fn provider_display_name_acronym_words_in_fallback() {
+        // Per-word acronym map applies inside the smart fallback.
+        assert_eq!(get_provider_display_name("acme-ai"), "Acme AI");
+        assert_eq!(get_provider_display_name("foo-api"), "Foo API");
+    }
+
+    #[test]
+    fn provider_display_name_merged_list_maps_each_segment() {
+        // Merged Models rows store providers as a ", "-joined string
+        // (aggregate_model_usage_entries). Each segment must be mapped
+        // independently — a prefix/contains-family branch on the whole string
+        // would otherwise silently drop the rest. Regression guard for that.
+        assert_eq!(
+            get_provider_display_name("openai, openrouter"),
+            "OpenAI, OpenRouter"
+        );
+        assert_eq!(
+            get_provider_display_name("kimi, anthropic"),
+            "Kimi, Anthropic"
+        );
+        // A `copilot` segment must not swallow its siblings via the contains()
+        // branch.
+        assert_eq!(
+            get_provider_display_name("anthropic, copilot"),
+            "Anthropic, GitHub Copilot"
+        );
+        assert_eq!(
+            get_provider_display_name("anthropic, openai"),
+            "Anthropic, OpenAI"
+        );
+    }
+
+    #[test]
+    fn provider_display_name_empty_is_empty() {
+        assert_eq!(get_provider_display_name(""), "");
+        // A string of only separators collapses to empty rather than panicking.
+        assert_eq!(get_provider_display_name("--_-"), "");
     }
 
     #[test]

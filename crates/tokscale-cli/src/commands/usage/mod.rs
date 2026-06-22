@@ -228,7 +228,36 @@ impl Fetch {
 
 type UsageProvider = (&'static str, fn() -> bool, Fetch);
 
+/// A provider that is active (has credentials) but whose fetch failed.
+///
+/// `name` is the human-facing provider label and `error` is the formatted
+/// error message (e.g. sakana's "refresh SAKANA_SESSION_COOKIE" guidance).
+#[derive(Debug, Clone)]
+pub struct ProviderError {
+    pub name: &'static str,
+    pub error: String,
+}
+
+/// Backwards-compatible entry point: returns only successful provider outputs.
+///
+/// Per-provider errors are silently discarded here. Callers that need to make
+/// failures visible (e.g. the CLI `run`) should use [`fetch_all_with_errors`].
+///
+/// Used by the TUI dashboard (non-test builds only); the TUI test build stubs
+/// the fetch out, so allow it to be unused there.
+#[cfg_attr(test, allow(dead_code))]
 pub fn fetch_all() -> Vec<UsageOutput> {
+    fetch_all_with_errors().0
+}
+
+/// Fetch usage for every active provider in parallel, returning both the
+/// successful outputs and the per-provider errors.
+///
+/// Previously a provider whose `fetch` returned `Err` (notably a stale/expired
+/// session-cookie auth error) was silently dropped: `has_credentials()` reports
+/// the provider as active, yet it just vanished from the output. This collects
+/// those errors so the caller can surface them to the user instead.
+pub fn fetch_all_with_errors() -> (Vec<UsageOutput>, Vec<ProviderError>) {
     let providers: Vec<UsageProvider> = vec![
         (
             "Claude",
@@ -274,19 +303,47 @@ pub fn fetch_all() -> Vec<UsageOutput> {
     let active: Vec<_> = providers.into_iter().filter(|(_, has, _)| has()).collect();
 
     if active.is_empty() {
-        return vec![];
+        return (vec![], vec![]);
     }
 
-    std::thread::scope(|s| {
-        active
+    let results = std::thread::scope(|s| {
+        let handles: Vec<_> = active
             .into_iter()
-            .map(|(_, _, fetch)| s.spawn(move || fetch.call().ok()))
+            .map(|(name, _, fetch)| s.spawn(move || (name, fetch.call())))
+            .collect();
+
+        handles
+            .into_iter()
+            .filter_map(|handle| {
+                // A panicked provider thread should not take down the whole
+                // command; skip it (a join error has no message to surface).
+                handle.join().ok()
+            })
             .collect::<Vec<_>>()
-            .into_iter()
-            .filter_map(|h| h.join().ok().flatten())
-            .flatten()
-            .collect()
-    })
+    });
+
+    partition_results(results)
+}
+
+/// Split per-provider fetch results into (successful outputs, errors).
+///
+/// An active provider returning `Err` becomes a [`ProviderError`] rather than
+/// being silently dropped.
+fn partition_results(
+    results: Vec<(&'static str, Result<Vec<UsageOutput>>)>,
+) -> (Vec<UsageOutput>, Vec<ProviderError>) {
+    let mut outputs = Vec::new();
+    let mut errors = Vec::new();
+    for (name, result) in results {
+        match result {
+            Ok(mut provider_outputs) => outputs.append(&mut provider_outputs),
+            Err(err) => errors.push(ProviderError {
+                name,
+                error: err.to_string(),
+            }),
+        }
+    }
+    (outputs, errors)
 }
 
 // ── Light-mode rendering ──
@@ -350,12 +407,20 @@ fn render_light(output: &UsageOutput) {
 }
 
 pub fn run(json: bool, _light: bool) -> Result<()> {
-    let outputs = fetch_all();
+    let (outputs, errors) = fetch_all_with_errors();
     if json {
+        // Keep stdout pure JSON: do NOT emit provider warnings here, since they
+        // would corrupt downstream `--json` consumers that read stderr too.
         println!("{}", serde_json::to_string_pretty(&outputs)?);
     } else {
         for o in &outputs {
             render_light(o);
+        }
+        // Surface active-but-failed providers (e.g. an expired session cookie)
+        // so they don't silently vanish from the output. One concise line per
+        // failing provider, on stderr to keep stdout clean.
+        for err in &errors {
+            eprintln!("{}: {} — skipped", err.name, err.error);
         }
     }
     Ok(())
@@ -423,6 +488,62 @@ mod tests {
         };
 
         assert_eq!(output.display_name(), "Codex (Account 123e45...4000)");
+    }
+
+    fn sample_output(provider: &str) -> UsageOutput {
+        UsageOutput {
+            provider: provider.to_string(),
+            account: None,
+            plan: None,
+            email: None,
+            metrics: Vec::new(),
+            reset_credits: None,
+            credit_status: None,
+            spend_control: None,
+        }
+    }
+
+    #[test]
+    fn partition_results_surfaces_provider_errors_instead_of_dropping_them() {
+        let results: Vec<(&'static str, Result<Vec<UsageOutput>>)> = vec![
+            ("Claude", Ok(vec![sample_output("Claude")])),
+            (
+                "Sakana",
+                Err(anyhow::anyhow!(
+                    "Sakana session expired or invalid. Refresh SAKANA_SESSION_COOKIE."
+                )),
+            ),
+            ("Codex", Ok(vec![sample_output("Codex"), sample_output("Codex")])),
+        ];
+
+        let (outputs, errors) = partition_results(results);
+
+        // Successful providers are preserved (including a Multi provider's
+        // several outputs), in order.
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].provider, "Claude");
+        assert_eq!(outputs[1].provider, "Codex");
+        assert_eq!(outputs[2].provider, "Codex");
+
+        // The failing provider's error is surfaced, not silently discarded.
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].name, "Sakana");
+        assert!(
+            errors[0].error.contains("SAKANA_SESSION_COOKIE"),
+            "expected the auth-refresh guidance to be preserved, got: {}",
+            errors[0].error
+        );
+    }
+
+    #[test]
+    fn partition_results_reports_no_errors_when_all_succeed() {
+        let results: Vec<(&'static str, Result<Vec<UsageOutput>>)> =
+            vec![("Claude", Ok(vec![sample_output("Claude")]))];
+
+        let (outputs, errors) = partition_results(results);
+
+        assert_eq!(outputs.len(), 1);
+        assert!(errors.is_empty());
     }
 
     #[test]
