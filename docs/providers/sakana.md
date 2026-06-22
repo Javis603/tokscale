@@ -56,10 +56,16 @@ Provide the cookie string via **either** of these (env var takes precedence):
 
   ```bash
   mkdir -p ~/.config/tokscale
-  printf '%s' '__Secure-authjs.session-token.0=...; __Secure-authjs.session-token.1=...' \
-    > ~/.config/tokscale/sakana-session
-  chmod 600 ~/.config/tokscale/sakana-session
+  # Create the file mode 600 from the start (umask 077) so the cookie is never
+  # briefly world-readable in the window between writing and chmod.
+  ( umask 077 && printf '%s' '__Secure-authjs.session-token.0=...; __Secure-authjs.session-token.1=...' \
+      > ~/.config/tokscale/sakana-session )
+  # Alternative: install -m 600 /dev/null ~/.config/tokscale/sakana-session first.
   ```
+
+  The file lives in tokscale's config dir, which honors `TOKSCALE_CONFIG_DIR`
+  (and `$XDG_CONFIG_HOME/tokscale` on Linux); `~/.config/tokscale` is just the
+  common default.
 
 Then:
 
