@@ -379,28 +379,24 @@ fn collect_kiro_snapshot_text(
                 };
             }
 
-            for key in ["prompt", "response", "content", "text", "message"] {
-                if let Some(item) = map.get(key) {
-                    collect_kiro_snapshot_text(item, counts, role);
-                }
-            }
-
-            for key in [
-                "messages",
-                "conversation",
-                "chat",
-                "transcript",
-                "entries",
-                "events",
-                "history",
+            // Each group below is an ordered list of *aliases* for the same
+            // logical payload (text body, conversation list, sub-parts). Kiro
+            // snapshots frequently store the identical text under more than one
+            // alias in a single object (e.g. both `content` and `text`, or both
+            // `messages` and `entries`). Descending into every present alias
+            // would count that text once per alias and inflate token totals, so
+            // we descend into only the FIRST present key in each group. This
+            // de-duplicates traversal so each node's text is collected once.
+            for group in [
+                // Inline text body of a single message.
+                &["prompt", "response", "content", "text", "message"][..],
+                // Container holding a list of messages/turns.
+                &["messages", "conversation", "chat", "transcript", "entries", "events", "history"]
+                    [..],
+                // Sub-parts of a single message.
+                &["parts", "items", "nodes"][..],
             ] {
-                if let Some(item) = map.get(key) {
-                    collect_kiro_snapshot_text(item, counts, role);
-                }
-            }
-
-            for key in ["parts", "items", "nodes"] {
-                if let Some(item) = map.get(key) {
+                if let Some(item) = group.iter().find_map(|key| map.get(*key)) {
                     collect_kiro_snapshot_text(item, counts, role);
                 }
             }
@@ -431,6 +427,10 @@ fn find_kiro_snapshot_model_id(value: &Value) -> Option<String> {
                 }
             }
 
+            // Recurse into the same containers `collect_kiro_snapshot_text`
+            // descends into, so the model id is discoverable wherever text is
+            // (otherwise a model id nested under e.g. `parts` or `prompt` would
+            // be missed and fall back to `unknown`). Keep these key-sets aligned.
             for key in [
                 "messages",
                 "conversation",
@@ -439,9 +439,14 @@ fn find_kiro_snapshot_model_id(value: &Value) -> Option<String> {
                 "entries",
                 "events",
                 "history",
+                "prompt",
+                "response",
                 "content",
                 "text",
                 "message",
+                "parts",
+                "items",
+                "nodes",
             ] {
                 if let Some(item) = map.get(key) {
                     if let Some(model) = find_kiro_snapshot_model_id(item) {
@@ -495,12 +500,23 @@ fn parse_kiro_global_storage_file(path: &Path) -> Vec<UnifiedMessage> {
         return Vec::new();
     }
 
+    // Date-bucketing limitation: Kiro IDE globalStorage snapshots are a single
+    // rolling JSON blob with no per-turn timestamps — turns carry only their
+    // text, not a `timestamp`/`end_timestamp` field (unlike the CLI `.jsonl`
+    // and the sqlite `request_metadata` sources, which do expose per-turn
+    // times). We therefore emit the entire snapshot as ONE message stamped at
+    // the file's mtime. This mis-buckets historical usage into the day the file
+    // was last written rather than the days the turns actually occurred. We do
+    // NOT synthesize timestamps; if a future snapshot schema adds per-turn
+    // times, read them here and split into one message per turn.
+    let snapshot_timestamp = fallback_timestamp;
+
     let mut message = UnifiedMessage::new_with_dedup(
         CLIENT_ID,
         model_id,
         PROVIDER_ID,
         session_id.clone(),
-        fallback_timestamp,
+        snapshot_timestamp,
         TokenBreakdown {
             input,
             output,
@@ -883,5 +899,78 @@ not valid json at all
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.output, 4);
+    }
+
+    #[test]
+    fn test_collect_kiro_snapshot_text_does_not_double_count_aliased_keys() {
+        // (a) A single message object that stores the SAME assistant body under
+        // two aliased text keys (`content` and `text`). Before the fix, the
+        // traversal descended into every present alias and counted "response
+        // text" twice (8 assistant chars -> output 2). After the fix it descends
+        // into only the first present alias in the group, counting once.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "messages": [
+                    {"role": "assistant", "content": "abcd", "text": "abcd"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut counts = KiroSnapshotTextCounts::default();
+        collect_kiro_snapshot_text(&value, &mut counts, None);
+
+        // "abcd" counted once = 4 chars, not 8.
+        assert_eq!(counts.assistant_chars, 4);
+        assert_eq!(counts.prompt_chars, 0);
+    }
+
+    #[test]
+    fn test_collect_kiro_snapshot_text_does_not_double_count_aliased_containers() {
+        // (a) An object that stores the SAME conversation list under two aliased
+        // container keys (`messages` and `entries`). Before the fix both were
+        // traversed and the text was counted twice.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "messages": [{"role": "user", "content": "hello"}],
+                "entries": [{"role": "user", "content": "hello"}]
+            }"#,
+        )
+        .unwrap();
+
+        let mut counts = KiroSnapshotTextCounts::default();
+        collect_kiro_snapshot_text(&value, &mut counts, None);
+
+        // "hello" counted once = 5 chars, not 10.
+        assert_eq!(counts.prompt_chars, 5);
+        assert_eq!(counts.assistant_chars, 0);
+    }
+
+    #[test]
+    fn test_find_kiro_snapshot_model_id_descends_into_aliased_text_keys() {
+        // (b) Model id nested under `parts` / `prompt` — keys that
+        // `collect_kiro_snapshot_text` descends into but the model-id finder
+        // previously omitted, causing the model to fall back to `unknown`.
+        let parts_value: Value = serde_json::from_str(
+            r#"{
+                "messages": [
+                    {"parts": [{"model_id": "claude-sonnet-4-5"}]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_kiro_snapshot_model_id(&parts_value),
+            Some("claude-sonnet-4-5".to_string())
+        );
+
+        let prompt_value: Value = serde_json::from_str(
+            r#"{"prompt": {"model": "auto"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_kiro_snapshot_model_id(&prompt_value),
+            Some("auto".to_string())
+        );
     }
 }
