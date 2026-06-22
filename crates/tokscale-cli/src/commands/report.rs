@@ -1149,17 +1149,41 @@ fn parse_date_range(since: &Option<String>, until: &Option<String>) -> (Option<i
     (since_ts, until_ts)
 }
 
-/// Returns the Unix-millisecond timestamp for midnight (00:00:00) of `date` in
-/// the local timezone, or `None` when that wall-clock time does not exist
-/// locally (e.g. a DST spring-forward gap).
+/// Returns the Unix-millisecond timestamp for the start of `date` in the local
+/// timezone.
+///
+/// This is normally midnight (00:00:00), but in zones that spring forward at
+/// local midnight (e.g. `America/Nuuk` on `2024-03-31`) that wall-clock time
+/// does not exist. Rather than dropping the boundary (which would silently make
+/// date filtering unbounded), we walk forward to the first representable instant
+/// after the gap so the day boundary is preserved.
 fn local_start_of_day_millis(date: chrono::NaiveDate) -> Option<i64> {
-    let midnight = date.and_hms_opt(0, 0, 0)?;
-    match Local.from_local_datetime(&midnight) {
-        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
-            Some(dt.timestamp_millis())
+    start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall))
+}
+
+/// Core of [`local_start_of_day_millis`], parameterized over the timezone
+/// resolver so the DST-gap handling can be exercised deterministically in tests.
+///
+/// Starts at midnight and, when that wall-clock time is skipped (a spring-forward
+/// gap), walks forward in 1-minute steps to the first representable instant. The
+/// probe window covers a full day so even unusual offsets resolve rather than
+/// silently dropping the boundary.
+fn start_of_day_millis_with<F>(date: chrono::NaiveDate, resolve: F) -> Option<i64>
+where
+    F: Fn(&chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<Local>>,
+{
+    let mut wall = date.and_hms_opt(0, 0, 0)?;
+    for _ in 0..=(24 * 60) {
+        match resolve(&wall) {
+            chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+                return Some(dt.timestamp_millis());
+            }
+            chrono::LocalResult::None => {
+                wall += chrono::Duration::minutes(1);
+            }
         }
-        chrono::LocalResult::None => None,
     }
+    None
 }
 
 /// Loads the canonical pricing dataset for cost attribution, preferring a fresh
@@ -1341,6 +1365,55 @@ mod tests {
         } else {
             assert_eq!(since, Some(utc_since));
         }
+    }
+
+    #[test]
+    fn start_of_day_preserves_boundary_across_dst_gap() {
+        use chrono::{Local, LocalResult, TimeZone};
+
+        // Simulate a zone that springs forward at local midnight (like
+        // `America/Nuuk` on 2024-03-31, where 00:00–00:59 do not exist). The
+        // resolver maps any wall-clock time before 01:00 to `None` (the gap) and
+        // resolves 01:00+ as a real instant. The first valid instant after the
+        // gap must be returned instead of dropping the boundary.
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 3, 31).unwrap();
+        let resolve = |wall: &chrono::NaiveDateTime| -> LocalResult<chrono::DateTime<Local>> {
+            if wall.time() < chrono::NaiveTime::from_hms_opt(1, 0, 0).unwrap() {
+                LocalResult::None
+            } else {
+                // Resolve against the machine's local zone for an arbitrary but
+                // representable instant; the value just needs to be `Single`.
+                Local.from_local_datetime(wall)
+            }
+        };
+
+        let result = start_of_day_millis_with(date, resolve);
+        let expected = Local
+            .from_local_datetime(&date.and_hms_opt(1, 0, 0).unwrap())
+            .single()
+            .map(|dt| dt.timestamp_millis());
+
+        // Boundary must be preserved (not `None`) and equal to the first valid
+        // post-gap instant (01:00 local).
+        assert!(
+            result.is_some(),
+            "DST-gap midnight must not drop the date boundary (would make filtering unbounded)"
+        );
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn start_of_day_uses_midnight_when_representable() {
+        use chrono::{Local, TimeZone};
+
+        // Sanity: when midnight exists, it is used unchanged (no forward walk).
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let result = start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall));
+        let expected = Local
+            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .map(|dt| dt.timestamp_millis());
+        assert_eq!(result, expected);
     }
 
     #[test]
