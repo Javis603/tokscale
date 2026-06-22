@@ -5815,7 +5815,7 @@ mod tests {
         assert_eq!(build_client_filter_with_defaults(flags, &[]), None);
     }
 
-    /// The 32 per-client boolean flags removed in 3.2.0. After removal every
+    /// The 32 per-client boolean flags removed in 4.0.0. After removal every
     /// one of these must produce a clap parse error — backward-compat parsing
     /// is intentionally gone (breaking change). Keep this list in sync with the
     /// flags deleted from `ClientFlags`.
