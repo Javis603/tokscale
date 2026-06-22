@@ -103,10 +103,10 @@ struct ParsedWindow {
 /// tokens (e.g. inside script/RSC noise) yet contain no real billing data,
 /// producing a bogus empty card instead of a needs-auth signal. So we require a
 /// STRONGER positive signal — a real window label (`>5-hour<` / `>Weekly<`) or a
-/// concrete `$NN/mo` price match — before trusting the page. Final emptiness is
-/// caught downstream in `parse_billing` (an empty parse is treated as not
-/// logged in). This stays conservative: a genuine billing page always carries at
-/// least one of these.
+/// concrete `$NN/mo` price match — before trusting the page. A price-only shell
+/// (price present but NO quota windows) is caught downstream in `parse_billing`,
+/// which treats a windowless parse as not logged in. This stays conservative: a
+/// genuine billing page always renders quota windows.
 fn looks_logged_out(html: &str) -> bool {
     if !html.contains("Billing") {
         return true;
@@ -418,11 +418,15 @@ fn parse_billing(html: &str) -> Result<ParsedBilling> {
     let next_renewal = find_next_renewal(html);
     let windows = parse_windows(html);
 
-    // Defense in depth: even if `looks_logged_out` was satisfied by weak
-    // markers, a parse that recovered NOTHING (no price, no plan, no windows)
-    // is not a usable billing page. Treat it as needs-auth rather than emitting
-    // an empty, all-zero card that looks like real (but bogus) data.
-    if monthly_price.is_none() && plan.is_none() && windows.is_empty() {
+    // Defense in depth: the real billing console ALWAYS renders quota windows.
+    // A parse that recovered no windows is not a usable billing page — even when
+    // a price/plan was scraped. An expired-cookie/error shell can legitimately
+    // carry `Billing` + a spaced price like `$20 / mo` (so `find_monthly_price`
+    // succeeds and `looks_logged_out` is satisfied) while containing zero quota
+    // windows. Accepting that would emit a Sakana result with a plan and zero
+    // metrics instead of asking the user to refresh the cookie. Require actual
+    // quota-window data before trusting the page.
+    if windows.is_empty() {
         anyhow::bail!("NEEDS_AUTH");
     }
 
@@ -782,6 +786,36 @@ mod tests {
     #[test]
     fn weak_marker_error_page_returns_needs_auth() {
         let err = parse_billing(WEAK_MARKERS_ERROR_PAGE).expect_err("must error, not empty card");
+        assert!(
+            err.to_string().contains("NEEDS_AUTH"),
+            "expected NEEDS_AUTH, got: {err}"
+        );
+    }
+
+    // An expired-cookie / error shell that still carries `Billing` and a spaced
+    // plan price (`$20 / mo`) — so `find_monthly_price` succeeds and
+    // `looks_logged_out` is satisfied — but contains NO quota windows. This must
+    // be treated as needs-auth: a price-only page is NOT a usable billing page,
+    // and we must ask the user to refresh the cookie rather than emit a Sakana
+    // result with a plan and zero metrics. Regression for review feedback.
+    const PRICE_ONLY_NO_WINDOWS: &str = r#"
+<html><body>
+  <h1>Session expired</h1>
+  <nav>Billing</nav>
+  <div class="plan-card"><span>Standard</span><span>$20 / mo</span></div>
+</body></html>
+"#;
+
+    #[test]
+    fn price_only_no_windows_returns_needs_auth() {
+        // Sanity: the price marker really does satisfy `looks_logged_out`, so the
+        // downstream guard is the thing under test.
+        assert!(
+            !looks_logged_out(PRICE_ONLY_NO_WINDOWS),
+            "price marker should pass the cheap logged-out heuristic"
+        );
+        let err =
+            parse_billing(PRICE_ONLY_NO_WINDOWS).expect_err("price-only shell must be needs-auth");
         assert!(
             err.to_string().contains("NEEDS_AUTH"),
             "expected NEEDS_AUTH, got: {err}"
