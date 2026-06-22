@@ -20,7 +20,10 @@ use std::time::UNIX_EPOCH;
 // 20: Codex fork replay parsing now keeps user-fork turns after repeated child
 // session_meta rows; cached Codex entries from older parser logic can be empty.
 // (19 was the jcode parser change in #718 — bump again so those caches reparse.)
-const CACHE_SCHEMA_VERSION: u32 = 22;
+// 23: Jcode parser now does journal-wins merge (first-occurrence-targeted) and
+// timezone-less timestamp parsing; schema-22 caches return stale snapshot
+// token_usage, so invalidate them.
+const CACHE_SCHEMA_VERSION: u32 = 23;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;

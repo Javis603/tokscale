@@ -232,11 +232,19 @@ pub fn parse_jcode_file(path: &Path) -> Vec<UnifiedMessage> {
     // journal would silently drop the journal's correction. Instead, replace
     // the snapshot entry in place when the journal repeats its id — journal
     // wins, and the message_id still collapses to exactly one entry.
-    let mut index_by_dedup_key: std::collections::HashMap<String, usize> = parsed
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, message)| message.dedup_key.clone().map(|key| (key, idx)))
-        .collect();
+    // Downstream dedup is first-wins, so when the snapshot itself replays a
+    // duplicate dedup_key we must map the key to its FIRST index — that's the
+    // entry that survives dedup. Mapping to the last index would let a journal
+    // update overwrite a row that is later discarded, preserving the stale
+    // first snapshot row. `collect()` keeps the last insertion, so build the
+    // map explicitly with `or_insert` to keep the first.
+    let mut index_by_dedup_key: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (idx, message) in parsed.iter().enumerate() {
+        if let Some(key) = message.dedup_key.clone() {
+            index_by_dedup_key.entry(key).or_insert(idx);
+        }
+    }
 
     let journal_path = jcode_journal_path(path);
     if let Ok(file) = std::fs::File::open(&journal_path) {
