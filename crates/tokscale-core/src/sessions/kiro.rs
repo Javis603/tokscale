@@ -384,9 +384,18 @@ fn collect_kiro_snapshot_text(
             // snapshots frequently store the identical text under more than one
             // alias in a single object (e.g. both `content` and `text`, or both
             // `messages` and `entries`). Descending into every present alias
-            // would count that text once per alias and inflate token totals, so
-            // we descend into only the FIRST present key in each group. This
-            // de-duplicates traversal so each node's text is collected once.
+            // would count that text once per alias and inflate token totals.
+            //
+            // However, an object may also legitimately hold *distinct* payloads
+            // under several keys of the same group (e.g. a turn with both
+            // `prompt` and `response`, or a chat with both `messages` and
+            // `history` pointing at different subtrees). Visiting only the first
+            // present key would silently drop those, undercounting tokens.
+            //
+            // So we descend into every present key in the group but de-duplicate
+            // by VALUE: subtrees structurally equal to one already visited in the
+            // same group are skipped. Distinct subtrees are all counted; repeated
+            // (aliased) subtrees are counted once.
             for group in [
                 // Inline text body of a single message.
                 &["prompt", "response", "content", "text", "message"][..],
@@ -396,8 +405,15 @@ fn collect_kiro_snapshot_text(
                 // Sub-parts of a single message.
                 &["parts", "items", "nodes"][..],
             ] {
-                if let Some(item) = group.iter().find_map(|key| map.get(*key)) {
-                    collect_kiro_snapshot_text(item, counts, role);
+                let mut visited: Vec<&Value> = Vec::new();
+                for key in group {
+                    if let Some(item) = map.get(*key) {
+                        if visited.contains(&item) {
+                            continue;
+                        }
+                        visited.push(item);
+                        collect_kiro_snapshot_text(item, counts, role);
+                    }
                 }
             }
         }
@@ -943,6 +959,49 @@ not valid json at all
 
         // "hello" counted once = 5 chars, not 10.
         assert_eq!(counts.prompt_chars, 5);
+        assert_eq!(counts.assistant_chars, 0);
+    }
+
+    #[test]
+    fn test_collect_kiro_snapshot_text_counts_distinct_alias_subtrees() {
+        // A single turn that stores DISTINCT payloads under two keys of the same
+        // alias group: `prompt` (user text) and `response` (assistant text).
+        // These are different subtrees, so both must be counted. A first-key-only
+        // traversal would drop the `response` body and undercount.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "prompt": {"role": "user", "text": "hi there"},
+                "response": {"role": "assistant", "text": "hello back"}
+            }"#,
+        )
+        .unwrap();
+
+        let mut counts = KiroSnapshotTextCounts::default();
+        collect_kiro_snapshot_text(&value, &mut counts, None);
+
+        // "hi there" = 8 prompt chars, "hello back" = 10 assistant chars.
+        assert_eq!(counts.prompt_chars, 8);
+        assert_eq!(counts.assistant_chars, 10);
+    }
+
+    #[test]
+    fn test_collect_kiro_snapshot_text_counts_distinct_container_subtrees() {
+        // A chat object holding DISTINCT conversation lists under two container
+        // aliases (`messages` and `history`). Both must be counted; the
+        // value-based de-dup only skips structurally identical subtrees.
+        let value: Value = serde_json::from_str(
+            r#"{
+                "messages": [{"role": "user", "content": "alpha"}],
+                "history": [{"role": "user", "content": "bravo"}]
+            }"#,
+        )
+        .unwrap();
+
+        let mut counts = KiroSnapshotTextCounts::default();
+        collect_kiro_snapshot_text(&value, &mut counts, None);
+
+        // "alpha" (5) + "bravo" (5) = 10 prompt chars; nothing dropped.
+        assert_eq!(counts.prompt_chars, 10);
         assert_eq!(counts.assistant_chars, 0);
     }
 
