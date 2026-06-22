@@ -299,7 +299,12 @@ pub fn get_provider_from_model(model: &str) -> &'static str {
         || model_lower.contains("sonnet")
         || model_lower.contains("opus")
         || model_lower.contains("haiku")
-        || model_lower.contains("fable")
+        // Match "fable" only as a delimited token (mirrors core's
+        // provider_identity::contains_delimited) so unrelated names like
+        // "unfabled-x" don't get misattributed to Anthropic.
+        || model_lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == "fable")
     {
         "anthropic"
     } else if model_lower.contains("gpt")
@@ -539,7 +544,23 @@ mod tests {
         let opus = get_model_color("claude-opus-4-1");
         assert_eq!(fable, opus);
         assert_eq!(fable, get_model_color("claude-fable-5"));
-        assert_ne!(fable, get_model_color("some-unknown-model"));
+        // Don't assert default-palette inequality against an unknown model:
+        // user color overrides from ~/.tokscale could make the two colors
+        // equal at runtime, which would flake this test. Assert provider
+        // classification instead, which is independent of config palettes.
+        assert_eq!(get_provider_from_model("some-unknown-model"), "unknown");
+    }
+
+    #[test]
+    fn fable_substring_does_not_misattribute_to_anthropic() {
+        // Regression: raw substring matching for "fable" would misclassify
+        // unrelated model names. Matching must be on delimited tokens only,
+        // consistent with core provider_identity inference.
+        assert_eq!(get_provider_from_model("unfabled-model"), "unknown");
+        assert_eq!(get_provider_from_model("fableton-1"), "unknown");
+        // But genuine fable tokens still resolve to Anthropic.
+        assert_eq!(get_provider_from_model("fable-5"), "anthropic");
+        assert_eq!(get_provider_from_model("claude-fable-5[1m]"), "anthropic");
     }
 
     #[test]
