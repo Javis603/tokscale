@@ -4,6 +4,7 @@ use colored::Colorize;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use unicode_normalization::UnicodeNormalization;
 
 use super::apple_fm;
 use std::time::Duration;
@@ -487,6 +488,14 @@ fn is_combining_mark(c: char) -> bool {
 
 fn significant_tokens(title: &str) -> Vec<String> {
     let mut tokens: Vec<String> = title
+        // Normalize to NFC FIRST so canonically-equivalent inputs (precomposed
+        // "é" vs base "e" + combining acute) collapse to the same code points
+        // before lowercasing and combining-mark stripping. Without this, an NFC
+        // title kept the precomposed letter while an NFD one had its combining
+        // mark stripped, tokenizing identical titles differently and splitting
+        // them across clusters.
+        .nfc()
+        .collect::<String>()
         .to_lowercase()
         .chars()
         // Lowercase before filtering: Unicode lowercase can expand a character
@@ -518,6 +527,10 @@ fn significant_tokens(title: &str) -> Vec<String> {
 /// identical all-stopword titles together while keeping distinct ones apart.
 fn normalized_title(title: &str) -> String {
     title
+        // Match significant_tokens: normalize to NFC before lowercasing so
+        // canonically-equivalent all-stopword titles share an exact key.
+        .nfc()
+        .collect::<String>()
         .to_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -548,7 +561,15 @@ fn tokens_overlap(a: &[String], b: &[String]) -> bool {
     }
     let shared = a.iter().filter(|t| b.contains(t)).count();
     let smaller = a.len().min(b.len());
-    smaller > 0 && (shared as f64 / smaller as f64) >= CLUSTER_SIMILARITY_THRESHOLD
+    // A single-token set scores a perfect 1.0 against any longer title that
+    // merely contains that token, so a generic summary like "API" / "Fix API"
+    // would cluster with every unrelated "Add API auth", "Update API billing",
+    // etc. Require at least TWO shared tokens whenever the smaller set has only
+    // one token, so singletons need real signal before merging.
+    if smaller <= 1 {
+        return shared >= 2;
+    }
+    (shared as f64 / smaller as f64) >= CLUSTER_SIMILARITY_THRESHOLD
 }
 
 /// Deterministically cluster summarized entries by title similarity and return
@@ -1463,6 +1484,83 @@ mod tests {
         // A short title fully contained in a long one still merges (coeff 1.0).
         let short = significant_tokens("pricing service");
         assert!(tokens_overlap(&short, &a));
+    }
+
+    #[test]
+    fn tokens_overlap_singleton_does_not_overcluster() {
+        // A title reducing to a SINGLE significant token must not merge with
+        // every unrelated longer title that happens to contain that token —
+        // the overlap coefficient alone would score 1.0 here.
+        let single = significant_tokens("Fix API"); // -> ["api"]
+        assert_eq!(single, vec!["api".to_string()]);
+        let auth = significant_tokens("Add API auth"); // -> ["api", "auth"]
+        let billing = significant_tokens("Update API billing"); // -> ["api", "billing"]
+        assert!(
+            !tokens_overlap(&single, &auth),
+            "single shared token must not merge a singleton title"
+        );
+        assert!(
+            !tokens_overlap(&single, &billing),
+            "single shared token must not merge a singleton title"
+        );
+        // Two unrelated singletons that share their one token must also stay apart.
+        let other_single = significant_tokens("API"); // -> ["api"]
+        assert!(!tokens_overlap(&single, &other_single));
+        // Genuinely related multi-token titles still cluster.
+        let related_long = significant_tokens("Add API security with JWT auth middleware");
+        let related_short = significant_tokens("Enhance API auth"); // -> ["api", "auth"]
+        assert!(
+            tokens_overlap(&related_short, &related_long),
+            "two shared tokens out of two must still merge"
+        );
+    }
+
+    #[test]
+    fn cluster_titles_does_not_overcluster_singletons() {
+        // "Fix API" (singleton "api") must NOT swallow unrelated API titles.
+        let entries = [
+            titled_entry("a", "Fix API"),
+            titled_entry("b", "Add API auth"),
+            titled_entry("c", "Update API billing"),
+        ];
+        let refs: Vec<&WikiEntry> = entries.iter().collect();
+        let assignments = cluster_titles(&refs);
+        let distinct: std::collections::HashSet<_> =
+            assignments.iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "a singleton-token title must not cluster with unrelated longer titles"
+        );
+    }
+
+    #[test]
+    fn significant_tokens_normalizes_nfc_nfd_equivalents() {
+        // Precomposed "café" (NFC, U+00E9) and decomposed "café" (NFD,
+        // "e" + U+0301 combining acute) are canonically equivalent and must
+        // tokenize identically once normalized to NFC before stripping marks.
+        let nfc = "Caf\u{00e9} module"; // café
+        let nfd = "Cafe\u{0301} module"; // cafe + combining acute
+        assert_ne!(nfc, nfd, "fixture must use distinct byte sequences");
+        assert_eq!(significant_tokens(nfc), significant_tokens(nfd));
+        assert!(significant_tokens(nfc).contains(&"café".to_string()));
+    }
+
+    #[test]
+    fn cluster_titles_merges_nfc_nfd_equivalents() {
+        let entries = [
+            titled_entry("a", "Refactor Caf\u{00e9} Strat\u{00e9}gie"), // NFC
+            titled_entry("b", "Refactor Cafe\u{0301} Strate\u{0301}gie"), // NFD
+        ];
+        let refs: Vec<&WikiEntry> = entries.iter().collect();
+        let assignments = cluster_titles(&refs);
+        let distinct: std::collections::HashSet<_> =
+            assignments.iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "canonically-equivalent titles must merge regardless of NFC/NFD form"
+        );
     }
 
     #[test]
