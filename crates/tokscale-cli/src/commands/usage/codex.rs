@@ -893,14 +893,17 @@ fn reset_credits_from_response(response: ResetCreditsResponse) -> Option<UsageRe
 
 /// Decide whether to issue the extra detail GET for reset credits.
 ///
-/// The detail endpoint is only worth hitting when the cheap inline summary
-/// already tells us there is at least one available credit to enrich. When the
-/// summary is absent or reports zero credits we skip the call entirely: there
-/// is nothing to enrich, and firing the request on every periodic TUI refresh
-/// would roughly double backend request volume per Codex account and raise
-/// rate-limit risk.
+/// We fetch the detail endpoint whenever the cheap inline summary leaves the
+/// credit state unknown (absent) or already reports at least one available
+/// credit to enrich. The detail call is the only source of truth for accounts
+/// whose `/wham/usage` payload omits `rate_limit_reset_credits` entirely, so
+/// skipping it on an absent summary would hide reset credits that production
+/// can otherwise surface. We only skip when the summary is present and
+/// explicitly reports zero credits: there is nothing to enrich, and firing the
+/// request on every periodic TUI refresh would needlessly raise backend request
+/// volume and rate-limit risk.
 fn should_fetch_reset_details(summary: Option<&UsageResetCredits>) -> bool {
-    summary.is_some_and(|credits| credits.available_count > 0)
+    summary.is_none_or(|credits| credits.available_count > 0)
 }
 
 /// Merge the cheap summary count with an optional detail response.
@@ -1579,9 +1582,11 @@ mod tests {
     }
 
     #[test]
-    fn should_fetch_reset_details_only_when_summary_has_credits() {
-        // Absent summary: do NOT fire the extra round-trip on every refresh.
-        assert!(!should_fetch_reset_details(None));
+    fn should_fetch_reset_details_unless_summary_is_explicitly_zero() {
+        // Absent summary (unknown): fetch the detail endpoint, since it is the
+        // only source of credits for accounts whose usage payload omits the
+        // inline summary. Skipping here would hide reset credits in production.
+        assert!(should_fetch_reset_details(None));
         // Summary present but zero credits: nothing to enrich, skip.
         assert!(!should_fetch_reset_details(Some(&UsageResetCredits {
             available_count: 0,
