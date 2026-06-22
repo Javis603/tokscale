@@ -211,6 +211,48 @@ pub fn metadata_only_content(session_id: &str, client: &str) -> SessionContent {
     }
 }
 
+/// Dispatch to the correct per-client extractor for `client`, reading the
+/// session's actual file(s) from `candidate_paths`, and return the first result
+/// that yields a real `first_user_message`.
+///
+/// Falls back to [`metadata_only_content`] — never an error or panic — when:
+/// - the client has no dedicated extractor,
+/// - `candidate_paths` is empty,
+/// - every candidate file is missing/unreadable/unparseable, or
+/// - no candidate produced a non-empty first user message.
+///
+/// For file-keyed clients (claude, codex, gemini) each candidate is the
+/// session's own transcript file. For opencode the session lives as rows inside
+/// a shared SQLite database, so `candidate_paths` should carry the opencode
+/// database(s) and the extractor selects the session by `session_id` internally.
+pub fn extract_session_content(
+    client: &str,
+    session_id: &str,
+    candidate_paths: &[std::path::PathBuf],
+) -> SessionContent {
+    let extractor: fn(&Path, &str) -> Option<SessionContent> = match client {
+        "opencode" => extract_opencode_content,
+        "claude" => extract_claudecode_content,
+        "codex" => extract_codex_content,
+        "gemini" => extract_gemini_content,
+        // Unknown/unsupported client: no dedicated extractor.
+        _ => return metadata_only_content(session_id, client),
+    };
+
+    for path in candidate_paths {
+        if let Some(content) = extractor(path, session_id) {
+            // A real extractor can still return `Some` with `first_user_message:
+            // None` (e.g. the file parsed but held no user message); keep
+            // scanning the remaining candidates for one that does.
+            if content.first_user_message.is_some() {
+                return content;
+            }
+        }
+    }
+
+    metadata_only_content(session_id, client)
+}
+
 fn extract_text_from_claude_message(value: &Value) -> Option<String> {
     if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
         if let Some(arr) = content.as_array() {
@@ -265,5 +307,50 @@ fn truncate(s: &str, max_chars: usize) -> String {
             .map(|(i, _)| i)
             .unwrap_or(s.len());
         format!("{}...", &s[..boundary])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn extract_session_content_dispatches_to_real_claude_extractor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Add a CLI flag"}]}}
+"#,
+        )
+        .unwrap();
+
+        let content = extract_session_content("claude", "sess", &[path]);
+        assert_eq!(content.first_user_message.as_deref(), Some("Add a CLI flag"));
+        assert_eq!(content.client, "claude");
+    }
+
+    #[test]
+    fn extract_session_content_unknown_client_is_metadata_only() {
+        let content = extract_session_content("totally-unknown", "sess", &[PathBuf::from("/nope")]);
+        assert!(content.first_user_message.is_none());
+        assert_eq!(content.client, "totally-unknown");
+    }
+
+    #[test]
+    fn extract_session_content_no_candidates_is_metadata_only() {
+        let content = extract_session_content("claude", "sess", &[]);
+        assert!(content.first_user_message.is_none());
+        assert_eq!(content.client, "claude");
+    }
+
+    #[test]
+    fn extract_session_content_unreadable_file_does_not_panic() {
+        // Missing/unparseable candidate must degrade gracefully, never panic.
+        let content =
+            extract_session_content("codex", "sess", &[PathBuf::from("/definitely/missing.jsonl")]);
+        assert!(content.first_user_message.is_none());
+        assert_eq!(content.client, "codex");
     }
 }

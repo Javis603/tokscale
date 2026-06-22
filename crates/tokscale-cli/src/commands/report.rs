@@ -7,7 +7,8 @@ use std::process::{Command, Output, Stdio};
 
 use super::apple_fm;
 use std::time::Duration;
-use tokscale_core::content_extractor::metadata_only_content;
+use std::path::PathBuf;
+use tokscale_core::content_extractor::{extract_session_content, metadata_only_content};
 use tokscale_core::content_extractor::SessionContent;
 use tokscale_core::pricing::PricingService;
 use tokscale_core::wiki::{WikiDb, WikiEntry};
@@ -53,7 +54,8 @@ pub fn run_report(opts: ReportOptions) -> Result<()> {
     };
 
     if !unsummarized.is_empty() {
-        run_summarizer(&db, &unsummarized, &opts.summarizer)?;
+        let session_paths = build_session_path_index(&opts);
+        run_summarizer(&db, &unsummarized, &opts.summarizer, &session_paths)?;
     }
 
     let entries = db
@@ -191,11 +193,16 @@ fn populate_wiki_from_sessions(db: &WikiDb, opts: &ReportOptions) -> Result<()> 
     Ok(())
 }
 
-fn run_summarizer(db: &WikiDb, session_ids: &[String], backend: &str) -> Result<()> {
+fn run_summarizer(
+    db: &WikiDb,
+    session_ids: &[String],
+    backend: &str,
+    session_paths: &SessionPathIndex,
+) -> Result<()> {
     let mut payloads: Vec<serde_json::Value> = Vec::new();
     for sid in session_ids {
         if let Ok(Some(entry)) = db.get_entry(sid) {
-            let content = extract_content_for_session(&entry);
+            let content = extract_content_for_session(&entry, session_paths);
             payloads.push(serde_json::json!({
                 "session_id": entry.session_id,
                 "client": entry.client,
@@ -1127,8 +1134,81 @@ fn print_session_list(entries: &[WikiEntry]) {
     }
 }
 
-fn extract_content_for_session(entry: &WikiEntry) -> SessionContent {
-    metadata_only_content(&entry.session_id, &entry.client)
+/// Maps every locally-discovered session to the on-disk file(s) its content can
+/// be extracted from, so the summarizer payload carries the real first user
+/// message instead of metadata only.
+///
+/// File-keyed clients (claude, codex, gemini) live as one transcript file per
+/// session, indexed here by `session_id` (the file stem). OpenCode sessions live
+/// as rows inside a shared SQLite database, so every opencode database is kept as
+/// a candidate and the extractor selects the matching session internally.
+#[derive(Default)]
+struct SessionPathIndex {
+    by_session_id: HashMap<String, Vec<PathBuf>>,
+    opencode_dbs: Vec<PathBuf>,
+}
+
+impl SessionPathIndex {
+    /// Candidate file(s) to feed the dispatcher for `(client, session_id)`.
+    fn candidates_for(&self, client: &str, session_id: &str) -> Vec<PathBuf> {
+        if client == "opencode" {
+            return self.opencode_dbs.clone();
+        }
+        self.by_session_id
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Scan local client data once and index every session file by `session_id`
+/// (file stem) plus the OpenCode databases, so per-session content extraction
+/// never has to re-walk the filesystem. Scanning is best-effort: any client the
+/// summarizer can't extract simply yields no candidates and falls back to
+/// metadata-only.
+fn build_session_path_index(opts: &ReportOptions) -> SessionPathIndex {
+    let home_dir = opts
+        .home_dir
+        .clone()
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_default();
+    let use_env_roots = opts.home_dir.is_none();
+
+    let scan = tokscale_core::scanner::scan_all_clients_with_scanner_settings(
+        &home_dir,
+        &[],
+        use_env_roots,
+        &opts.scanner_settings,
+    );
+
+    let mut by_session_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for (_client, path) in scan.all_files() {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            by_session_id
+                .entry(stem.to_string())
+                .or_default()
+                .push(path);
+        }
+    }
+
+    SessionPathIndex {
+        by_session_id,
+        opencode_dbs: scan.opencode_dbs.clone(),
+    }
+}
+
+/// Resolve a session's real content by dispatching to the correct per-client
+/// extractor over its on-disk file(s). Falls back to metadata-only when the
+/// client is unsupported or no candidate file yields a first user message.
+fn extract_content_for_session(
+    entry: &WikiEntry,
+    session_paths: &SessionPathIndex,
+) -> SessionContent {
+    let candidates = session_paths.candidates_for(&entry.client, &entry.session_id);
+    if candidates.is_empty() {
+        return metadata_only_content(&entry.session_id, &entry.client);
+    }
+    extract_session_content(&entry.client, &entry.session_id, &candidates)
 }
 
 fn parse_date_range(since: &Option<String>, until: &Option<String>) -> (Option<i64>, Option<i64>) {
@@ -1328,7 +1408,7 @@ mod tests {
 
     #[test]
     fn cluster_titles_merges_near_duplicates() {
-        let entries = vec![
+        let entries = [
             titled_entry("a", "Enhance API Security"),
             titled_entry("b", "Enhance API security with JWT auth middleware"),
             titled_entry("c", "Add JWT auth middleware"),
@@ -1356,7 +1436,7 @@ mod tests {
 
     #[test]
     fn cluster_titles_keeps_unrelated_apart() {
-        let entries = vec![
+        let entries = [
             titled_entry("a", "Add JWT auth middleware"),
             titled_entry("b", "Update database migration scripts"),
             titled_entry("c", "Refactor pricing service cache"),
@@ -1377,7 +1457,7 @@ mod tests {
     fn cluster_label_prefers_most_frequent_then_shortest() {
         // Two identical long titles + one shorter variant: frequency wins, so the
         // repeated long title is the label even though a shorter one exists.
-        let entries = vec![
+        let entries = [
             titled_entry("a", "Add JWT auth middleware"),
             titled_entry("b", "Add JWT auth middleware"),
             titled_entry("c", "JWT auth"),
@@ -1401,5 +1481,79 @@ mod tests {
             assignments.iter().map(|(_, l)| l.clone()).collect();
         assert_eq!(distinct.len(), 1);
         assert_eq!(assignments.len(), 51);
+    }
+
+    fn entry_for(session_id: &str, client: &str) -> WikiEntry {
+        let mut e = titled_entry(session_id, "ignored");
+        e.client = client.to_string();
+        e.title = None;
+        e
+    }
+
+    #[test]
+    fn extract_content_for_session_reads_real_claude_first_message() {
+        // A claudecode transcript on disk, keyed by file stem == session_id.
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "sess-claude-1";
+        let path = dir.path().join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &path,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the login bug"}]}}
+"#,
+        )
+        .unwrap();
+
+        let mut by_session_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        by_session_id.insert(session_id.to_string(), vec![path]);
+        let index = SessionPathIndex {
+            by_session_id,
+            opencode_dbs: Vec::new(),
+        };
+
+        let entry = entry_for(session_id, "claude");
+        let content = extract_content_for_session(&entry, &index);
+
+        // The dispatcher must have reached the real claudecode extractor and
+        // surfaced the actual first user message — not metadata-only.
+        assert_eq!(
+            content.first_user_message.as_deref(),
+            Some("Fix the login bug")
+        );
+        assert_eq!(content.client, "claude");
+    }
+
+    #[test]
+    fn extract_content_for_session_unknown_client_falls_back_to_metadata_only() {
+        // An unsupported client has no dedicated extractor: must degrade to
+        // metadata-only (None) without error or panic, even if a stray file
+        // happens to share the session id.
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "sess-unknown-1";
+        let path = dir.path().join(format!("{session_id}.jsonl"));
+        std::fs::write(&path, "garbage\n").unwrap();
+
+        let mut by_session_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        by_session_id.insert(session_id.to_string(), vec![path]);
+        let index = SessionPathIndex {
+            by_session_id,
+            opencode_dbs: Vec::new(),
+        };
+
+        let entry = entry_for(session_id, "some-unsupported-client");
+        let content = extract_content_for_session(&entry, &index);
+
+        assert!(content.first_user_message.is_none());
+        assert_eq!(content.client, "some-unsupported-client");
+    }
+
+    #[test]
+    fn extract_content_for_session_missing_file_falls_back_to_metadata_only() {
+        // Supported client but no candidate file on disk: never panic, return
+        // metadata-only.
+        let index = SessionPathIndex::default();
+        let entry = entry_for("does-not-exist", "claude");
+        let content = extract_content_for_session(&entry, &index);
+        assert!(content.first_user_message.is_none());
+        assert_eq!(content.client, "claude");
     }
 }
