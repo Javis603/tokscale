@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::{Local, TimeZone};
 use colored::Colorize;
 use std::collections::HashMap;
 use std::io::Write;
@@ -1048,8 +1048,8 @@ fn print_daily_breakdown(entries: &[WikiEntry]) {
 
     let mut by_date: BTreeMap<String, (f64, i64, usize, Vec<&WikiEntry>)> = BTreeMap::new();
     for entry in entries {
-        let date_key = Utc
-            .timestamp_opt(entry.created_at / 1000, 0)
+        let date_key = Local
+            .timestamp_millis_opt(entry.created_at)
             .single()
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown".to_string());
@@ -1102,8 +1102,8 @@ fn print_session_list(entries: &[WikiEntry]) {
         println!("  Sessions:");
         println!("  {}", "─".repeat(80));
         for entry in recent {
-            let date = Utc
-                .timestamp_opt(entry.created_at / 1000, 0)
+            let date = Local
+                .timestamp_millis_opt(entry.created_at)
                 .single()
                 .map(|dt| dt.format("%H:%M").to_string())
                 .unwrap_or_else(|| "??:??".to_string());
@@ -1132,25 +1132,34 @@ fn extract_content_for_session(entry: &WikiEntry) -> SessionContent {
 }
 
 fn parse_date_range(since: &Option<String>, until: &Option<String>) -> (Option<i64>, Option<i64>) {
-    let since_ts = since.as_ref().and_then(|s| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()
-            .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
-    });
-    let until_ts = until.as_ref().and_then(|s| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()
-            .map(|d| {
-                d.succ_opt()
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc()
-                    .timestamp_millis()
-                    - 1
-            })
-    });
+    // The `since`/`until` strings are local-calendar dates (e.g. produced by
+    // `build_date_filter`, which derives them from `chrono::Local::now()`), and
+    // session dates are bucketed in local time (see
+    // `sessions::timestamp_to_date`). Interpret the day boundaries in local time
+    // so filtering lines up with grouping and avoids off-by-a-day mismatches.
+    let since_ts = since
+        .as_ref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .and_then(local_start_of_day_millis);
+    let until_ts = until
+        .as_ref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .and_then(|d| d.succ_opt())
+        .and_then(|next| local_start_of_day_millis(next).map(|ms| ms - 1));
     (since_ts, until_ts)
+}
+
+/// Returns the Unix-millisecond timestamp for midnight (00:00:00) of `date` in
+/// the local timezone, or `None` when that wall-clock time does not exist
+/// locally (e.g. a DST spring-forward gap).
+fn local_start_of_day_millis(date: chrono::NaiveDate) -> Option<i64> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    match Local.from_local_datetime(&midnight) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+            Some(dt.timestamp_millis())
+        }
+        chrono::LocalResult::None => None,
+    }
 }
 
 /// Loads the canonical pricing dataset for cost attribution, preferring a fresh
@@ -1274,6 +1283,64 @@ mod tests {
             canonical > 0.0,
             "expected a positive cost for a known model"
         );
+    }
+
+    #[test]
+    fn parse_date_range_buckets_in_local_time() {
+        use chrono::{Local, TimeZone};
+
+        // Pick an arbitrary calendar day. The exact day is irrelevant; what
+        // matters is that `parse_date_range` interprets the boundaries in the
+        // *local* timezone, matching how `sessions::timestamp_to_date` buckets
+        // each message (and how `build_date_filter` derives these strings from
+        // `chrono::Local::now()`).
+        let day = "2026-03-08";
+        let (since, until) = parse_date_range(&Some(day.into()), &Some(day.into()));
+
+        let expected_since = Local
+            .with_ymd_and_hms(2026, 3, 8, 0, 0, 0)
+            .single()
+            .map(|dt| dt.timestamp_millis())
+            .expect("local midnight exists for this fixed date");
+        // The window is inclusive of the whole local day: [00:00:00.000,
+        // next-day 00:00:00.000 - 1ms].
+        let expected_until = Local
+            .with_ymd_and_hms(2026, 3, 9, 0, 0, 0)
+            .single()
+            .map(|dt| dt.timestamp_millis() - 1)
+            .expect("local midnight exists for this fixed date");
+
+        assert_eq!(since, Some(expected_since));
+        assert_eq!(until, Some(expected_until));
+
+        // Regression guard: the previous implementation interpreted the day as
+        // UTC. Any machine running in a non-UTC zone would then see boundaries
+        // shifted by the offset. Confirm the local boundary differs from the
+        // UTC one whenever the local offset is non-zero, so this test actually
+        // exercises the fix on offset machines (and stays correct on UTC ones).
+        let utc_since = chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        let local_offset_secs = Local
+            .offset_from_utc_datetime(
+                &chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )
+            .local_minus_utc();
+        if local_offset_secs != 0 {
+            assert_ne!(
+                since,
+                Some(utc_since),
+                "local-time bucketing must differ from UTC on offset machines"
+            );
+        } else {
+            assert_eq!(since, Some(utc_since));
+        }
     }
 
     #[test]
