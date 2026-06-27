@@ -86,7 +86,7 @@
 | <img width="48px" src="https://github.com/cline.png" alt="Cline" /> | [Cline](https://github.com/cline/cline) | VS Code globalStorage tasks (Linux: `~/.config/Code/...`; macOS: `~/Library/Application Support/Code/...`; Windows: `%APPDATA%\Code\...`; server: `~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks/`) | ✅ Yes |
 | <img width="48px" src="https://github.com/user-attachments/assets/7246e920-f3f8-4b6e-847e-030ae04e86c2" alt="Gajae-Code" /> | [gajae-code (gjc)](https://github.com/Yeachan-Heo/gajae-code) | `~/.gjc/agent/sessions/` (override via `GJC_CODING_AGENT_DIR`, `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`; `$XDG_DATA_HOME/gjc/sessions/` on Linux/macOS) | ✅ Yes |
 | <img width="48px" src=".github/assets/client-jcode.png" alt="Jcode" /> | [Jcode](https://github.com/1jehuang/jcode) | `~/.jcode/sessions/session_*.json` + `session_*.journal.jsonl` sidecars (override via `JCODE_HOME`) | ✅ Yes |
-| <img width="48px" src="https://github.com/XiaomiMiMo.png" alt="MiMo Code" /> | [MiMo Code](https://github.com/XiaomiMiMo/MiMo-Code) | `~/.local/share/micode/mimocode.db` (XDG data dir; SQLite) | ✅ Yes |
+| <img width="48px" src="https://github.com/XiaomiMiMo.png" alt="MiMo Code" /> | [MiMo Code](https://github.com/XiaomiMiMo/MiMo-Code) | `~/.local/share/mimocode/mimocode.db` (XDG data dir; SQLite) | ✅ Yes |
 | <img width="48px" src="https://github.com/JetBrains.png" alt="Junie" /> | [Junie](https://www.jetbrains.com/junie/) | `~/.junie/sessions/*/events.jsonl` | ✅ Yes |
 | <img width="48px" src="https://raw.githubusercontent.com/CommandCodeAI/command-code/main/.github/commandcode/logo/command-code-logo-black-bg.png" alt="Command Code" /> | [Command Code](https://github.com/CommandCodeAI/command-code) | `~/.commandcode/projects/**/*.jsonl` (token usage estimated from transcripts at ~4 chars/token; not persisted on disk) | ✅ Yes |
 | <img width="48px" src="https://github.com/zai-org.png" alt="ZCode" /> | [ZCode](https://zcode.z.ai/) | `~/.zcode/projects/**/*.jsonl` | ✅ Yes |
@@ -1300,7 +1300,7 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Warp/Oz | `~/.config/tokscale/warp-cache/usage.json` | `%APPDATA%\tokscale\warp-cache\usage.json` | Synced via `tokscale warp sync`; aggregate requests and spend only, no token transcripts |
 | Grok Build | `~/.grok/sessions/` | `%USERPROFILE%\.grok\sessions\` | Configurable via `GROK_HOME` env var; parses `updates.jsonl` session updates |
 | Jcode | `~/.jcode/sessions/` | `%USERPROFILE%\.jcode\sessions\` | Configurable via `JCODE_HOME` env var; parses `session_*.json` snapshots plus `session_*.journal.jsonl` sidecars |
-| MiMo Code | `~/.local/share/micode/` | `%USERPROFILE%\.local\share\micode\` | Uses XDG data directory; SQLite database `mimocode.db` |
+| MiMo Code | `~/.local/share/mimocode/` | `%USERPROFILE%\.local\share\mimocode\` | Uses XDG data directory; SQLite database `mimocode.db` |
 | Gajae-Code | `~/.gjc/agent/sessions/` | `%USERPROFILE%\.gjc\agent\sessions\` | Configurable via `GJC_CODING_AGENT_DIR` (also `GJC_CONFIG_DIR`/`PI_CONFIG_DIR`; `$XDG_DATA_HOME/gjc/sessions/` flattens on Linux/macOS) |
 | Junie | `~/.junie/sessions/` | `%USERPROFILE%\.junie\sessions\` | Same home-relative path on all platforms; parses `events.jsonl` usage events |
 | ZCode | `~/.zcode/projects/` | `%USERPROFILE%\.zcode\projects\` | Parses `*.jsonl` session transcripts; Z.ai's ADE for GLM models |
@@ -1721,7 +1721,7 @@ Tokscale also checks Octofriend SQLite at `~/.local/share/octofriend/sqlite.db` 
 
 ### MiMo Code
 
-Location: `~/.local/share/micode/mimocode.db` (XDG data directory)
+Location: `~/.local/share/mimocode/mimocode.db` (XDG data directory)
 
 MiMo Code stores session data in a SQLite database. Tokscale queries the `message` table joined with `session` for workspace context:
 

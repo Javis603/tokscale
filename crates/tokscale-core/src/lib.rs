@@ -3868,7 +3868,7 @@ mod tests {
         std::env::set_var("HOME", cache_home.path());
 
         {
-            let micode_dir = source_home.path().join(".local/share/micode");
+            let micode_dir = source_home.path().join(".local/share/mimocode");
             std::fs::create_dir_all(&micode_dir).unwrap();
             let db_path = micode_dir.join("mimocode.db");
 

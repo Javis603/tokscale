@@ -463,7 +463,7 @@ define_clients!(
     MiMoCode = 30 => {
         id: "micode",
         root: PathRoot::XdgData,
-        relative: "micode",
+        relative: "mimocode",
         pattern: "*.db",
         headless: false,
         parse_local: true,
