@@ -178,10 +178,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.settings.target }}
+      - name: Install pinned Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The source checkout owns its exact toolchain in rust-toolchain.toml.
+          # Installing a target into a floating `stable` toolchain leaves the
+          # pinned toolchain without its cross stdlib, so cargo later fails with
+          # "can't find crate for core" on every non-host target.
+          rustup target add "${{ matrix.settings.target }}"
 
       - name: Cache cargo
         uses: actions/cache@v5
