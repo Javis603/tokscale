@@ -7,6 +7,13 @@
 //! same rows to a plain `session.jsonl` in the same directory, so this parser
 //! dispatches on the zstd frame magic rather than on the file name.
 //!
+//! A harness upgrade re-encodes a session under a version-tagged name
+//! (`session.v3.jsonl.zstd`) and stops appending to the unversioned pair, which
+//! it leaves in place; `scanner::is_dsh_session_log` matches every spelling.
+//! The two copies of one session overlap, and the dedup key below — the call
+//! identity plus its token counts — is what collapses them, so this lane must
+//! stay on `parse_cached_lane_deduped`.
+//!
 //! The transcript is an append-only event stream; the rows Tokscale needs are:
 //!
 //! - `session`: session id, `createdAt` (ms), `cwd` (workspace root), and the
