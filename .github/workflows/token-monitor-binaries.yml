@@ -1,15 +1,26 @@
 name: Token Monitor Vendor Release
-run-name: "Token Monitor vendor release from upstream/${{ inputs.source_ref }}"
+run-name: "Token Monitor vendor release from ${{ inputs.source_repository }}/${{ inputs.source_ref }}"
 
-# Downstream-only workflow for Javis603/tokscale. It intentionally builds from
-# junhoyeo/tokscale instead of the fork checkout, so leaving source_ref at main
-# always resolves the current upstream tip to an exact, reproducible commit.
+# Downstream-only workflow for Javis603/tokscale. It builds from a source
+# repository rather than from the branch it is dispatched on, so the defaults —
+# junhoyeo/tokscale at main — always resolve the current upstream tip to an
+# exact, reproducible commit.
+#
+# source_repository exists for the case the vendor override is for: upstream
+# has not released a fix Token Monitor needs, so a patch branch on this fork is
+# the source. Point it back at junhoyeo/tokscale once that fix is upstream, so
+# a vendored build stays reproducible from upstream by default.
 
 on:
   workflow_dispatch:
     inputs:
+      source_repository:
+        description: "Source repository (owner/repo) to build from"
+        required: true
+        type: string
+        default: "junhoyeo/tokscale"
       source_ref:
-        description: "Upstream branch, tag, or full commit SHA to release"
+        description: "Branch, tag, or full commit SHA in that repository to release"
         required: true
         type: string
         default: "main"
@@ -26,24 +37,35 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM_REPOSITORY: junhoyeo/tokscale
+  SOURCE_REPOSITORY: ${{ inputs.source_repository }}
   MACOSX_DEPLOYMENT_TARGET: "10.13"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
   resolve-source:
-    name: Resolve upstream source
+    name: Resolve build source
     runs-on: ubuntu-latest
     outputs:
       source_sha: ${{ steps.source.outputs.source_sha }}
       short_sha: ${{ steps.source.outputs.short_sha }}
       release_tag: ${{ steps.source.outputs.release_tag }}
     steps:
-      - name: Checkout upstream source
+      # Runs before the checkout so a typo names itself instead of surfacing as
+      # an opaque "repository not found" from actions/checkout.
+      - name: Validate source repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "source_repository must be owner/repo, got '$SOURCE_REPOSITORY'" >&2
+            exit 1
+          fi
+
+      - name: Checkout build source
         uses: actions/checkout@v5
         with:
-          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ inputs.source_ref }}
           fetch-depth: 1
           persist-credentials: false
@@ -58,7 +80,7 @@ jobs:
           release_tag="token-monitor-${short_sha}"
 
           if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Could not resolve an exact upstream commit SHA" >&2
+            echo "Could not resolve an exact source commit SHA" >&2
             exit 1
           fi
 
@@ -67,7 +89,7 @@ jobs:
             echo "short_sha=$short_sha"
             echo "release_tag=$release_tag"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved $UPSTREAM_REPOSITORY@$source_sha"
+          echo "Resolved $SOURCE_REPOSITORY@$source_sha"
 
       - name: Refuse to replace an existing vendor release
         env:
@@ -148,10 +170,10 @@ jobs:
             strip: ""
 
     steps:
-      - name: Checkout exact upstream source
+      - name: Checkout exact build source
         uses: actions/checkout@v5
         with:
-          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.resolve-source.outputs.source_sha }}
           fetch-depth: 1
           persist-credentials: false
@@ -281,7 +303,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          notes="Token Monitor downstream binary build from [$UPSTREAM_REPOSITORY@$SHORT_SHA](https://github.com/$UPSTREAM_REPOSITORY/commit/$SOURCE_SHA)."
+          notes="Token Monitor downstream binary build from [$SOURCE_REPOSITORY@$SHORT_SHA](https://github.com/$SOURCE_REPOSITORY/commit/$SOURCE_SHA)."
           if [[ -n "$RELEASE_SUMMARY" ]]; then
             notes="$(printf '%s\n\n%s' "$notes" "$RELEASE_SUMMARY")"
           fi
