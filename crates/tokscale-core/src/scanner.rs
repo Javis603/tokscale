@@ -382,6 +382,36 @@ pub fn copilot_exporter_path() -> Option<PathBuf> {
     copilot_exporter_path_with_env_strategy(true)
 }
 
+/// Whether `file_name` is a DeepSeek Harness session transcript.
+///
+/// DSH writes one transcript per session directory as `session.jsonl.zstd`, or
+/// as a plain `session.jsonl` when the backend is configured with
+/// `compression: none`. A harness upgrade re-encodes the transcript under a
+/// version-tagged spelling — `session.v3.jsonl.zstd` — and stops appending to
+/// the unversioned pair, which it leaves behind. Matching only the unversioned
+/// names therefore reported no usage at all for every session written after
+/// such an upgrade.
+///
+/// The version segment is matched generically rather than pinned to `v3`, so
+/// the next re-encode does not silently drop usage the same way.
+///
+/// Both spellings of one session can sit in the same directory. That is safe:
+/// the DSH lane runs through `parse_cached_lane_deduped`, and the parser's
+/// dedup key is the call identity plus its token counts, so the re-encoded
+/// prefix collapses against the rows retained in the original file.
+fn is_dsh_session_log(file_name: &str) -> bool {
+    let stem = file_name.strip_suffix(".zstd").unwrap_or(file_name);
+    let Some(version) = stem
+        .strip_prefix("session.")
+        .and_then(|rest| rest.strip_suffix(".jsonl"))
+    else {
+        return stem == "session.jsonl";
+    };
+    version
+        .strip_prefix('v')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Whether an OpenClaw transcript name is a compaction checkpoint snapshot.
 ///
 /// OpenClaw writes these as `<session>.checkpoint.<uuid>.jsonl`; its archive
@@ -623,11 +653,11 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 // depth under `~/.dsh/sessions/`. The `.zstd` suffix marks the
                 // physical encoding only — a backend configured with
                 // `compression: none` writes the same rows to a plain
-                // `session.jsonl` in the same directory — so both spellings
-                // are session logs and the parser sniffs the frame magic.
-                "dsh-session-log" => {
-                    file_name == "session.jsonl.zstd" || file_name == "session.jsonl"
-                }
+                // `session.jsonl` in the same directory — so every spelling is
+                // a session log and the parser sniffs the frame magic. See
+                // `is_dsh_session_log` for the version-tagged names a harness
+                // upgrade re-encodes into.
+                "dsh-session-log" => is_dsh_session_log(file_name),
                 "wire.jsonl" => file_name == "wire.jsonl",
                 // fx (vercel-labs/fx): one `usage-v2.json` per session
                 // directory under `~/.fx/sessions/<id>/`. WalkDir recursion
@@ -3411,6 +3441,63 @@ mod tests {
             .collect();
         // Byte-lexical path order: `session-abc-123` sorts before `session-def-456`.
         assert_eq!(names, vec!["session.jsonl.zstd", "session.jsonl"]);
+    }
+
+    /// A DSH harness upgrade re-encodes each session under a version-tagged
+    /// name and stops appending to the unversioned pair it leaves behind, so
+    /// matching only the unversioned names hid every session written after the
+    /// upgrade. Both spellings are discovered; the DSH lane dedupes the
+    /// overlapping rows on the call identity.
+    #[test]
+    fn test_scan_directory_dsh_versioned_session_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        // The upgrade case: the re-encoded transcript beside the retained one.
+        let upgraded = path
+            .join("sessions")
+            .join("--E-Code-proj--")
+            .join("session-abc-123");
+        fs::create_dir_all(&upgraded).unwrap();
+        File::create(upgraded.join("session.jsonl.zstd")).unwrap();
+        File::create(upgraded.join("session.v3.jsonl.zstd")).unwrap();
+        // DSH holds a lock file in the same directory; it is not a transcript.
+        File::create(upgraded.join("session.lock")).unwrap();
+
+        // A session written entirely after the upgrade has no unversioned copy,
+        // and `compression: none` spells it without the `.zstd` suffix.
+        let versioned_only = path
+            .join("sessions")
+            .join("--E-Code-proj--")
+            .join("session-def-456");
+        fs::create_dir_all(&versioned_only).unwrap();
+        File::create(versioned_only.join("session.v12.jsonl")).unwrap();
+
+        // Neither a non-numeric version segment nor a partial write is a
+        // transcript this parser should claim.
+        let rejected = path
+            .join("sessions")
+            .join("--E-Code-proj--")
+            .join("session-ghi-789");
+        fs::create_dir_all(&rejected).unwrap();
+        File::create(rejected.join("session.next.jsonl.zstd")).unwrap();
+        File::create(rejected.join("session.v3.jsonl.tmp")).unwrap();
+        File::create(rejected.join("session.v.jsonl")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "dsh-session-log");
+        let mut names: Vec<&str> = files
+            .iter()
+            .filter_map(|file| file.file_name().and_then(|name| name.to_str()))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "session.jsonl.zstd",
+                "session.v12.jsonl",
+                "session.v3.jsonl.zstd"
+            ]
+        );
     }
 
     #[test]
