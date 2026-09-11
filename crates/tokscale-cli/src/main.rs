@@ -90,7 +90,7 @@ struct Cli {
         long,
         value_name = "STRATEGY",
         default_value = "client,model",
-        help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model"
+        help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, client,workspace,session,model"
     )]
     group_by: String,
 
@@ -122,7 +122,7 @@ enum Commands {
             long,
             value_name = "STRATEGY",
             default_value = "client,model",
-            help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model"
+            help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, client,workspace,session,model"
         )]
         group_by: String,
         #[arg(
@@ -2308,9 +2308,37 @@ fn run_models_report(
 
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
+        struct WorkspaceMetaJson {
+            workspace_key: String,
+            label: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            path: Option<String>,
+        }
+
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SessionMetaJson {
+            client: String,
+            session_id: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title: Option<String>,
+            first_active_ms: i64,
+            last_active_ms: i64,
+        }
+
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct ModelReportJson {
             group_by: String,
             entries: Vec<ModelUsageJson>,
+            /// Per-session facts for session-grouped reports, joined by
+            /// `(client, sessionId)`. Absent for every other grouping.
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            sessions: Vec<SessionMetaJson>,
+            /// Decoded workspace identities, joined by `workspaceKey`. Absent
+            /// for groupings whose rows carry no workspace.
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            workspaces: Vec<WorkspaceMetaJson>,
             total_input: i64,
             total_output: i64,
             total_cache_read: i64,
@@ -2324,13 +2352,38 @@ fn run_models_report(
             diagnostics: Vec<claude_diagnostics::ClientDiagnostic>,
         }
 
+        let workspaces: Vec<WorkspaceMetaJson> = report
+            .workspaces
+            .into_iter()
+            .map(|w| WorkspaceMetaJson {
+                workspace_key: w.workspace_key,
+                label: w.label,
+                path: w.path,
+            })
+            .collect();
+        let sessions: Vec<SessionMetaJson> = report
+            .sessions
+            .into_iter()
+            .map(|s| SessionMetaJson {
+                client: s.client,
+                session_id: s.session_id,
+                title: s.title,
+                first_active_ms: s.first_active_ms,
+                last_active_ms: s.last_active_ms,
+            })
+            .collect();
         let output = ModelReportJson {
             group_by: group_by.to_string(),
+            sessions,
+            workspaces,
             entries: report
                 .entries
                 .into_iter()
                 .map(|e| ModelUsageJson {
-                    workspace_key: if group_by == GroupBy::WorkspaceModel {
+                    workspace_key: if matches!(
+                        group_by,
+                        GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+                    ) {
                         Some(
                             e.workspace_key
                                 .map(serde_json::Value::String)
@@ -2339,12 +2392,18 @@ fn run_models_report(
                     } else {
                         None
                     },
-                    workspace_label: if group_by == GroupBy::WorkspaceModel {
+                    workspace_label: if matches!(
+                        group_by,
+                        GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+                    ) {
                         e.workspace_label
                     } else {
                         None
                     },
-                    session_id: if matches!(group_by, GroupBy::Session | GroupBy::ClientSession) {
+                    session_id: if matches!(
+                        group_by,
+                        GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+                    ) {
                         e.session_id
                     } else {
                         None
@@ -2541,8 +2600,11 @@ fn run_models_report(
                             .set_alignment(CellAlignment::Right),
                     ]);
                 }
-                GroupBy::Session | GroupBy::ClientSession => {
-                    let show_client = group_by == GroupBy::ClientSession;
+                GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession => {
+                    let show_client = matches!(
+                        group_by,
+                        GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+                    );
                     let mut header = Vec::with_capacity(6);
                     if show_client {
                         header.push(Cell::new("Client").fg(Color::Cyan));
@@ -2743,8 +2805,11 @@ fn run_models_report(
                             .set_alignment(CellAlignment::Right),
                     ]);
                 }
-                GroupBy::Session | GroupBy::ClientSession => {
-                    let show_client = group_by == GroupBy::ClientSession;
+                GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession => {
+                    let show_client = matches!(
+                        group_by,
+                        GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+                    );
                     let mut header = Vec::with_capacity(9);
                     if show_client {
                         header.push(Cell::new("Client").fg(Color::Cyan));
