@@ -1449,7 +1449,12 @@ fn parser_version(client: ClientId) -> u32 {
         // `data.compactionId` before the per-transcript `seq` fallback. Reparse
         // released v4 rows so unrelated summaries with otherwise identical
         // call data are no longer collapsed across files (#1187).
-        ClientId::Dsh => 5,
+        // v5->v6: current seeded transcripts store their inherited-prefix cut
+        // on the last tagged `session/end-seed` marker instead of the legacy
+        // header `seedLength`. Finished child transcripts keep the same bytes,
+        // so only this bump removes cached inherited usage and repairs its
+        // per-session attribution.
+        ClientId::Dsh => 6,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -4035,11 +4040,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dsh_compaction_identity_parser_version_invalidates_v4_entries() {
-        // A finished transcript is never rewritten when attribution starts
-        // preferring compactionId, so its fingerprint remains valid and only
-        // the parser version can retire the seq-keyed row released in v4.14.0.
-        assert_eq!(parser_version(ClientId::Dsh), 5);
+    fn test_dsh_seed_boundary_parser_version_invalidates_v5_entries() {
+        // A finished child transcript is never rewritten when the parser gains
+        // v3 end-seed awareness, so its fingerprint remains valid and only the
+        // parser version can retire inherited usage cached by v5.
+        assert_eq!(parser_version(ClientId::Dsh), 6);
     }
 
     #[test]
@@ -4053,7 +4058,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 5);
+        assert_eq!(current_identity.parser_version, 6);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 3,
@@ -4114,7 +4119,7 @@ mod tests {
 
         let warm = SourceMessageCache::load();
         let cached = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(cached.parser_version, 5);
+        assert_eq!(cached.parser_version, 6);
         assert_eq!(cached.messages, rebuilt);
     }
 
@@ -4129,7 +4134,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 5);
+        assert_eq!(current_identity.parser_version, 6);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 4,
@@ -4194,7 +4199,7 @@ mod tests {
 
         let warm = SourceMessageCache::load();
         let cached = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(cached.parser_version, 5);
+        assert_eq!(cached.parser_version, 6);
         assert_eq!(cached.messages, rebuilt);
     }
 
