@@ -313,9 +313,11 @@ fn daily_source_model_key(
     match group_by {
         GroupBy::WorkspaceModel => workspace_model_daily_key(workspace_group_key, model),
         GroupBy::ClientProviderModel => format!("{provider_id}:{model}"),
-        GroupBy::Model | GroupBy::ClientModel | GroupBy::Session | GroupBy::ClientSession => {
-            model.to_string()
-        }
+        GroupBy::Model
+        | GroupBy::ClientModel
+        | GroupBy::Session
+        | GroupBy::ClientSession
+        | GroupBy::ClientWorkspaceSession => model.to_string(),
     }
 }
 
@@ -328,9 +330,11 @@ fn daily_source_model_display_name(
     match group_by {
         GroupBy::WorkspaceModel => workspace_model_display_label(workspace_label, model),
         GroupBy::ClientProviderModel => format!("{provider_id} / {model}"),
-        GroupBy::Model | GroupBy::ClientModel | GroupBy::Session | GroupBy::ClientSession => {
-            model.to_string()
-        }
+        GroupBy::Model
+        | GroupBy::ClientModel
+        | GroupBy::Session
+        | GroupBy::ClientSession
+        | GroupBy::ClientWorkspaceSession => model.to_string(),
     }
 }
 
@@ -341,7 +345,8 @@ fn model_color_key(group_by: &GroupBy, _provider_id: &str, model: &str) -> Strin
         | GroupBy::ClientModel
         | GroupBy::WorkspaceModel
         | GroupBy::Session
-        | GroupBy::ClientSession => model.to_string(),
+        | GroupBy::ClientSession
+        | GroupBy::ClientWorkspaceSession => model.to_string(),
     }
 }
 
@@ -352,7 +357,8 @@ fn hourly_model_key(group_by: &GroupBy, provider_id: &str, model: &str) -> Strin
         | GroupBy::ClientModel
         | GroupBy::WorkspaceModel
         | GroupBy::Session
-        | GroupBy::ClientSession => model.to_string(),
+        | GroupBy::ClientSession
+        | GroupBy::ClientWorkspaceSession => model.to_string(),
     }
 }
 
@@ -363,7 +369,8 @@ fn hourly_model_display_name(group_by: &GroupBy, provider_id: &str, model: &str)
         | GroupBy::ClientModel
         | GroupBy::WorkspaceModel
         | GroupBy::Session
-        | GroupBy::ClientSession => model.to_string(),
+        | GroupBy::ClientSession
+        | GroupBy::ClientWorkspaceSession => model.to_string(),
     }
 }
 
@@ -642,7 +649,10 @@ impl DataLoader {
                     format!("{}:{}", workspace_group_key, normalized_model)
                 }
                 GroupBy::Session => format!("{}:{}", msg.session_id, normalized_model),
-                GroupBy::ClientSession => {
+                // The TUI has no workspace+session view, so the downstream-only
+                // grouping renders as its session equivalent rather than as a
+                // workspace key this path never resolves.
+                GroupBy::ClientSession | GroupBy::ClientWorkspaceSession => {
                     format!("{}:{}:{}", msg.client, msg.session_id, normalized_model)
                 }
             };
