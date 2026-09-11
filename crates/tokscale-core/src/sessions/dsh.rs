@@ -10,7 +10,8 @@
 //! The transcript is an append-only event stream; the rows Tokscale needs are:
 //!
 //! - `session`: session id, `createdAt` (ms), `cwd` (workspace root), and the
-//!   `seedLength` fork boundary.
+//!   fork lineage. Legacy logs carry the exact cut as `seedLength`; current
+//!   seeded logs put it on the last tagged `session/end-seed` marker.
 //! - `request/header`: the provider/model the request was routed to (fallback
 //!   for messages whose `source` is absent).
 //! - `assistant/message`: authoritative per-call usage on `data.usage`
@@ -79,6 +80,77 @@ const MAX_TRANSCRIPT_FILE_BYTES: usize = 64 * 1024 * 1024;
 /// doubling is deliberate: refusing a DSH transcript drops that session's
 /// tokens outright, where droid only loses attribution detail.
 const MAX_DECODED_TRANSCRIPT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ForkBoundary {
+    #[default]
+    None,
+    Cut(i64),
+    MissingTaggedCut,
+}
+
+/// Resolve the ownership boundary before emitting usage from a seeded session.
+///
+/// The common path only reparses the leading `session` row: an unseeded header
+/// or a legacy `seedLength` decides the result immediately. Current seeded
+/// transcripts require the complete pass because a nested fork can inherit an
+/// ancestor's tagged marker; the last `session/end-seed { inherited: true }`
+/// row is the boundary belonging to this child.
+fn fork_boundary(decoded: &[u8]) -> ForkBoundary {
+    let mut last_tagged_cut = None;
+    let mut seeded_header_seen = false;
+    let mut session_header_seen = false;
+
+    for line in lossy_lines(decoded) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("session/end-seed")
+                if value.pointer("/data/inherited") == Some(&Value::Bool(true)) =>
+            {
+                if let Some(seq) = value.get("seq").and_then(Value::as_i64) {
+                    last_tagged_cut = Some(seq);
+                }
+            }
+            Some("session") => {
+                if session_header_seen {
+                    continue;
+                }
+                session_header_seen = true;
+                // A present legacy field owns the decision even when it is
+                // zero or malformed; falling through to a v3 marker would
+                // silently reinterpret an older persisted contract.
+                if value
+                    .get("seedLength")
+                    .is_some_and(|seed_length| !seed_length.is_null())
+                {
+                    return value
+                        .get("seedLength")
+                        .and_then(Value::as_i64)
+                        .filter(|length| *length > 0)
+                        .map(ForkBoundary::Cut)
+                        .unwrap_or(ForkBoundary::None);
+                }
+                if value.get("isSeeded").and_then(Value::as_bool) != Some(true) {
+                    return ForkBoundary::None;
+                }
+                seeded_header_seen = true;
+
+                // The header is normally the first row. Continue through the
+                // rest of the log because the final tagged marker wins.
+            }
+            _ => {}
+        }
+    }
+
+    if !seeded_header_seen {
+        return ForkBoundary::None;
+    }
+    last_tagged_cut
+        .map(ForkBoundary::Cut)
+        .unwrap_or(ForkBoundary::MissingTaggedCut)
+}
 
 /// Read a DSH transcript, decoding zstd frames when the payload carries them.
 ///
@@ -204,6 +276,15 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
         return Vec::new();
     }
 
+    let fork_boundary = fork_boundary(&decoded);
+    // A current header that says the session is seeded but has no readable
+    // tagged cut cannot distinguish inherited usage from child-owned usage.
+    // Charging the whole copied prefix to the child is worse than omitting a
+    // malformed/torn transcript until a later scan can read its marker.
+    if fork_boundary == ForkBoundary::MissingTaggedCut {
+        return Vec::new();
+    }
+
     // The transcript directory is named after the session id; it is the
     // fallback when the leading `session` event is missing.
     let session_id_from_path = path
@@ -216,9 +297,9 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let mut session_id: Option<String> = None;
     let mut workspace_key: Option<String> = None;
-    // Fork boundary: how many leading events this session inherited verbatim
-    // from its parent. Zero for a session that was never forked.
-    let mut seed_length: i64 = 0;
+    // Preserve the existing tolerance for rows before a late session header:
+    // the ownership cut starts only once that header has actually appeared.
+    let mut session_header_seen = false;
     // Most recent request routing, used when a message lacks its own `source`.
     let mut fallback_provider: Option<String> = None;
     let mut fallback_model: Option<String> = None;
@@ -240,13 +321,9 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
         };
         match event_type {
             "session" => {
+                session_header_seen = true;
                 session_id = value.get("id").and_then(Value::as_str).map(str::to_string);
                 workspace_key = value.get("cwd").and_then(Value::as_str).map(str::to_string);
-                seed_length = value
-                    .get("seedLength")
-                    .and_then(Value::as_i64)
-                    .filter(|length| *length > 0)
-                    .unwrap_or(0);
             }
             "request/header" => {
                 let config = value.pointer("/data/header/config");
@@ -272,18 +349,16 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
             "assistant/message" | "assistant/attempt" | "compaction/summary" => {
                 let is_summary = event_type == "compaction/summary";
                 let is_attempt = event_type == "assistant/attempt";
-                // Fork/continuation ownership boundary. Forking copies the
-                // parent's completed prefix into the child transcript verbatim
-                // — same `seq`, `time`, `usage` and `message.id` — and records
-                // how many events were inherited as the header's `seedLength`
-                // (`core/session/src/index.ts`, `SessionStore::fork`). Only
-                // events at or after that boundary are this session's own work;
-                // counting the seed again bills the parent's calls twice.
-                if seed_length > 0
-                    && value
+                // Fork/continuation ownership boundary. Legacy headers carry
+                // `seedLength`; current v3 headers carry `isSeeded: true` and
+                // put the exact cut on the last tagged `session/end-seed`
+                // marker. Events at or after the cut are this child's own work;
+                // counting the copied prefix bills the parent's calls twice.
+                if session_header_seen
+                    && matches!(fork_boundary, ForkBoundary::Cut(cut) if value
                         .get("seq")
                         .and_then(Value::as_i64)
-                        .is_some_and(|seq| seq < seed_length)
+                        .is_some_and(|seq| seq < cut))
                 {
                     continue;
                 }
@@ -1088,6 +1163,113 @@ mod tests {
         assert_eq!(child_messages.len(), 1);
         assert_eq!(child_messages[0].timestamp, 1786358035361);
         assert_eq!(child_messages[0].tokens.input, 97);
+    }
+
+    #[test]
+    fn skips_a_v3_seeded_prefix_when_the_parent_file_is_unavailable() {
+        let child = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"child-v3","createdAt":2,"cwd":"/work","parentSession":"parent-v3","isSeeded":true}"#,
+            r#"{"type":"assistant/message","seq":1,"time":1785730448979,"data":{"turn":1,"message":{"id":"parent-call","source":{"provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":1000,"outputTokens":1000}}}"#,
+            r#"{"type":"session/end-seed","seq":2,"time":1785730448980,"data":{"inherited":true}}"#,
+            r#"{"type":"assistant/message","seq":3,"time":1786358035361,"data":{"turn":2,"message":{"id":"child-call","source":{"provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+        ]);
+
+        let child_messages = parse_dsh_file(child.path());
+
+        assert_eq!(child_messages.len(), 1);
+        assert_eq!(child_messages[0].session_id, "child-v3");
+        assert_eq!(child_messages[0].tokens.total(), 15);
+        assert_eq!(child_messages[0].timestamp, 1786358035361);
+    }
+
+    #[test]
+    fn v3_parent_and_child_keep_usage_on_the_owning_session() {
+        let copied = r#"{"type":"assistant/message","seq":1,"time":1785730448979,"data":{"turn":1,"message":{"id":"parent-call","source":{"provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":1000,"outputTokens":1000}}}"#;
+        let parent = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"parent-v3","createdAt":1,"cwd":"/work","isSeeded":false}"#,
+            copied,
+        ]);
+        let child = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"child-v3","createdAt":2,"cwd":"/work","parentSession":"parent-v3","isSeeded":true}"#,
+            copied,
+            r#"{"type":"session/end-seed","seq":2,"time":1785730448980,"data":{"inherited":true}}"#,
+            r#"{"type":"assistant/message","seq":3,"time":1786358035361,"data":{"turn":2,"message":{"id":"child-call","source":{"provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+        ]);
+
+        let parent_messages = parse_dsh_file(parent.path());
+        let child_messages = parse_dsh_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(parent_messages[0].session_id, "parent-v3");
+        assert_eq!(parent_messages[0].tokens.total(), 2000);
+        assert_eq!(child_messages.len(), 1);
+        assert_eq!(child_messages[0].session_id, "child-v3");
+        assert_eq!(child_messages[0].tokens.total(), 15);
+    }
+
+    #[test]
+    fn a_nested_v3_fork_uses_the_last_tagged_end_seed_marker() {
+        let child = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"nested-child","createdAt":3,"cwd":"/work","parentSession":"middle","isSeeded":true}"#,
+            r#"{"type":"assistant/message","seq":1,"time":1785730448979,"data":{"turn":1,"message":{"id":"root-call","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":1000,"outputTokens":1000}}}"#,
+            r#"{"type":"session/end-seed","seq":2,"time":1785730448980,"data":{"inherited":true}}"#,
+            r#"{"type":"assistant/message","seq":4,"time":1785730448981,"data":{"turn":2,"message":{"id":"middle-call","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":500,"outputTokens":500}}}"#,
+            r#"{"type":"session/end-seed","seq":5,"time":1785730448982,"data":{"inherited":true}}"#,
+            r#"{"type":"assistant/message","seq":7,"time":1785730448983,"data":{"turn":3,"message":{"id":"child-call","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(child.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 15);
+        assert_eq!(messages[0].timestamp, 1785730448983);
+    }
+
+    #[test]
+    fn a_seeded_v3_transcript_without_a_tagged_cut_fails_closed() {
+        let child = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"torn-child","createdAt":2,"cwd":"/work","parentSession":"parent","isSeeded":true}"#,
+            r#"{"type":"assistant/message","seq":1,"time":1785730448979,"data":{"turn":1,"message":{"id":"ownership-unknown","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+            r#"{"type":"session/end-seed","seq":2,"time":1785730448980,"data":{}}"#,
+        ]);
+
+        assert!(parse_dsh_file(child.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unseeded_v3_transcript_ignores_tagged_end_seed_markers() {
+        let session = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"resumed","createdAt":2,"cwd":"/work","isSeeded":false}"#,
+            r#"{"type":"assistant/message","seq":1,"time":1785730448979,"data":{"turn":1,"message":{"id":"before-marker","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+            r#"{"type":"session/end-seed","seq":2,"time":1785730448980,"data":{"inherited":true}}"#,
+            r#"{"type":"assistant/message","seq":3,"time":1785730448981,"data":{"turn":2,"message":{"id":"after-marker","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":20,"outputTokens":5}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(session.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            40
+        );
+    }
+
+    #[test]
+    fn legacy_seed_length_takes_priority_over_v3_markers() {
+        let child = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"legacy-cut","createdAt":2,"cwd":"/work","parentSession":"parent","seedLength":4,"isSeeded":true}"#,
+            r#"{"type":"assistant/message","seq":2,"time":1785730448979,"data":{"turn":1,"message":{"id":"inherited","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":1000,"outputTokens":1000}}}"#,
+            r#"{"type":"assistant/message","seq":5,"time":1785730448980,"data":{"turn":2,"message":{"id":"child-call","source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+            r#"{"type":"session/end-seed","seq":10,"time":1785730448981,"data":{"inherited":true}}"#,
+        ]);
+
+        let messages = parse_dsh_file(child.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 15);
     }
 
     #[test]
