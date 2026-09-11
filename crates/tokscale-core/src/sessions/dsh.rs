@@ -19,6 +19,11 @@
 //!   configured for the request; when the provider serves a different model,
 //!   the response records its concrete identity on
 //!   `source.replayState.response.responseModel`, which takes precedence.
+//!   Current logs may retain usage only in the embedded `data.stream`; that is
+//!   the fallback when the promoted top-level value is absent.
+//! - `assistant/attempt`: a failed, retried, cancelled, or stream-error model
+//!   call that produced no surface message. Its final usage remains in the
+//!   embedded stream and is still billable.
 //! - `compaction/summary`: the same usage and routing shape for the summarize
 //!   call DSH makes when it compacts a range. Real spend on the same account,
 //!   and disjoint from the loop steps around it.
@@ -189,10 +194,10 @@ fn read_session_bytes_bounded(
 
 /// Parse one DSH `session.jsonl.zstd` transcript into unified messages.
 ///
-/// Each `assistant/message` event with a non-zero `data.usage` becomes one
-/// [`UnifiedMessage`]. Messages without usable timestamps are skipped; usage
-/// with a zero total is skipped so noise rows (e.g. echoed tool-call-only
-/// messages) do not produce zero-token contributions.
+/// Each billable assistant message, attempt, or compaction event becomes one
+/// [`UnifiedMessage`]. Records without usable timestamps are skipped; usage
+/// with a zero total is skipped so bookkeeping noise does not produce
+/// zero-token contributions.
 pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
     let decoded = read_session_bytes(path);
     if decoded.is_empty() {
@@ -264,8 +269,9 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
             // shares no `(turn, step)` with one, so it is counted in addition
             // to the messages around it rather than replacing any of them.
             // Falling through to `_` billed those calls at zero (#1152).
-            "assistant/message" | "compaction/summary" => {
+            "assistant/message" | "assistant/attempt" | "compaction/summary" => {
                 let is_summary = event_type == "compaction/summary";
+                let is_attempt = event_type == "assistant/attempt";
                 // Fork/continuation ownership boundary. Forking copies the
                 // parent's completed prefix into the child transcript verbatim
                 // — same `seq`, `time`, `usage` and `message.id` — and records
@@ -281,7 +287,23 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 {
                     continue;
                 }
-                let Some(usage) = value.pointer("/data/usage") else {
+                // A surface message normally promotes its final usage to
+                // `data.usage`, which is authoritative when both forms exist.
+                // Attempts never produced that message, so their accounting
+                // remains inside the embedded stream. Current message records
+                // can also lack the promoted copy and use the same fallback.
+                let usage = if is_attempt {
+                    last_stream_usage(&value)
+                } else {
+                    value.pointer("/data/usage").or_else(|| {
+                        if is_summary {
+                            None
+                        } else {
+                            last_stream_usage(&value)
+                        }
+                    })
+                };
+                let Some(usage) = usage else {
                     continue;
                 };
                 let tokens = tokens_from_usage(usage);
@@ -311,12 +333,12 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                     .clone()
                     .unwrap_or_else(|| session_id_from_path.clone());
 
-                // A summary is not a loop step, so it neither claims a turn
-                // start nor consumes the marker a `user/message` armed for the
-                // next assistant reply — taking it here would hand the turn to
-                // the summary and leave the real reply looking like a
-                // continuation.
-                let is_turn_start = if is_summary {
+                // A summary is not a loop step, and an attempt produced no
+                // surface reply. Neither claims a turn start nor consumes the
+                // marker a `user/message` armed for the next assistant reply —
+                // taking it here would leave the successful retry looking like
+                // a continuation.
+                let is_turn_start = if is_summary || is_attempt {
                     false
                 } else {
                     let turn = value.pointer("/data/turn").and_then(Value::as_i64);
@@ -382,7 +404,13 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 // fall back to `sid:` and a summary that happened to match a
                 // reply's timestamp, routing and buckets would otherwise be
                 // dropped as a duplicate of it.
-                let kind = if is_summary { "summary:" } else { "" };
+                let kind = if is_summary {
+                    "summary:"
+                } else if is_attempt {
+                    "attempt:"
+                } else {
+                    ""
+                };
                 let dedup_key = format!(
                     "dsh:{kind}{identity}:{timestamp}:{provider_id}:{model_id}:{}:{}:{}:{}:{}",
                     tokens.input,
@@ -445,6 +473,23 @@ fn non_empty_string(value: &Value) -> Option<&str> {
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Return the final usage snapshot from an embedded DSH stream.
+///
+/// Usage snapshots are cumulative for one model call, so summing them would
+/// multiply the call. Walking backwards also avoids assuming usage is the last
+/// chunk: a terminal error/cancel record can follow it.
+fn last_stream_usage(value: &Value) -> Option<&Value> {
+    value
+        .pointer("/data/stream")
+        .and_then(Value::as_array)
+        .and_then(|stream| {
+            stream
+                .iter()
+                .rev()
+                .find_map(|event| event.pointer("/chunk/usage"))
+        })
 }
 
 /// Split DSH's usage row into Tokscale's five additive buckets.
@@ -679,6 +724,45 @@ mod tests {
 
         // Same turn, later step: not a turn start.
         assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn counts_a_failed_attempt_before_its_successful_retry() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"session-retry","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"request/header","seq":1,"time":1786669450000,"data":{"header":{"config":{"provider":"irix","model":"deepseek-v4-flash"}}}}"#,
+            r#"{"type":"user/message","seq":2,"time":1786669450001,"data":{"turn":1}}"#,
+            r#"{"type":"assistant/attempt","seq":3,"time":1786669450002,"data":{"turn":1,"step":1,"stream":[{"type":"chunk","chunk":{"type":"usage","usage":{"inputTokens":6,"outputTokens":1}}},{"type":"chunk","chunk":{"type":"error","reason":"stream-error"}},{"type":"chunk","chunk":{"type":"usage","usage":{"inputTokens":10,"outputTokens":2}}}]}}"#,
+            r#"{"type":"assistant/message","seq":4,"time":1786669450003,"data":{"turn":1,"step":2,"message":{"id":"m-retry","source":{"provider":"irix","model":"deepseek-v4-flash"}},"usage":{"inputTokens":20,"outputTokens":5}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tokens.total(), 12);
+        assert!(!messages[0].is_turn_start);
+        assert_eq!(messages[1].tokens.total(), 25);
+        assert!(messages[1].is_turn_start);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("dsh:attempt:seq:3:1786669450002:irix:deepseek-v4-flash:10:2:0:0:0")
+        );
+    }
+
+    #[test]
+    fn assistant_message_prefers_promoted_usage_then_falls_back_to_stream() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","version":3,"id":"session-stream","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"request/header","seq":1,"time":1786669450000,"data":{"header":{"config":{"provider":"p","model":"m"}}}}"#,
+            r#"{"type":"assistant/message","seq":2,"time":1786669450001,"data":{"turn":1,"message":{"id":"m-promoted"},"stream":[{"type":"chunk","chunk":{"usage":{"inputTokens":100,"outputTokens":50}}}],"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+            r#"{"type":"assistant/message","seq":3,"time":1786669450002,"data":{"turn":2,"message":{"id":"m-stream"},"stream":[{"type":"chunk","chunk":{"usage":{"inputTokens":5,"outputTokens":1}}},{"type":"chunk","chunk":{"usage":{"inputTokens":10,"outputTokens":5}}}]}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tokens.total(), 15);
+        assert_eq!(messages[1].tokens.total(), 15);
     }
 
     #[test]
