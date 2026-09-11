@@ -1521,6 +1521,48 @@ fn write_dsh_fork_pair(base: &Path) {
     .unwrap();
 }
 
+/// A v3 DSH fork pair where the child has no legacy `seedLength`. The tagged
+/// end-seed record is the ownership boundary: rows before it belong to the
+/// parent, while rows after it belong to the child.
+fn write_dsh_v3_fork_pair(base: &Path) {
+    let fixtures = [
+        (
+            "v3-parent",
+            concat!(
+                r#"{"type":"session","version":3,"id":"v3-parent","createdAt":1,"cwd":"/tmp/dsh-workspace","isSeeded":false}"#,
+                "\n",
+                r#"{"type":"assistant/message","seq":1,"time":1785730448979,"data":{"turn":1,"message":{"id":"parent-call","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":1000,"outputTokens":1000}}}"#,
+                "\n"
+            ),
+        ),
+        (
+            "v3-child",
+            concat!(
+                r#"{"type":"session","version":3,"id":"v3-child","createdAt":2,"cwd":"/tmp/dsh-workspace","parentSession":"v3-parent","isSeeded":true}"#,
+                "\n",
+                r#"{"type":"assistant/message","seq":1,"time":1785730448979,"data":{"turn":1,"message":{"id":"parent-call","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":1000,"outputTokens":1000}}}"#,
+                "\n",
+                r#"{"type":"session/end-seed","seq":2,"time":1785730448980,"data":{"inherited":true}}"#,
+                "\n",
+                r#"{"type":"assistant/message","seq":3,"time":1785730448981,"data":{"turn":2,"message":{"id":"child-call","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+                "\n"
+            ),
+        ),
+    ];
+
+    for (session_id, payload) in fixtures {
+        let dir = dsh_sessions_root(base)
+            .join("-tmp-dsh-workspace")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("session.v3.jsonl.zstd"),
+            zstd::encode_all(payload.as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 /// A DSH transcript pair whose child header carries no `seedLength`, so only
 /// the per-call `message.id` marks the seeded rows as the parent's work.
 fn write_dsh_seeded_pair_without_seed_length(base: &Path) {
@@ -2614,6 +2656,53 @@ fn test_dsh_forked_session_counts_the_seeded_prefix_once_cold_and_warm_cache() {
         assert_eq!(
             json["totalOutput"].as_i64(),
             Some(2 + 5),
+            "{pass} cache pass"
+        );
+    }
+}
+
+/// V3 replaced the header's `seedLength` with a tagged end-seed record. The
+/// parent keeps the inherited call, the child owns only the post-boundary call,
+/// and both the cold parser path and warm source-cache path must agree.
+#[test]
+fn test_dsh_v3_fork_attributes_usage_once_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    write_dsh_v3_fork_pair(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "dsh", "--no-spinner"])
+            .args(["--group-by", "client,session,model"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{pass} cache pass");
+
+        let parent = entries
+            .iter()
+            .find(|entry| entry["sessionId"] == "v3-parent")
+            .expect("parent session must retain the inherited call");
+        assert_eq!(parent["input"].as_i64(), Some(1000), "{pass} cache pass");
+        assert_eq!(parent["output"].as_i64(), Some(1000), "{pass} cache pass");
+
+        let child = entries
+            .iter()
+            .find(|entry| entry["sessionId"] == "v3-child")
+            .expect("child session must retain only its owned call");
+        assert_eq!(child["input"].as_i64(), Some(10), "{pass} cache pass");
+        assert_eq!(child["output"].as_i64(), Some(5), "{pass} cache pass");
+
+        assert_eq!(json["totalMessages"].as_i64(), Some(2), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(1010), "{pass} cache pass");
+        assert_eq!(
+            json["totalOutput"].as_i64(),
+            Some(1005),
             "{pass} cache pass"
         );
     }
