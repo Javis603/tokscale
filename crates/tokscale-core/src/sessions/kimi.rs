@@ -6,7 +6,9 @@
 //!   Token data comes from StatusUpdate messages.
 //!
 //! `~/.kimi-code/sessions/[WORKSPACE]/[SESSION]/agents/[AGENT]/wire.jsonl`
-//!   Token data comes from usage.record lines.
+//!   Token data comes from usage.record lines; a record's response duration is
+//!   derived from the timestamp of the llm.request that precedes it, and a
+//!   paired record is anchored at that request's start.
 
 use super::utils::{file_modified_timestamp_ms, for_each_json_line};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
@@ -339,6 +341,9 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let mut messages: Vec<UnifiedMessage> = Vec::new();
     let mut latest_request_model: Option<String> = None;
+    // Start time of the most recent llm.request, paired with the next
+    // turn-scoped usage.record to derive that call's response duration.
+    let mut pending_request_time_ms: Option<i64> = None;
 
     for_each_json_line(path, &mut |_index, trimmed| {
         let mut bytes = trimmed.as_bytes().to_vec();
@@ -357,6 +362,10 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
             {
                 latest_request_model = Some(model);
             }
+            // Overwrite even when `time` is missing: a request with an
+            // unreadable clock invalidates the pairing rather than borrowing
+            // the previous request's start.
+            pending_request_time_ms = wire_line.time.filter(|ms| *ms > 0);
             return;
         }
 
@@ -376,6 +385,11 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
             return;
         }
 
+        // A turn-scoped record answers the latest llm.request even when it
+        // reports zero tokens, so take the pending start before that skip: a
+        // later record without its own request must not pair against it.
+        let request_time_ms = pending_request_time_ms.take();
+
         // Skip entries with zero tokens
         let Some(tokens) = wire_line.usage.as_ref().and_then(TokenUsage::to_breakdown) else {
             return;
@@ -394,12 +408,20 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
         // This field is never seconds, so rescaling would invent a plausible
         // instant for a value that is simply corrupt; the mtime fallback says
         // "unknown" instead.
-        let timestamp_ms = wire_line
-            .time
-            .filter(|ms| *ms > 0)
+        let wire_time_ms = wire_line.time.filter(|ms| *ms > 0);
+        // Pair against the wire time only: the mtime fallback can sit long
+        // after the response landed and would inflate the duration.
+        let duration_ms = duration_between_ms(request_time_ms, wire_time_ms);
+        // A paired call is anchored at its request start with the duration
+        // running forward to the response, the start-anchored contract
+        // sessionize reads (`end = timestamp + duration_ms`); an unpaired
+        // record keeps its own time, or the mtime fallback.
+        let timestamp_ms = duration_ms
+            .and(request_time_ms)
+            .or(wire_time_ms)
             .unwrap_or(fallback_timestamp);
 
-        messages.push(UnifiedMessage::new(
+        let mut message = UnifiedMessage::new(
             "kimi",
             model,
             DEFAULT_PROVIDER,
@@ -407,10 +429,17 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
             timestamp_ms,
             tokens,
             0.0,
-        ));
+        );
+        message.duration_ms = duration_ms;
+        messages.push(message);
     });
 
     messages
+}
+
+fn duration_between_ms(start_ms: Option<i64>, end_ms: Option<i64>) -> Option<i64> {
+    let duration = end_ms?.saturating_sub(start_ms?);
+    (duration > 0).then_some(duration)
 }
 
 /// Parse a Kimi CLI wire.jsonl file
@@ -1014,6 +1043,126 @@ not valid json at all
         assert_eq!(messages[0].tokens.input, 100);
         assert_eq!(messages[0].tokens.output, 50);
         assert_eq!(messages[0].timestamp, 1780319377010);
+    }
+
+    #[test]
+    fn test_parse_kimi_code_records_duration_from_llm_request() {
+        let content = r#"{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319377000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319385612}
+{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319385700}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":200,"output":75,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319398000}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].duration_ms, Some(8612));
+        assert_eq!(messages[1].duration_ms, Some(12300));
+        // Anchored at each request's start, so `timestamp + duration_ms` lands
+        // on the record's own time and the span sessionize derives is the call.
+        assert_eq!(messages[0].timestamp, 1780319377000);
+        assert_eq!(messages[1].timestamp, 1780319385700);
+        assert_eq!(messages[0].timestamp + 8612, 1780319385612);
+        assert_eq!(messages[1].timestamp + 12300, 1780319398000);
+    }
+
+    #[test]
+    fn test_parse_kimi_code_duration_is_consumed_by_first_record() {
+        // A second usage.record with no intervening llm.request has no request
+        // start of its own and must not reuse the consumed one.
+        let content = r#"{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319377000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319378000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":200,"output":75,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319379000}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].duration_ms, Some(1000));
+        assert_eq!(messages[1].duration_ms, None);
+        assert_eq!(messages[0].timestamp, 1780319377000);
+        // The unpaired record keeps its own time.
+        assert_eq!(messages[1].timestamp, 1780319379000);
+    }
+
+    #[test]
+    fn test_parse_kimi_code_zero_token_record_consumes_request_start() {
+        // A zero-token turn record still answers the request before it, so a
+        // later record without its own llm.request must not pair against that
+        // stale start.
+        let content = r#"{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319377000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":0,"output":0,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319378000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319379000}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].duration_ms, None);
+        assert_eq!(messages[0].timestamp, 1780319379000);
+    }
+
+    #[test]
+    fn test_parse_kimi_code_session_record_keeps_request_start() {
+        // Session-scoped bookkeeping between a request and its response is not
+        // that response, so it leaves the pending start for the turn record.
+        let content = r#"{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319377000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":999,"output":999,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"session","time":1780319377500}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319378000}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].duration_ms, Some(1000));
+        assert_eq!(messages[0].timestamp, 1780319377000);
+    }
+
+    #[test]
+    fn test_parse_kimi_code_duration_none_without_request() {
+        let content = r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319377014}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].duration_ms, None);
+    }
+
+    #[test]
+    fn test_parse_kimi_code_duration_rejects_non_positive_gap() {
+        // Equal timestamps and a record predating its request both yield no
+        // sample rather than a zero or negative duration.
+        let content = r#"{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319377000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319377000}
+{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319378000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319377000}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].duration_ms, None);
+        assert_eq!(messages[1].duration_ms, None);
+        // Unpaired records keep their own time, not their request's.
+        assert_eq!(messages[1].timestamp, 1780319377000);
+    }
+
+    #[test]
+    fn test_parse_kimi_code_duration_skips_mtime_fallback_timestamp() {
+        // A record whose own `time` is unusable anchors to the file mtime;
+        // pairing the request start against that fallback would inflate the
+        // duration, so no sample is recorded.
+        let content = r#"{"type":"llm.request","model":"kimi-code/kimi-for-coding","time":1780319377000}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":-1}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+        let mtime = file_modified_timestamp_ms(&fake_path);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].duration_ms, None);
+        assert_eq!(messages[0].timestamp, mtime);
     }
 
     #[test]
