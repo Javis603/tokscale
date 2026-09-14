@@ -639,8 +639,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                             .strip_prefix("session.v")
                             .and_then(|rest| rest.strip_suffix(".jsonl"))
                             .map(|version| {
-                                !version.is_empty()
-                                    && version.bytes().all(|b| b.is_ascii_digit())
+                                !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
                             })
                             .unwrap_or(false)
                 }
