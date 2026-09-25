@@ -272,6 +272,14 @@ pub enum GroupBy {
     ClientSession,
     /// Machine label (see [`machine_label`]), then model.
     MachineModel,
+    /// Session rows that also carry the workspace they belong to.
+    ///
+    /// Downstream-only (Token Monitor): `workspace,model` answers "how much did
+    /// this project cost" but drops the session id, and `client,session,model`
+    /// answers "how much did this conversation cost" but drops the workspace,
+    /// so attributing sessions to projects otherwise costs a second full scan
+    /// of the same messages. Keying on both joins them in one pass.
+    ClientWorkspaceSession,
 }
 
 impl std::fmt::Display for GroupBy {
@@ -284,6 +292,7 @@ impl std::fmt::Display for GroupBy {
             GroupBy::Session => write!(f, "session,model"),
             GroupBy::ClientSession => write!(f, "client,session,model"),
             GroupBy::MachineModel => write!(f, "machine,model"),
+            GroupBy::ClientWorkspaceSession => write!(f, "client,workspace,session,model"),
         }
     }
 }
@@ -303,8 +312,11 @@ impl std::str::FromStr for GroupBy {
                 Ok(GroupBy::ClientSession)
             }
             "machine,model" | "machine-model" => Ok(GroupBy::MachineModel),
+            "client,workspace,session,model" | "client-workspace-session-model" => {
+                Ok(GroupBy::ClientWorkspaceSession)
+            }
             _ => Err(format!(
-                "Invalid group-by value: '{}'. Valid options: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, machine,model",
+                "Invalid group-by value: '{}'. Valid options: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, machine,model, client,workspace,session,model",
                 s
             )),
         }
@@ -1018,9 +1030,49 @@ pub struct MonthlyUsageV2 {
     pub cost: f64,
 }
 
+/// Per-session facts the scanner already parsed but the row shape has no place
+/// for, keyed by `(client, session_id)` so callers join it onto session-grouped
+/// entries.
+///
+/// Downstream-only (Token Monitor): these live beside `entries` rather than on
+/// [`ModelUsage`] because they describe a session, not a `(session, model)` row,
+/// and because widening the row struct would touch every literal that builds one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionMeta {
+    pub client: String,
+    pub session_id: String,
+    /// Human-readable title when the source client stores one. `None` otherwise.
+    pub title: Option<String>,
+    /// Unix-ms timestamp of the first message observed in this session, and of
+    /// the last. `0` when every message in the session lacked a usable one.
+    pub first_active_ms: i64,
+    pub last_active_ms: i64,
+}
+
+/// The real filesystem path behind a workspace key, resolved once per key.
+///
+/// Downstream-only (Token Monitor): parsers write whatever identity their client
+/// stores, so Codex writes a path while Claude Code writes a dash-mangled slug.
+/// Consumers that key projects by path need the decoded form to recognize one
+/// directory across clients, and only the labeler can decode it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspaceMeta {
+    pub workspace_key: String,
+    pub label: String,
+    /// `None` when the key is not a path (an opaque client id) or its directory
+    /// is gone.
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelReport {
     pub entries: Vec<ModelUsage>,
+    /// Populated only for session-grouped reports, where a caller can join it
+    /// back onto the rows. Empty otherwise, so no other report path pays for it.
+    pub sessions: Vec<SessionMeta>,
+    /// Populated only for workspace-bearing reports, joined onto the rows by
+    /// `workspace_key`. Empty otherwise.
+    pub workspaces: Vec<WorkspaceMeta>,
     pub total_input: i64,
     pub total_output: i64,
     pub total_cache_read: i64,
@@ -6201,6 +6253,87 @@ fn qualify_workspace_label(label: &str, parents: &[String], depth: usize) -> Str
     format!("{}/{label}", prefix.join("/"))
 }
 
+/// Resolves each distinct workspace key the rows carry to its real path.
+///
+/// Reuses the aggregation's labeler, so a key it already decoded costs a map
+/// lookup here. Rows without a workspace key (every non-workspace grouping)
+/// produce nothing.
+fn workspace_metadata_for_entries(
+    entries: &[ModelUsage],
+    labeler: &mut WorkspaceLabeler,
+) -> Vec<WorkspaceMeta> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut workspaces: Vec<WorkspaceMeta> = Vec::new();
+
+    for entry in entries {
+        let Some(key) = entry.workspace_key.as_deref() else {
+            continue;
+        };
+        if !seen.insert(key.to_string()) {
+            continue;
+        }
+        workspaces.push(WorkspaceMeta {
+            workspace_key: key.to_string(),
+            label: entry
+                .workspace_label
+                .clone()
+                .unwrap_or_else(|| labeler.label(key)),
+            path: labeler.path(key),
+        });
+    }
+
+    workspaces
+}
+
+/// Rolls the already-filtered messages up into one [`SessionMeta`] per
+/// `(client, session_id)`.
+///
+/// Mirrors the TUI's Sessions rollup: messages without a session id are skipped
+/// rather than lumped into one bogus row, `0` timestamps are treated as "no
+/// timestamp" instead of as the epoch, and the first non-empty title wins.
+/// Ordering follows first appearance so the output is stable across runs.
+fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    let mut sessions: Vec<SessionMeta> = Vec::new();
+
+    for msg in messages {
+        if msg.session_id.is_empty() {
+            continue;
+        }
+        let key = (msg.client.to_string(), msg.session_id.to_string());
+        let position = *index.entry(key).or_insert_with(|| {
+            sessions.push(SessionMeta {
+                client: msg.client.to_string(),
+                session_id: msg.session_id.to_string(),
+                title: None,
+                first_active_ms: 0,
+                last_active_ms: 0,
+            });
+            sessions.len() - 1
+        });
+        let entry = &mut sessions[position];
+
+        if entry.title.is_none() {
+            if let Some(title) = msg.session_title.as_deref() {
+                if !title.trim().is_empty() {
+                    entry.title = Some(title.to_string());
+                }
+            }
+        }
+
+        if msg.timestamp > 0 {
+            if entry.first_active_ms == 0 || msg.timestamp < entry.first_active_ms {
+                entry.first_active_ms = msg.timestamp;
+            }
+            if msg.timestamp > entry.last_active_ms {
+                entry.last_active_ms = msg.timestamp;
+            }
+        }
+    }
+
+    sessions
+}
+
 #[cfg(test)]
 fn aggregate_model_usage_entries(
     messages: Vec<UnifiedMessage>,
@@ -6223,6 +6356,21 @@ fn aggregate_model_usage_entries_with_rollup(
         fold.add(msg);
     }
     fold.finish()
+}
+
+#[cfg(test)]
+fn aggregate_model_usage_entries_with_labeler(
+    messages: Vec<UnifiedMessage>,
+    group_by: &GroupBy,
+    rollup: WorktreeRollup,
+    labeler: &mut WorkspaceLabeler,
+) -> Vec<ModelUsage> {
+    let mut fold = ModelUsageFold::new(group_by, rollup);
+    fold.labeler = std::mem::take(labeler);
+    for message in &messages {
+        fold.add(message);
+    }
+    fold.finish_with_labeler(labeler)
 }
 
 /// A model-report row while messages are still being folded into it.
@@ -6269,7 +6417,10 @@ impl ModelUsageFold {
         // Bucketing a workspace resolves its label, which reads the filesystem. Every
         // other grouping discards that label a few lines below, so skip the work rather
         // than paying it on `tokscale --light`, `monthly`, and every TUI refresh.
-        let needs_workspace = matches!(group_by, GroupBy::WorkspaceModel);
+        let needs_workspace = matches!(
+            group_by,
+            GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+        );
         let normalized = model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
         let (workspace_group_key, workspace_key, workspace_label) = if needs_workspace {
             self.workspace_labels
@@ -6293,12 +6444,21 @@ impl ModelUsageFold {
                 let machine = message_machine_label(msg);
                 format!("{}:{}:{}", machine.len(), machine, normalized)
             }
+            GroupBy::ClientWorkspaceSession => {
+                format!(
+                    "{}:{}:{}:{}",
+                    msg.client, workspace_group_key, msg.session_id, normalized
+                )
+            }
         };
         let merge_clients = matches!(
             group_by,
             GroupBy::Model | GroupBy::WorkspaceModel | GroupBy::MachineModel
         );
-        let session_grouped = matches!(group_by, GroupBy::Session | GroupBy::ClientSession);
+        let session_grouped = matches!(
+            group_by,
+            GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+        );
         let row = self.rows.entry(key).or_insert_with(|| ModelUsageRow {
             usage: ModelUsage {
                 client: msg.client.to_string(),
@@ -6307,12 +6467,12 @@ impl ModelUsageFold {
                 } else {
                     None
                 },
-                workspace_key: if matches!(group_by, GroupBy::WorkspaceModel) {
+                workspace_key: if needs_workspace {
                     workspace_key.clone()
                 } else {
                     None
                 },
-                workspace_label: if matches!(group_by, GroupBy::WorkspaceModel) {
+                workspace_label: if needs_workspace {
                     Some(workspace_label.clone())
                 } else {
                     None
@@ -6374,8 +6534,15 @@ impl ModelUsageFold {
             .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
     }
 
-    fn finish(mut self) -> Vec<ModelUsage> {
-        let label_overrides = if matches!(self.group_by, GroupBy::WorkspaceModel) {
+    fn finish(self) -> Vec<ModelUsage> {
+        self.finish_with_labeler(&mut WorkspaceLabeler::default())
+    }
+
+    fn finish_with_labeler(mut self, labeler: &mut WorkspaceLabeler) -> Vec<ModelUsage> {
+        let label_overrides = if matches!(
+            self.group_by,
+            GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+        ) {
             std::mem::take(&mut self.workspace_labels).overrides(&mut self.labeler)
         } else {
             HashMap::new()
@@ -6414,6 +6581,7 @@ impl ModelUsageFold {
                 .unwrap_or(std::cmp::Ordering::Equal),
         });
 
+        *labeler = self.labeler;
         entries
     }
 }
@@ -6515,12 +6683,14 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
     });
 
     let pricing = load_pricing_for_local_parse().await;
+    let session_grouped = matches!(
+        options.group_by,
+        GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+    );
     let mut sink = ModelReportSink::new(&options);
-    let claude_desktop_cache = if recovery::applicable(&home_dir) {
-        // The recovery overlay reconciles its ledger against the whole native
-        // parse at once (which sessions are still on disk, how far each day
-        // already reaches), so only this case collects before folding.
-        let (all_messages, claude_desktop_cache) = parse_all_messages_with_coverage(
+    let mut sessions = Vec::new();
+    let claude_desktop_cache = if recovery::applicable(&home_dir) || session_grouped {
+        let (messages, coverage) = parse_all_messages_with_coverage(
             &home_dir,
             &clients,
             pricing.as_deref(),
@@ -6529,10 +6699,14 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
             SourceCachePolicy::Persistent,
             Some(&options),
         );
-        for message in all_messages {
+        let filtered = filter_messages_for_report(messages, &options);
+        if session_grouped {
+            sessions = aggregate_session_metadata(&filtered);
+        }
+        for message in filtered {
             sink.accept(message);
         }
-        claude_desktop_cache
+        coverage
     } else {
         let mut custom_sink = CustomPricingSink {
             sink: &mut sink,
@@ -6551,6 +6725,7 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
         .coverage
     };
     let (entries, undated_tokens) = sink.finish();
+    let workspaces = workspace_metadata_for_entries(&entries, &mut WorkspaceLabeler::default());
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
         model_report_token_totals(&entries);
@@ -6565,6 +6740,8 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
         claude_desktop_cache,
         report: ModelReport {
             entries,
+            sessions,
+            workspaces,
             total_input,
             total_output,
             total_cache_read,
@@ -9994,6 +10171,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 #[cfg(test)]
 mod tests {
     mod window_dates;
+    mod window_pricing;
 
     use super::{
         aggregate_by_date_v2, aggregate_hourly_usage_entries, aggregate_model_usage_entries,
@@ -10010,20 +10188,21 @@ mod tests {
         paths, prepare_submission_pricing, pricing, retain_for_requested_clients, scanner,
         select_best_covered_hermes_groups, select_local_parse_pricing, sessions, unified_to_parsed,
         validate_priced_messages, ClientId, GraphPricingRequirement, GraphSink, GroupBy,
-        LocalParseOptions, MessageSink, ModelUsage, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2,
+        LocalParseOptions, MessageSink, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2,
         ReportOptions, SourceCachePolicy, TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage,
         AMBIGUOUS_MODEL_PRICING_REASON, GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON,
         MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
         UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
-    use super::{
-        apply_custom_pricing_if_available, calculate_cost_with_service_tier,
-        parse_all_messages_streaming_with_env_strategy, CostSource, CustomPricingSink,
-    };
     // Kept as its own statement rather than folded into the list above: that list
     // is edited by nearly every PR that touches this file, and sharing it made
     // this branch conflict on every single upstream merge.
     use super::{aggregate_model_usage_entries_with_rollup, WorktreeRollup};
+    use super::{aggregate_session_metadata, workspace_metadata_for_entries, WorkspaceLabeler};
+    use super::{
+        apply_custom_pricing_if_available, calculate_cost_with_service_tier,
+        parse_all_messages_streaming_with_env_strategy, CostSource, CustomPricingSink, ModelUsage,
+    };
     use super::{flush_retained_lane, matches_flush_filter, FlushContext};
     use super::{
         machine_label, parse_antigravity_family_messages,
@@ -13238,6 +13417,178 @@ mod tests {
         msg
     }
 
+    /// Downstream-only (Token Monitor) coverage for the workspace-joined
+    /// session grouping and the per-session metadata that rides beside it.
+    fn make_session_meta_message(
+        client: &str,
+        session_id: &str,
+        timestamp: i64,
+        title: Option<&str>,
+    ) -> UnifiedMessage {
+        let mut msg = UnifiedMessage::new(
+            client,
+            "claude-sonnet-4-5-20250929",
+            "anthropic",
+            session_id,
+            timestamp,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+            1.0,
+        );
+        msg.session_title = title.map(Into::into);
+        msg
+    }
+
+    #[test]
+    fn group_by_round_trips_the_workspace_session_value() {
+        use std::str::FromStr;
+        assert_eq!(
+            GroupBy::from_str("client,workspace,session,model").unwrap(),
+            GroupBy::ClientWorkspaceSession
+        );
+        assert_eq!(
+            GroupBy::ClientWorkspaceSession.to_string(),
+            "client,workspace,session,model"
+        );
+    }
+
+    #[test]
+    fn workspace_session_grouping_splits_on_both_and_keeps_both_identities() {
+        let messages = vec![
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("/repo-a"),
+                Some("repo-a"),
+            ),
+            // Same session, second workspace: the tokens belong to each project
+            // separately, so this must not fold into the row above.
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                2.0,
+                Some("/repo-b"),
+                Some("repo-b"),
+            ),
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-2",
+                4.0,
+                Some("/repo-a"),
+                Some("repo-a"),
+            ),
+        ];
+
+        let entries = aggregate_model_usage_entries(messages, &GroupBy::ClientWorkspaceSession);
+
+        assert_eq!(entries.len(), 3, "workspace and session both split rows");
+        for entry in &entries {
+            assert!(
+                entry.workspace_key.is_some(),
+                "the joined grouping keeps the workspace a session belongs to"
+            );
+            assert!(
+                entry.session_id.is_some(),
+                "the joined grouping keeps the session id"
+            );
+        }
+        // The join may not move usage between rows.
+        assert_eq!(entries.iter().map(|e| e.cost).sum::<f64>(), 7.0);
+    }
+
+    #[test]
+    fn session_metadata_bounds_activity_and_adopts_the_first_title() {
+        let messages = vec![
+            make_session_meta_message("opencode", "session-1", 300, None),
+            make_session_meta_message("opencode", "session-1", 100, Some("Fix the parser")),
+            // A message with no usable timestamp must not drag the window to the
+            // epoch, and a later title must not replace the one already adopted.
+            make_session_meta_message("opencode", "session-1", 0, Some("Renamed later")),
+            make_session_meta_message("opencode", "session-2", 0, None),
+            // Records without a session id belong to no session row.
+            make_session_meta_message("opencode", "", 400, None),
+        ];
+
+        let sessions = aggregate_session_metadata(&messages);
+
+        assert_eq!(sessions.len(), 2, "one row per (client, session id)");
+        let first = &sessions[0];
+        assert_eq!(first.session_id, "session-1");
+        assert_eq!(first.first_active_ms, 100);
+        assert_eq!(first.last_active_ms, 300);
+        assert_eq!(first.title.as_deref(), Some("Fix the parser"));
+        let second = &sessions[1];
+        assert_eq!(second.first_active_ms, 0, "no timestamp stays unknown");
+        assert_eq!(second.last_active_ms, 0);
+        assert_eq!(second.title, None);
+    }
+
+    #[test]
+    fn workspace_metadata_resolves_one_row_per_distinct_key() {
+        let entries = aggregate_model_usage_entries(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some("/repo-a"),
+                    Some("repo-a"),
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    1.0,
+                    Some("/repo-a"),
+                    Some("repo-a"),
+                ),
+            ],
+            &GroupBy::ClientWorkspaceSession,
+        );
+        let mut labeler = WorkspaceLabeler::default();
+
+        let workspaces = workspace_metadata_for_entries(&entries, &mut labeler);
+
+        assert_eq!(entries.len(), 2, "two sessions, one workspace");
+        assert_eq!(workspaces.len(), 1, "the workspace is described once");
+        assert_eq!(workspaces[0].workspace_key, "/repo-a");
+    }
+
+    #[test]
+    fn workspace_metadata_is_empty_without_a_workspace_grouping() {
+        let entries = aggregate_model_usage_entries(
+            vec![make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("/repo-a"),
+                Some("repo-a"),
+            )],
+            &GroupBy::ClientSession,
+        );
+        let mut labeler = WorkspaceLabeler::default();
+
+        assert!(workspace_metadata_for_entries(&entries, &mut labeler).is_empty());
+    }
+
     fn make_workbuddy_message(
         session_id: &str,
         timestamp: i64,
@@ -13698,6 +14049,7 @@ mod tests {
             GroupBy::WorkspaceModel,
             GroupBy::Session,
             GroupBy::ClientSession,
+            GroupBy::ClientWorkspaceSession,
             GroupBy::MachineModel,
         ];
 
@@ -13857,7 +14209,11 @@ mod tests {
             reasoning: 80,
             ..Default::default()
         };
-        for group in [GroupBy::ClientModel, GroupBy::ClientSession] {
+        for group in [
+            GroupBy::ClientModel,
+            GroupBy::ClientSession,
+            GroupBy::ClientWorkspaceSession,
+        ] {
             let entries =
                 aggregate_model_usage_entries(vec![timed.clone(), untimed.clone()], &group);
             assert_eq!(entries.len(), 1);
@@ -15945,6 +16301,7 @@ mod tests {
                 GroupBy::ClientProviderModel,
                 GroupBy::Session,
                 GroupBy::ClientSession,
+                GroupBy::ClientWorkspaceSession,
             ] {
                 let entries = aggregate_model_usage_entries(messages.clone(), &grouping);
                 assert_eq!(entries.len(), 1);
@@ -32625,6 +32982,14 @@ mod tests {
                 None,
             );
             let filtered = filter_messages_for_report(messages, options);
+            let sessions = if matches!(
+                options.group_by,
+                GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+            ) {
+                aggregate_session_metadata(&filtered)
+            } else {
+                Vec::new()
+            };
             let mut undated_tokens = TokenBreakdown::default();
             for message in &filtered {
                 if claude_desktop::is_undated_balance(message) {
@@ -32636,12 +33001,16 @@ mod tests {
                 &options.group_by,
                 options.worktree_rollup,
             );
+            let workspaces =
+                workspace_metadata_for_entries(&entries, &mut WorkspaceLabeler::default());
             let (total_input, total_output, total_cache_read, total_cache_write) =
                 model_report_token_totals(&entries);
             ModelReportV2 {
                 undated_tokens,
                 claude_desktop_cache,
                 report: crate::ModelReport {
+                    sessions,
+                    workspaces,
                     total_messages: entries.iter().map(|e| e.message_count).sum(),
                     total_cost: entries.iter().map(|e| e.cost).sum::<f64>() + 0.0,
                     entries,
@@ -32684,19 +33053,38 @@ mod tests {
             assert_eq!(totals(streamed), totals(collected), "{label}");
             assert_eq!(streamed.undated_tokens, collected.undated_tokens, "{label}");
             assert_eq!(
+                serde_json::to_value(&streamed.report.sessions).unwrap(),
+                serde_json::to_value(&collected.report.sessions).unwrap(),
+                "{label}"
+            );
+            let canonical_workspaces = |rows: &[crate::WorkspaceMeta]| {
+                let mut rows: Vec<_> = rows
+                    .iter()
+                    .map(|row| serde_json::to_string(row).unwrap())
+                    .collect();
+                rows.sort();
+                rows
+            };
+            assert_eq!(
+                canonical_workspaces(&streamed.report.workspaces),
+                canonical_workspaces(&collected.report.workspaces),
+                "{label}"
+            );
+            assert_eq!(
                 serde_json::to_value(&streamed.claude_desktop_cache).unwrap(),
                 serde_json::to_value(&collected.claude_desktop_cache).unwrap(),
                 "{label}"
             );
         }
 
-        const GROUPINGS: [GroupBy; 7] = [
+        const GROUPINGS: [GroupBy; 8] = [
             GroupBy::Model,
             GroupBy::ClientModel,
             GroupBy::ClientProviderModel,
             GroupBy::WorkspaceModel,
             GroupBy::Session,
             GroupBy::ClientSession,
+            GroupBy::ClientWorkspaceSession,
             GroupBy::MachineModel,
         ];
 
