@@ -1,0 +1,345 @@
+name: Token Monitor Vendor Release
+run-name: "Token Monitor vendor release from ${{ inputs.source_repository }}/${{ inputs.source_ref }}"
+
+# Downstream-only workflow for Javis603/tokscale. It builds from a source
+# repository rather than from the branch it is dispatched on, so the defaults —
+# junhoyeo/tokscale at main — always resolve the current upstream tip to an
+# exact, reproducible commit.
+#
+# source_repository exists for the case the vendor override is for: upstream
+# has not released a fix Token Monitor needs, so a patch branch on this fork is
+# the source. Point it back at junhoyeo/tokscale once that fix is upstream, so
+# a vendored build stays reproducible from upstream by default.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: "Source repository (owner/repo) to build from"
+        required: true
+        type: string
+        default: "junhoyeo/tokscale"
+      source_ref:
+        description: "Branch, tag, or full commit SHA in that repository to release"
+        required: true
+        type: string
+        default: "main"
+      summary:
+        description: "Optional Token Monitor-specific release summary"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: token-monitor-vendor-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  resolve-source:
+    name: Resolve build source
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      short_sha: ${{ steps.source.outputs.short_sha }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+    steps:
+      # Runs before the checkout so a typo names itself instead of surfacing as
+      # an opaque "repository not found" from actions/checkout.
+      - name: Validate source repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "source_repository must be owner/repo, got '$SOURCE_REPOSITORY'" >&2
+            exit 1
+          fi
+
+      - name: Checkout build source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Lock exact source commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse 'HEAD^{commit}')"
+          short_sha="${source_sha:0:8}"
+          release_tag="token-monitor-${short_sha}"
+
+          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve an exact source commit SHA" >&2
+            exit 1
+          fi
+
+          {
+            echo "source_sha=$source_sha"
+            echo "short_sha=$short_sha"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $SOURCE_REPOSITORY@$source_sha"
+
+      - name: Refuse to replace an existing vendor release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to replace its assets." >&2
+            exit 1
+          fi
+
+  build:
+    name: Build - ${{ matrix.settings.target }}
+    needs: resolve-source
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            asset_name: tokscale-darwin-x64
+            bin_name: tokscale
+            build: cargo build --release -p tokscale-cli --target x86_64-apple-darwin
+            strip: strip -x target/x86_64-apple-darwin/release/tokscale
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: tokscale-darwin-arm64
+            bin_name: tokscale
+            # Token Monitor does not use the Apple Foundation Models
+            # summarizer, so keep this a single portable binary and avoid the
+            # macOS 26 runner plus libFoundationModels.dylib sidecar.
+            build: cargo build --release -p tokscale-cli --target aarch64-apple-darwin
+            strip: strip -x target/aarch64-apple-darwin/release/tokscale
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: tokscale-linux-x64
+            bin_name: tokscale
+            build: cargo zigbuild --release -p tokscale-cli --target x86_64-unknown-linux-gnu
+            strip: strip target/x86_64-unknown-linux-gnu/release/tokscale
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_name: tokscale-linux-x64-musl
+            bin_name: tokscale
+            build: cargo zigbuild --release -p tokscale-cli --target x86_64-unknown-linux-musl
+            strip: strip target/x86_64-unknown-linux-musl/release/tokscale
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset_name: tokscale-linux-arm64
+            bin_name: tokscale
+            build: cargo zigbuild --release -p tokscale-cli --target aarch64-unknown-linux-gnu
+            strip: ""
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset_name: tokscale-linux-arm64-musl
+            bin_name: tokscale
+            build: cargo zigbuild --release -p tokscale-cli --target aarch64-unknown-linux-musl
+            strip: ""
+          - host: ubuntu-latest
+            target: aarch64-linux-android
+            asset_name: tokscale-android-arm64
+            bin_name: tokscale
+            build: cargo build --release -p tokscale-cli --target aarch64-linux-android
+            strip: ""
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: tokscale-win32-x64.exe
+            bin_name: tokscale.exe
+            build: cargo build --release -p tokscale-cli --target x86_64-pc-windows-msvc
+            strip: ""
+          - host: windows-latest
+            target: aarch64-pc-windows-msvc
+            asset_name: tokscale-win32-arm64.exe
+            bin_name: tokscale.exe
+            build: cargo build --release -p tokscale-cli --target aarch64-pc-windows-msvc
+            strip: ""
+
+    steps:
+      - name: Checkout exact build source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The source checkout owns its exact toolchain in rust-toolchain.toml.
+          # Installing a target into a floating `stable` toolchain leaves the
+          # pinned toolchain without its cross stdlib, so cargo later fails with
+          # "can't find crate for core" on every non-host target.
+          rustup target add "${{ matrix.settings.target }}"
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: tm-vendor-${{ matrix.settings.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        if: ${{ contains(matrix.settings.target, 'linux') && !contains(matrix.settings.target, 'android') }}
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        if: ${{ contains(matrix.settings.target, 'linux') && !contains(matrix.settings.target, 'android') }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
+      - name: Setup Android cross toolchain
+        if: ${{ matrix.settings.target == 'aarch64-linux-android' }}
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-linux-android
+          runner: qemu-user
+
+      - name: Build CLI binary
+        run: ${{ matrix.settings.build }}
+        shell: bash
+
+      - name: Smoke Android binary
+        if: ${{ matrix.settings.target == 'aarch64-linux-android' }}
+        run: cargo run --release -p tokscale-cli --target aarch64-linux-android -- --no-spinner --version
+        shell: bash
+
+      - name: Strip CLI binary
+        if: ${{ matrix.settings.strip != '' }}
+        run: ${{ matrix.settings.strip }}
+        shell: bash
+
+      - name: Stage release asset
+        env:
+          SOURCE_PATH: target/${{ matrix.settings.target }}/release/${{ matrix.settings.bin_name }}
+          ASSET_NAME: ${{ matrix.settings.asset_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$SOURCE_PATH" "dist/$ASSET_NAME"
+          test -s "dist/$ASSET_NAME"
+          ls -lh "dist/$ASSET_NAME"
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.settings.asset_name }}
+          path: dist/${{ matrix.settings.asset_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [resolve-source, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v6
+        with:
+          pattern: tokscale-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assets and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            tokscale-android-arm64
+            tokscale-darwin-arm64
+            tokscale-darwin-x64
+            tokscale-linux-arm64
+            tokscale-linux-arm64-musl
+            tokscale-linux-x64
+            tokscale-linux-x64-musl
+            tokscale-win32-arm64.exe
+            tokscale-win32-x64.exe
+          )
+
+          for asset in "${expected[@]}"; do
+            test -s "dist/$asset"
+          done
+
+          mapfile -t actual < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ "${actual[*]}" != "${expected[*]}" ]]; then
+            printf 'Unexpected release assets: %s\n' "${actual[*]}" >&2
+            exit 1
+          fi
+
+          find dist -maxdepth 1 -type f ! -name '*.exe' -exec chmod +x {} +
+          sha256sum "${expected[@]/#/dist/}" | sed 's#  dist/#  #' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create vendor release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
+          SHORT_SHA: ${{ needs.resolve-source.outputs.short_sha }}
+          RELEASE_TAG: ${{ needs.resolve-source.outputs.release_tag }}
+          RELEASE_SUMMARY: ${{ inputs.summary }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="Token Monitor downstream binary build from [$SOURCE_REPOSITORY@$SHORT_SHA](https://github.com/$SOURCE_REPOSITORY/commit/$SOURCE_SHA)."
+          if [[ -n "$RELEASE_SUMMARY" ]]; then
+            notes="$(printf '%s\n\n%s' "$notes" "$RELEASE_SUMMARY")"
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "Token Monitor vendor build @ $SHORT_SHA" \
+            --notes "$notes" \
+            --generate-notes \
+            --latest \
+            dist/tokscale-android-arm64 \
+            dist/tokscale-darwin-arm64 \
+            dist/tokscale-darwin-x64 \
+            dist/tokscale-linux-arm64 \
+            dist/tokscale-linux-arm64-musl \
+            dist/tokscale-linux-x64 \
+            dist/tokscale-linux-x64-musl \
+            dist/tokscale-win32-arm64.exe \
+            dist/tokscale-win32-x64.exe \
+            SHA256SUMS
+
+      - name: Verify published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-source.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_target="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)"
+          [[ "$actual_target" == "$SOURCE_SHA" ]]
+          [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" == "10" ]]
+          [[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" == "$RELEASE_TAG" ]]
