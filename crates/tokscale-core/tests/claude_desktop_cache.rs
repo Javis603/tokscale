@@ -4,8 +4,10 @@ use std::path::Path;
 use tokscale_core::claude_desktop;
 
 #[test]
-fn original_model_report_remains_source_and_serialization_compatible() {
+fn model_report_preserves_upstream_fields_and_downstream_metadata() {
     let report = tokscale_core::ModelReport {
+        sessions: Vec::new(),
+        workspaces: Vec::new(),
         entries: vec![],
         total_input: 0,
         total_output: 0,
@@ -16,7 +18,9 @@ fn original_model_report_remains_source_and_serialization_compatible() {
         processing_time_ms: 0,
     };
     let json = serde_json::to_value(report).unwrap();
-    assert_eq!(json.as_object().unwrap().len(), 8);
+    assert_eq!(json.as_object().unwrap().len(), 10);
+    assert_eq!(json["sessions"], json!([]));
+    assert_eq!(json["workspaces"], json!([]));
     assert!(json.get("undated_tokens").is_none());
 }
 
