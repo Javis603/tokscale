@@ -1030,6 +1030,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         use_env_roots,
         scanner_settings,
         cache_policy,
+        None,
         &mut messages,
     );
     let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
@@ -1042,6 +1043,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     messages
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_all_messages_streaming<S: MessageSink>(
     home_dir: &str,
     clients: &[String],
@@ -1049,6 +1051,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
     cache_policy: SourceCachePolicy,
+    since_date: Option<&str>,
     sink: &mut S,
 ) {
     #[derive(Debug)]
@@ -2201,8 +2204,69 @@ fn parse_all_messages_streaming<S: MessageSink>(
     }
 
     let claude_home = PathBuf::from(home_dir);
-    let claude_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Claude)
+
+    // When a date lower-bound is in effect (e.g. `--today` / `--since`), skip
+    // transcript files whose mtime predates the window start.  Claude Code
+    // always appends to the file whose mtime it last touched; a file that has
+    // not been modified since before `since_date` cannot contain messages on
+    // or after that date, so there is nothing for the fingerprint check or the
+    // parser to find.  The check is opt-in: callers that do not propagate a
+    // date bound pass `None` and get the previous behaviour.
+    //
+    // Safety: dedup keys for assistant turns are globally stable (they embed
+    // the API-assigned `messageId:requestId`, not a file path), so skipping a
+    // file here cannot cause a cross-file duplicate to slip through.  See
+    // `dedup_key_is_globally_stable` in sessions/claudecode.rs.
+    let claude_paths: Vec<&PathBuf> = {
+        let paths = scan_result.get(ClientId::Claude);
+        if let Some(since) = since_date {
+            // Parse `since` as a local-date boundary (YYYY-MM-DD). Any file
+            // modified strictly before midnight on that date is excluded.
+            let boundary_secs: Option<u64> = (|| {
+                let mut parts = since.splitn(3, '-');
+                let y: i32 = parts.next()?.parse().ok()?;
+                let m: u32 = parts.next()?.parse().ok()?;
+                let d: u32 = parts.next()?.parse().ok()?;
+                // Compute Unix seconds for midnight UTC of that date.  We
+                // intentionally use UTC here to stay conservative: a local
+                // midnight would vary by timezone, but a UTC midnight is
+                // always ≤ the local midnight everywhere, so we never skip a
+                // file that could contain same-day rows.
+                let days_since_epoch = {
+                    // Days from 1970-01-01 to y-m-d (proleptic Gregorian).
+                    let y = y as i64;
+                    let m = m as i64;
+                    let d = d as i64;
+                    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+                    let c = y / 100;
+                    let yc = y - 100 * c;
+                    (146097 * c / 4) + (1461 * yc / 4) + (153 * m + 2) / 5 + d - 719469
+                };
+                let unix_secs = days_since_epoch.checked_mul(86400)?;
+                u64::try_from(unix_secs).ok()
+            })();
+            if let Some(boundary) = boundary_secs {
+                paths
+                    .iter()
+                    .filter(|p| {
+                        let mtime_secs = p
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs());
+                        mtime_secs.is_none_or(|secs| secs >= boundary)
+                    })
+                    .collect()
+            } else {
+                paths.iter().collect()
+            }
+        } else {
+            paths.iter().collect()
+        }
+    };
+
+    let claude_outcomes: Vec<CachedParseOutcome> = claude_paths
         .par_iter()
         .map(|path| {
             // Claude Code rewrites a transcript in place on resume/compact,
@@ -4875,6 +4939,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
         use_env_roots,
         scanner_settings,
         SourceCachePolicy::Persistent,
+        None,
         sink,
     );
 }
