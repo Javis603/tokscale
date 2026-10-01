@@ -19,7 +19,7 @@ All commands run with Rust 1.98.0 on this macOS Apple Silicon machine, offline d
 - Fork-aligned public-report differential tests: `cargo test --offline --locked -p tokscale-core --lib tests::window_pricing -- --nocapture` passed the current fixture suite. They compare full report entries, session/workspace metadata, and totals against the same fork's full-pricing pipeline; repeated calls are compared too.
 - `cargo clippy --offline --locked --workspace --all-features --all-targets -- -D warnings` passed.
 - `cargo test --offline --locked --workspace --all-features` passed every nonignored suite. Existing ignored tests remain ignored; this does not claim those scenarios executed.
-- `cargo test --offline --locked -p tokscale-core --lib window_` passed 19 focused tests after the final Codex additions.
+- `cargo test --offline --locked -p tokscale-core --lib window_` selected 19 passing tests: 16 concern this window-pricing feature, while three existing LM Studio tests concern streaming-buffer windows. The latter are unrelated and are excluded from the feature-specific count.
 - `cargo fmt --all -- --check` passed.
 
 Public-report fixtures cover Codex, Claude, Cursor, OpenCode SQLite, Hermes SQLite, OpenClaw SQLite/JSON overlap, and GJC reported-zero amounts. Cases include all supported grouping modes (including `client,workspace,session,model`), narrow/wide/narrow queries, new price catalogs, missing pricing becoming available, raw cache shard byte invariance, file append/Claude compaction/CSV rewrite/deletion, SQL insert/update/delete, Codex priority pricing, and the fork's request archive/daily-floor recovery overlay. Prices and dates are deterministic. Date-prediction tests include positive, nonpositive, unrepresentable timestamps, year/day boundaries, inclusive ranges, contradictory predicates, and US daylight-saving transitions.
@@ -30,7 +30,7 @@ A pristine binary built from `ab1067f3` and the candidate binary were run agains
 
 All 39 comparisons passed: Codex/Claude/Cursor/OpenCode/OpenClaw cold and warm reports, all grouping modes, narrow/year/narrow windows, warm price-catalog replacement, Claude append/compaction/deletion, Cursor export replacement/deletion, OpenCode SQL update/insert/delete, and OpenClaw SQLite/JSON migration overlap plus SQL changes, and Codex incremental append/truncation plus fallback modification-time movement across dates. Full JSON (including diagnostics and metadata) matched after excluding only elapsed processing-time fields and normalizing unordered report arrays. This is output-equivalence evidence, not a performance benchmark.
 
-Local replay artifacts:
+Historical local replay artifacts (the debug binaries and temporary source fixtures were subsequently removed during user-requested cleanup):
 
 - Harness: `/private/tmp/window-cli-acceptance.py`.
 - Full baseline/candidate JSON reports: `/private/tmp/window-cli-results.json`.
@@ -39,11 +39,11 @@ Local replay artifacts:
 - Full test log: `/private/tmp/window-tests-final.log`.
 - Strict clippy log: `/private/tmp/window-clippy-final.log`.
 
-Replay: `python3 /private/tmp/window-cli-acceptance.py --baseline /private/tmp/tokscale-window-target/debug/tokscale-window-baseline --candidate /private/tmp/tokscale-window-target/debug/tokscale-window-candidate --output /private/tmp/window-cli-results.json`. These local artifacts are temporary; the permanent Rust regression tests are included in the branch.
+The paths above record the original execution; they are not a currently runnable replay command. Test logs, the harness and JSON comparisons are preserved in the separate handoff archive, and the permanent Rust regression tests remain in the branch. Restoring fixtures or rebuilding is a separate action; this documentation correction did neither.
 
 ## Limits of this evidence
 
-Every registered client and Synthetic was reviewed statically. New runtime fixtures are representative of the pipeline families and difficult reducers; they are not real-history tests for every client. The full workspace suite also executes existing parser/reducer and CLI fixtures on this platform. Linux/Windows execution remains for CI when a PR is created. No new performance percentage is claimed: the earlier v12 percentages describe the old experiment/baseline, and pinned-date prediction plus the current fork changes require new measurements before quoting current gains.
+Every registered client and Synthetic has a static review record. New runtime fixtures are representative, not per-client runtime acceptance: public-report fixtures cover Codex, Claude, Cursor, OpenCode, Hermes and OpenClaw; GJC has only a reported-zero case. Pristine-baseline CLI comparisons cover only Codex, Claude, Cursor, OpenCode and OpenClaw. Other registered clients have no dedicated window-feature runtime evidence in this round, and covered clients still have untested subpaths. Existing parser tests and shared-loader reasoning do not fill that gap. No exhaustive real-history execution is claimed. The full workspace suite also executes existing parser/reducer and CLI fixtures on this platform. Linux/Windows execution remains for CI when a PR is created. This correctness document does not supply performance measurements. The earlier v12 percentages describe the old experiment/baseline. Later default-release CPU and powermetrics measurements were archived separately for implementation commit `62744c8e`; they apply to their recorded corpora and do not establish per-client correctness.
 
 ## Delivery after maintainer response
 
