@@ -1,6 +1,6 @@
 # Window pricing: local validation and fork handoff
 
-Status: locally prepared on `codex/window-scoped-pricing-ready`, based on token-monitor's consumed fork pin `ab1067f38edda3faa822c67b6df016c5c38ded9b`. Original experimental branch `perf/window-scoped-pricing` remains at `52ee12d7`; the original `codex/mcode-store-draft` checkout was not edited. No fork push, PR, release, or token-monitor binary pin change has been made. Maintainer response gates remote delivery.
+Status: locally prepared on `codex/window-scoped-pricing-ready`, based on token-monitor's consumed fork pin `ab1067f38edda3faa822c67b6df016c5c38ded9b`. Original experimental branch `perf/window-scoped-pricing` remains at `52ee12d7`; the original `codex/mcode-store-draft` checkout was not edited. No fork push, PR, release, or token-monitor binary pin change has been made. The maintainer has now invited a PR to `Javis603/tokscale` main; the user requires internal review before any push or PR creation. Publication and token-monitor pin updates remain the maintainer's responsibility.
 
 ## Behavior and scope
 
@@ -45,12 +45,14 @@ The paths above record the original execution; they are not a currently runnable
 
 Every registered client and Synthetic has a static review record. New runtime fixtures are representative, not per-client runtime acceptance: public-report fixtures cover Codex, Claude, Cursor, OpenCode, Hermes and OpenClaw; GJC has only a reported-zero case. Pristine-baseline CLI comparisons cover only Codex, Claude, Cursor, OpenCode and OpenClaw. Other registered clients have no dedicated window-feature runtime evidence in this round, and covered clients still have untested subpaths. Existing parser tests and shared-loader reasoning do not fill that gap. No exhaustive real-history execution is claimed. The full workspace suite also executes existing parser/reducer and CLI fixtures on this platform. Linux/Windows execution remains for CI when a PR is created. This correctness document does not supply performance measurements. The earlier v12 percentages describe the old experiment/baseline. Later default-release CPU and powermetrics measurements were archived separately for implementation commit `62744c8e`; they apply to their recorded corpora and do not establish per-client correctness.
 
-## Delivery after maintainer response
+## Delivery after internal review
 
-1. Confirm the intended fork branch and any requested client/scenario. Preserve this tested baseline and results, then compare/rebase onto the maintainer's then-current target branch.
-2. Repeat format, strict clippy, workspace tests, and relevant differential cases after any baseline changes. Verify joined session/workspace fields remain available.
-3. Rerun the v12-equivalent before/after phase measurement on that baseline if the PR includes performance percentages; do not reuse old numbers as current results.
-4. Push a review branch and open a PR to `Javis603/tokscale` after the maintainer's affirmative response. The feature is not a token-monitor release. Only after review/build availability should token-monitor's manifest point at a new approved fork build.
+The maintainer's reply on token-monitor#637 explicitly accepts the existing equivalence tests and measurements for code review and asks for no further benchmark expansion. The target is `Javis603/tokscale` main. The user's subsequent instruction requires internal review before any push or PR creation; the maintainer invitation does not override that instruction.
+
+1. Complete and record the internal review, retaining both findings and the per-client coverage gaps. Do not turn representative tests into a claim of exhaustive client acceptance.
+2. Compare the then-current fork target with the saved baseline. If it is unchanged and only documentation changed locally, use the existing results. If implementation or target changes, decide the smallest relevant checks and discuss new measurement costs before regenerating workloads; never apply old percentages blindly to changed code.
+3. Keep the review scope to the core window optimization, its equivalence tests and directly supporting documentation. Exclude phase instrumentation, benchmark machinery and the independent shard-cliff regression. Existing measured results may be referenced with their exact implementation SHA, release settings, workload and limitations; no v12/profiling rerun is required to open this review.
+4. Push and create the review PR only after the user's review instruction has been satisfied and submission is authorized. Do not change the token-monitor pin or publish a build; the maintainer will handle those after merging.
 
 Suggested PR title: `perf(core): skip out-of-window warm estimates in model reports`.
 
