@@ -6,7 +6,7 @@
 //! Upstream files reach this module through exactly four hooks:
 //!
 //! - `lib.rs`: `pub mod token_monitor;`
-//! - `lib.rs` streaming parse: [`extend_requested`] before the synthetic lane
+//! - `lib.rs` streaming parse: `extend_requested` before the synthetic lane
 //! - `lib.rs` `parse_local_clients`: [`requested_messages`] before the synthetic lane
 //! - `tokscale-cli` `main`: [`split_cli_clients`] before clap parses argv, and
 //!   [`merge_client_filter`] where the client filter is built
@@ -15,6 +15,7 @@
 //! scan, so plain `tokscale` output is identical to upstream's.
 
 mod proma;
+mod qodercn;
 
 use crate::sessions::UnifiedMessage;
 use std::ffi::OsString;
@@ -28,10 +29,16 @@ struct Client {
 
 /// Every Token Monitor-owned client, in the order they are parsed. Adding a
 /// client is one entry here plus its module; no upstream file changes.
-const CLIENTS: &[Client] = &[Client {
-    id: proma::CLIENT_ID,
-    parse: proma::parse,
-}];
+const CLIENTS: &[Client] = &[
+    Client {
+        id: proma::CLIENT_ID,
+        parse: proma::parse,
+    },
+    Client {
+        id: qodercn::CLIENT_ID,
+        parse: qodercn::parse,
+    },
+];
 
 /// Token Monitor-owned client ids.
 pub fn client_ids() -> impl Iterator<Item = &'static str> {
