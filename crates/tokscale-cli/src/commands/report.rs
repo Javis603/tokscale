@@ -1562,14 +1562,25 @@ fn load_pricing_service() -> Option<std::sync::Arc<PricingService>> {
     fresh.or_else(|| PricingService::load_cached_any_age().map(std::sync::Arc::new))
 }
 
-/// Computes a message's cost. A provider-reported cost is used as-is, the same
-/// way the submit lane never reprices an authoritative figure: some sources
-/// (fx session snapshots, for one) report a cost for a row that carries no
-/// tokens at all, and pricing that row from its tokens would record $0.00.
+/// An explicit custom rate overrides reported spend when token counts exist.
+/// Otherwise provider-reported spend is used as-is: aggregate-only snapshots
+/// cannot be reconstructed from a per-token rate.
 /// Anything else is priced with the canonical [`PricingService`], honoring
 /// per-model rates and every billed token type (input/output/cache read/cache
 /// write/reasoning). Returns 0.0 when no pricing dataset is available.
 fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f64 {
+    let tokens = TokenBreakdown {
+        input: msg.input,
+        output: msg.output,
+        cache_read: msg.cache_read,
+        cache_write: msg.cache_write,
+        reasoning: msg.reasoning,
+    };
+    if tokens.total() > 0 {
+        if let Some(cost) = pricing.and_then(|p| p.calculate_custom_cost(&msg.model_id, &tokens)) {
+            return cost;
+        }
+    }
     if msg.cost_source == CostSource::ProviderReported {
         return msg.cost;
     }
@@ -1580,13 +1591,7 @@ fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f6
         pricing,
         &msg.model_id,
         Some(&msg.provider_id),
-        &TokenBreakdown {
-            input: msg.input,
-            output: msg.output,
-            cache_read: msg.cache_read,
-            cache_write: msg.cache_write,
-            reasoning: msg.reasoning,
-        },
+        &tokens,
         msg.service_tier.as_deref(),
     )
 }
@@ -1827,6 +1832,38 @@ mod tests {
     fn compute_msg_cost_without_pricing_is_zero() {
         let msg = parsed_message("claude-haiku-4");
         assert_eq!(compute_msg_cost(&msg, None), 0.0);
+    }
+
+    #[test]
+    fn compute_msg_cost_custom_pricing_overrides_reported_cost_and_fast_tier() {
+        let mut msg = parsed_message("custom-model");
+        msg.provider_id = "openai".into();
+        msg.cost = 99.0;
+        msg.cost_source = CostSource::ProviderReported;
+        msg.service_tier = Some("priority".into());
+        for rate in [0.0, 0.001] {
+            let pricing = PricingService::new_with_custom(
+                tokscale_core::pricing::custom::CustomPricing::from_models(
+                    std::collections::HashMap::from([(
+                        "custom-model".into(),
+                        tokscale_core::pricing::ModelPricing {
+                            input_cost_per_token: Some(rate),
+                            output_cost_per_token: Some(rate * 2.0),
+                            cache_read_input_token_cost: Some(rate * 0.1),
+                            ..Default::default()
+                        },
+                    )]),
+                ),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            assert!((compute_msg_cost(&msg, Some(&pricing)) - rate * 2200.0).abs() < 1e-12);
+            let mut aggregate_only = msg.clone();
+            aggregate_only.input = 0;
+            aggregate_only.output = 0;
+            aggregate_only.cache_read = 0;
+            assert_eq!(compute_msg_cost(&aggregate_only, Some(&pricing)), 99.0);
+        }
     }
 
     #[test]
