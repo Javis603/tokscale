@@ -15390,6 +15390,30 @@ mod tests {
         }
     }
 
+    fn redirect_window_test_cache_home(home: &std::path::Path) -> crate::paths::test_env::EnvGuard {
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "HOME",
+            "TOKSCALE_CONFIG_DIR",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_EXTRA_DIRS",
+        ]);
+        point_cache_home(&mut env, home);
+        // Conflicting roots ensure these tests exercise only their source fixtures.
+        env.set("CODEX_HOME", home.join("external-codex"));
+        env.set("CLAUDE_CONFIG_DIR", home.join("external-claude"));
+        let extra = home.join("external-cursor");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(
+            extra.join("usage.csv"),
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n\
+             \"2026-09-15T12:00:00.000Z\",\"Included\",\"Composer 1.5\",\"No\",\"1200\",\"1000\",\"5000\",\"2000\",\"8000\",\"Included\"\n",
+        )
+        .unwrap();
+        env.set("TOKSCALE_EXTRA_DIRS", format!("cursor:{}", extra.display()));
+        env
+    }
+
     fn window_test_scanner_settings() -> scanner::ScannerSettings {
         scanner::ScannerSettings {
             bucket_timezone: Some("UTC".to_string()),
@@ -15406,7 +15430,7 @@ mod tests {
             home,
             clients,
             pricing,
-            true,
+            false,
             &window_test_scanner_settings(),
         )
     }
@@ -15416,7 +15440,7 @@ mod tests {
     fn test_window_sieve_pricing_matches_full_pricing_after_filter_codex() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let _cache_env = redirect_cache_home(cache_home.path());
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
         let today = "2026-09-15".to_string();
 
         let codex_dir = source_home.path().join(".codex/sessions");
@@ -15474,7 +15498,7 @@ mod tests {
             source_home.path().to_str().unwrap(),
             &["codex".to_string()],
             Some(&pricing),
-            true,
+            false,
             &window_test_scanner_settings(),
             Some(&window),
         );
@@ -15603,7 +15627,7 @@ mod tests {
         // the cold reseed, the compacted warm hit, and a wide-window pass.
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let _cache_env = redirect_cache_home(cache_home.path());
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
         let today = "2026-09-15".to_string();
 
         let claude_dir = source_home.path().join(".claude/projects/proj");
@@ -15645,7 +15669,7 @@ mod tests {
                 source_home.path().to_str().unwrap(),
                 &["claude".to_string()],
                 Some(&pricing),
-                true,
+                false,
                 &window_test_scanner_settings(),
                 window,
             )
@@ -15730,7 +15754,7 @@ mod tests {
         // changes and takes the cold/incremental path again.
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let _cache_env = redirect_cache_home(cache_home.path());
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
         let today = "2026-09-15".to_string();
 
         let cursor_dir = source_home.path().join(".config/tokscale/cursor-cache");
@@ -15777,7 +15801,7 @@ mod tests {
                 &home,
                 &clients,
                 Some(&pricing),
-                true,
+                false,
                 &window_test_scanner_settings(),
                 window,
             )
@@ -15857,7 +15881,7 @@ mod tests {
         // contribution (max-merge), proving the skipped estimate did not leak.
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let _cache_env = redirect_cache_home(cache_home.path());
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
         let today = "2026-09-15".to_string();
 
         let proj = source_home.path().join(".claude/projects/proj");
@@ -15903,7 +15927,7 @@ mod tests {
             source_home.path().to_str().unwrap(),
             &["claude".to_string()],
             Some(&pricing),
-            true,
+            false,
             &window_test_scanner_settings(),
             Some(&window),
         );
@@ -15958,7 +15982,7 @@ mod tests {
         // Historical messages remain present but do not need an estimate.
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let _cache_env = redirect_cache_home(cache_home.path());
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
         let today = "2026-09-15".to_string();
 
         let codex_dir = source_home.path().join(".codex/sessions");
@@ -16011,7 +16035,7 @@ mod tests {
             source_home.path().to_str().unwrap(),
             &["codex".to_string()],
             Some(&pricing),
-            true,
+            false,
             &scanner_settings,
             Some(&window),
         );
@@ -16032,7 +16056,7 @@ mod tests {
     fn test_window_sieve_pricing_matches_full_pricing_after_filter_generic_lane() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let _cache_env = redirect_cache_home(cache_home.path());
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
         let today = "2026-09-15".to_string();
 
         // A generic-lane client (Cursor) exercises the shared loader path that
@@ -16081,7 +16105,7 @@ mod tests {
             source_home.path().to_str().unwrap(),
             &["cursor".to_string()],
             Some(&pricing),
-            true,
+            false,
             &window_test_scanner_settings(),
             Some(&window),
         );
