@@ -14,8 +14,8 @@ use tokscale_core::content_extractor::{extract_session_content, metadata_only_co
 use tokscale_core::pricing::PricingService;
 use tokscale_core::wiki::{WikiDb, WikiEntry};
 use tokscale_core::{
-    calculate_cost_with_service_tier, parse_local_clients, CostSource, LocalParseOptions,
-    ParsedMessage, TokenBreakdown,
+    calculate_cost_with_service_tier, has_positive_token_usage, parse_local_clients, CostSource,
+    LocalParseOptions, ParsedMessage, TokenBreakdown,
 };
 
 pub struct ReportOptions {
@@ -1582,7 +1582,7 @@ fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f6
         cache_write: msg.cache_write,
         reasoning: msg.reasoning,
     };
-    if tokens.total() > 0 {
+    if has_positive_token_usage(&tokens) {
         if let Some(cost) = pricing.and_then(|p| p.calculate_custom_cost(&msg.model_id, &tokens)) {
             return cost;
         }
@@ -1870,6 +1870,54 @@ mod tests {
             aggregate_only.output = 0;
             aggregate_only.cache_read = 0;
             assert_eq!(compute_msg_cost(&aggregate_only, Some(&pricing)), 99.0);
+        }
+    }
+
+    #[test]
+    fn wiki_custom_pricing_uses_positive_buckets_when_the_total_is_nonpositive() {
+        for rate in [0.0, 0.001] {
+            let pricing = PricingService::new_with_custom(
+                tokscale_core::pricing::custom::CustomPricing::from_models(HashMap::from([(
+                    "custom-model".into(),
+                    ModelPricing {
+                        input_cost_per_token: Some(rate),
+                        output_cost_per_token: Some(rate),
+                        cache_read_input_token_cost: Some(rate),
+                        cache_creation_input_token_cost: Some(rate),
+                        ..Default::default()
+                    },
+                )])),
+                HashMap::new(),
+                HashMap::new(),
+            );
+            for (input, output, cache_read, cache_write, reasoning) in [
+                (100, -200, 0, 0, 0),
+                (-200, 100, 0, 0, 0),
+                (-200, 0, 100, 0, 0),
+                (-200, 0, 0, 100, 0),
+                (-200, 0, 0, 0, 100),
+            ] {
+                let mut msg = parsed_message("custom-model");
+                msg.input = input;
+                msg.output = output;
+                msg.cache_read = cache_read;
+                msg.cache_write = cache_write;
+                msg.reasoning = reasoning;
+                msg.cost_source = CostSource::ProviderReported;
+                for reported_cost in [0.0, 99.0] {
+                    msg.cost = reported_cost;
+                    assert!((compute_msg_cost(&msg, Some(&pricing)) - rate * 100.0).abs() < 1e-12);
+                }
+            }
+            // No positive bucket means aggregate spend cannot be repriced,
+            // even when corrupt negative counters are present.
+            let mut msg = parsed_message("custom-model");
+            msg.input = -100;
+            msg.output = 0;
+            msg.cache_read = 0;
+            msg.cost = 99.0;
+            msg.cost_source = CostSource::ProviderReported;
+            assert_eq!(compute_msg_cost(&msg, Some(&pricing)), 99.0);
         }
     }
 

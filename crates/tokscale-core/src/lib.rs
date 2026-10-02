@@ -4952,7 +4952,9 @@ fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
         || pricing::lookup::is_routing_label(model_id)
 }
 
-fn has_positive_token_usage(tokens: &TokenBreakdown) -> bool {
+/// Whether any token bucket contains usage, independent of corrupt negative
+/// counters in other buckets. Cost calculation clamps negative counters to zero.
+pub fn has_positive_token_usage(tokens: &TokenBreakdown) -> bool {
     tokens.input > 0
         || tokens.output > 0
         || tokens.cache_read > 0
@@ -16850,6 +16852,47 @@ mod tests {
         let original: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(original["messages"][0]["cost"], 99.0);
+    }
+
+    #[test]
+    fn test_custom_pricing_streaming_and_collecting_clamp_negative_buckets() {
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "custom-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.001),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut message = UnifiedMessage::new(
+            "micode",
+            "custom-model",
+            "mimo",
+            "session",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 100,
+                output: -200,
+                ..Default::default()
+            },
+            99.0,
+        );
+        message.mark_provider_reported_cost();
+        let mut collecting = message.clone();
+        apply_custom_pricing_if_available(&mut collecting, Some(&pricing));
+        let mut streaming = Vec::new();
+        CustomPricingSink {
+            sink: &mut streaming,
+            pricing: Some(&pricing),
+        }
+        .accept(message);
+        assert!((collecting.cost - 0.1).abs() < 1e-12);
+        assert_eq!(collecting.cost_source, CostSource::Estimated);
+        assert_eq!(streaming, vec![collecting]);
     }
 
     #[test]
