@@ -483,7 +483,7 @@ The pricing lookup uses a multi-step resolution strategy:
 
 ### Custom Pricing Overrides
 
-In this Token Monitor fork, a matching valid custom entry takes precedence over provider-reported spend as well as catalog prices. Overrides are applied before report and graph aggregation on both fresh parses and cache hits, including an explicit zero price, without adding hosted-provider markups or service-tier premiums. Removing an override restores the original reported cost or normal pricing fallback. This requires token-attributed usage with an unambiguous model; aggregate spend without token counts cannot be recalculated from a per-token rate.
+In this Token Monitor fork, a matching valid custom entry that covers every populated token bucket takes precedence over provider-reported spend as well as catalog prices. An incomplete override retains the original provider-reported cost; estimates without a reported cost keep the existing partial-rate lookup behavior. Overrides are applied before report and graph aggregation on both fresh parses and cache hits, including an explicit zero price, without adding hosted-provider markups or service-tier premiums. Removing an override restores the original reported cost or normal pricing fallback. This requires token-attributed usage with an unambiguous model; aggregate spend without token counts cannot be recalculated from a per-token rate.
 
 Create `custom-pricing.json` in Tokscale's config directory (`~/.config/tokscale/custom-pricing.json` on macOS/Linux by default; the same directory resolved by `TOKSCALE_CONFIG_DIR` when set) to override prices for model IDs that upstream pricing databases do not yet cover correctly.
 
@@ -726,7 +726,7 @@ tokscale trae logout --variant solo
 
 Antigravity and Trae syncs use a legacy-compatible `sync.lock` file to avoid overlapping an older tokscale binary during a rolling upgrade. After a crash or forced stop, that file can remain. Tokscale intentionally fails closed instead of replacing it, because an older binary may still be creating or updating the same path. Confirm that no `tokscale antigravity sync` or `tokscale trae sync` process is active, remove the exact quoted `sync.lock` path printed by the command, then retry. Do not remove the lock while a sync may still be running.
 
-> **Note on pricing**: Without a matching custom override, Trae cost figures are **vendor-reported** — tokscale surfaces the `dollar_float` value returned by Trae's own API rather than recomputing cost from token counts through tokscale's pricing engine. These default figures match what you see on `trae.ai/account-setting#usage`. In this fork, a matching custom entry recalculates token-attributed Trae usage at your rates.
+> **Note on pricing**: Without a matching custom override, Trae cost figures are **vendor-reported** — tokscale surfaces the `dollar_float` value returned by Trae's own API rather than recomputing cost from token counts through tokscale's pricing engine. These default figures match what you see on `trae.ai/account-setting#usage`. In this fork, a matching custom entry covering every populated token bucket recalculates token-attributed Trae usage at your rates.
 
 > **China variants**: The China editions (`trae.com.cn`) are intentionally **not** supported. The CN backend does not expose a session-level usage query API. Trae CN / Trae Solo CN support will be added once an official endpoint becomes available upstream.
 

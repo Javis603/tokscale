@@ -1562,13 +1562,19 @@ fn load_pricing_service() -> Option<std::sync::Arc<PricingService>> {
     fresh.or_else(|| PricingService::load_cached_any_age().map(std::sync::Arc::new))
 }
 
-/// An explicit custom rate overrides reported spend when token counts exist.
+/// A custom rate covering every populated bucket overrides reported spend
+/// when token counts exist and model attribution is unambiguous.
 /// Otherwise provider-reported spend is used as-is: aggregate-only snapshots
 /// cannot be reconstructed from a per-token rate.
 /// Anything else is priced with the canonical [`PricingService`], honoring
 /// per-model rates and every billed token type (input/output/cache read/cache
 /// write/reasoning). Returns 0.0 when no pricing dataset is available.
 fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f64 {
+    // Conflicting model evidence cannot justify any model-based estimate.
+    // Retain the parser's original cost, including an unpriced zero.
+    if msg.model_attribution_conflicted {
+        return msg.cost;
+    }
     let tokens = TokenBreakdown {
         input: msg.input,
         output: msg.output,
@@ -1654,6 +1660,7 @@ mod tests {
         ParsedMessage {
             client: "claude".to_string(),
             model_id: model_id.to_string(),
+            model_attribution_conflicted: false,
             provider_id: "anthropic".to_string(),
             session_id: "s1".to_string(),
             workspace_key: None,
@@ -1863,6 +1870,81 @@ mod tests {
             aggregate_only.output = 0;
             aggregate_only.cache_read = 0;
             assert_eq!(compute_msg_cost(&aggregate_only, Some(&pricing)), 99.0);
+        }
+    }
+
+    #[test]
+    fn wiki_keeps_reported_cost_when_custom_pricing_is_incomplete() {
+        let pricing = PricingService::new_with_custom(
+            tokscale_core::pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "partial-model".into(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000002),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut msg = parsed_message("partial-model");
+        msg.input = 1_000_000;
+        msg.output = 1_000_000;
+        msg.cache_read = 0;
+        msg.cost = 10.0;
+        msg.cost_source = CostSource::ProviderReported;
+        assert_eq!(compute_msg_cost(&msg, Some(&pricing)), 10.0);
+        let home = tempfile::TempDir::new().unwrap();
+        let db = WikiDb::open(&home.path().join("wiki.db")).unwrap();
+        record_new_sessions(&db, &[msg.clone()], Some(&pricing)).unwrap();
+        assert_eq!(
+            db.get_entry(&msg.session_id).unwrap().unwrap().total_cost,
+            10.0
+        );
+    }
+
+    #[test]
+    fn wiki_does_not_price_conflicted_model_attribution() {
+        let home = tempfile::TempDir::new().unwrap();
+        let logs = home.path().join(".grok/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("unified.jsonl"),
+            r#"{"ts":"2026-07-31T00:00:01Z","pid":19,"msg":"subagent spawn credentials","ctx":{"subagent_id":"child","effective_model":"grok-4.8"}}
+{"ts":"2026-07-31T00:00:02Z","pid":19,"sid":"child","msg":"model changed","ctx":{"model":"grok-code"}}
+{"ts":"2026-07-31T00:00:03Z","pid":19,"msg":"subagent failed","ctx":{"subagent_id":"child","effective_model":"grok-4.9"}}
+{"ts":"2026-07-31T00:00:04Z","pid":19,"sid":"child","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"cached_prompt_tokens":60,"completion_tokens":25,"reasoning_tokens":5}}"#,
+        ).unwrap();
+        let pricing = PricingService::new_with_custom(
+            tokscale_core::pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "grok-unknown".into(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0001),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        for scan in ["cold", "warm"] {
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(home.path().to_str().unwrap().into()),
+                use_env_roots: false,
+                clients: Some(vec!["grok".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(parsed.messages.len(), 1, "{scan}");
+            let msg = &parsed.messages[0];
+            assert_eq!(msg.model_id, "grok-unknown");
+            assert!(msg.input > 0 && msg.output > 0);
+            let db = WikiDb::open(&home.path().join(format!("wiki-{scan}.db"))).unwrap();
+            record_new_sessions(&db, &parsed.messages, Some(&pricing)).unwrap();
+            assert_eq!(
+                db.get_entry(&msg.session_id).unwrap().unwrap().total_cost,
+                0.0,
+                "{scan}"
+            );
         }
     }
 

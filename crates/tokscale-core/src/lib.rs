@@ -354,6 +354,8 @@ impl ModelPerformance {
 pub struct ParsedMessage {
     pub client: String,
     pub model_id: String,
+    /// Conflicting source evidence prevents pricing this row by its model id.
+    pub model_attribution_conflicted: bool,
     pub provider_id: String,
     pub session_id: String,
     pub workspace_key: Option<String>,
@@ -6800,6 +6802,7 @@ fn unified_to_parsed(msg: &UnifiedMessage) -> ParsedMessage {
     ParsedMessage {
         client: msg.client.clone(),
         model_id: msg.model_id.clone(),
+        model_attribution_conflicted: msg.model_attribution_conflicted,
         provider_id: msg.provider_id.clone(),
         session_id: msg.session_id.clone(),
         workspace_key: msg.workspace_key.clone(),
@@ -6941,7 +6944,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         dedup_key: None,
         session_title: None,
         is_turn_start: false,
-        model_attribution_conflicted: false,
+        model_attribution_conflicted: msg.model_attribution_conflicted,
     }
 }
 
@@ -16847,6 +16850,69 @@ mod tests {
         let original: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(original["messages"][0]["cost"], 99.0);
+    }
+
+    #[test]
+    fn test_custom_pricing_keeps_reported_cost_when_a_used_rate_is_missing() {
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "partial-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.000002),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut message = UnifiedMessage::new(
+            "micode",
+            "partial-model",
+            "mimo",
+            "session",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                ..Default::default()
+            },
+            10.0,
+        );
+        message.mark_provider_reported_cost();
+        let original = message.clone();
+        apply_custom_pricing_if_available(&mut message, Some(&pricing));
+        assert_eq!(message, original);
+        let mut output = Vec::new();
+        CustomPricingSink {
+            sink: &mut output,
+            pricing: Some(&pricing),
+        }
+        .accept(original.clone());
+        assert_eq!(output, vec![original]);
+    }
+
+    #[test]
+    fn test_parsed_round_trip_preserves_model_attribution_conflict() {
+        for conflicted in [false, true] {
+            let mut message = UnifiedMessage::new(
+                "grok",
+                "grok-unknown",
+                "xai",
+                "session",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input: 100,
+                    ..Default::default()
+                },
+                0.0,
+            );
+            message.model_attribution_conflicted = conflicted;
+            let parsed = unified_to_parsed(&message);
+            assert_eq!(
+                parsed_to_unified(&parsed, 0.0).model_attribution_conflicted,
+                conflicted
+            );
+        }
     }
 
     #[test]

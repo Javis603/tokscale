@@ -614,15 +614,25 @@ impl PricingService {
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> f64 {
-        if let Some(cost) = self.calculate_custom_cost(model_id, usage) {
-            return cost;
+        // Keep legacy partial-row estimates separate from the coverage-aware
+        // API used to replace an already reported cost.
+        if let Some(result) = self.custom.lookup_with_key(model_id) {
+            return compute_cost(
+                result.pricing,
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                usage.reasoning,
+            );
         }
 
         self.lookup
             .calculate_cost_with_provider(model_id, provider_id, usage)
     }
 
-    /// An explicit custom rate, including zero, without market-price fallback.
+    /// An explicit custom rate, including zero, covering every populated token
+    /// bucket without market-price fallback. An incomplete row returns `None`.
     /// Callers use this to override reported spend without treating every
     /// available catalog price as permission to replace the source's cost.
     pub fn calculate_custom_cost(&self, model_id: &str, usage: &TokenBreakdown) -> Option<f64> {
@@ -630,6 +640,9 @@ impl PricingService {
             return None;
         }
         let result = self.custom.lookup_with_key(model_id)?;
+        if !result.pricing.covers_usage(usage) {
+            return None;
+        }
         Some(compute_cost(
             result.pricing,
             usage.input,
@@ -2472,6 +2485,78 @@ mod tests {
 
         assert_eq!(result.source, "Models.dev");
         assert_eq!(result.matched_key, "openai/gpt-fixture-model");
+    }
+
+    #[test]
+    fn custom_reported_cost_override_requires_coverage_of_each_used_bucket() {
+        let service = custom_service(
+            HashMap::from([(
+                "partial-model".into(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000002),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::from([("partial-model".into(), model_pricing(0.00001, 0.00003))]),
+            HashMap::new(),
+        );
+        for usage in [
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                input: 1_000_000,
+                cache_read: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                input: 1_000_000,
+                cache_write: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                input: 1_000_000,
+                reasoning: 1,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                service.calculate_custom_cost("partial-model", &usage),
+                None,
+                "{usage:?}"
+            );
+            // Legacy estimates still honor partial custom rows and do not fill
+            // omitted rates from a catalog behind the user's back.
+            assert_eq!(
+                service.calculate_cost_with_provider("partial-model", None, &usage),
+                2.0
+            );
+        }
+        assert_eq!(
+            service.calculate_custom_cost(
+                "partial-model",
+                &TokenBreakdown {
+                    input: 1_000_000,
+                    ..Default::default()
+                }
+            ),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn custom_reported_cost_override_covers_explicitly_free_models() {
+        let service = custom_service(
+            HashMap::from([("free-model".into(), model_pricing(0.0, 0.0))]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert_eq!(
+            service.calculate_custom_cost("free-model", &all_bucket_usage()),
+            Some(0.0)
+        );
     }
 
     #[test]
