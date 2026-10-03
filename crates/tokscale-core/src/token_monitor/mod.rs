@@ -15,6 +15,7 @@
 //! A client here is requested only by name. It is never part of an unfiltered
 //! scan, so plain `tokscale` output is identical to upstream's.
 
+mod js;
 mod proma;
 mod qodercn;
 

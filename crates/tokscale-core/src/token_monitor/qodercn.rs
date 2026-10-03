@@ -13,14 +13,12 @@
 //! that snapshot instead of from a partial or empty read. The same cache lets
 //! unchanged sources skip re-reading entirely.
 
-use crate::sessions::utils::{open_readonly_sqlite, sqlite_for_each_row_on, SqliteScan};
-use crate::sessions::{
-    normalize_workspace_key, workspace_label_from_key, CostSource, UnifiedMessage,
-};
+use super::js;
+use crate::sessions::utils::open_readonly_sqlite;
+use crate::sessions::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -29,6 +27,7 @@ use tracing::warn;
 
 pub const CLIENT_ID: &str = "qodercn";
 const PROVIDER_ID: &str = "qodercn";
+const UNPRICED_PROVIDER_ID: &str = "unpriced:qodercn";
 const FALLBACK_MODEL: &str = "qoder-agent";
 
 const DB_SUFFIX: [&str; 4] = ["SharedClientCache", "cache", "db", "local.db"];
@@ -94,13 +93,13 @@ struct Fingerprint {
     wal: Option<(u64, u128)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CachedSource {
     fingerprint: Fingerprint,
     rows: Vec<Row>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Cache {
     version: u32,
     /// Keyed by source path: the database file, or one JSONL transcript.
@@ -156,6 +155,10 @@ fn data_paths(home: &Path) -> Paths {
 
 fn parse_with(paths: &Paths, cache_path: &Path) -> Vec<UnifiedMessage> {
     let mut cache = load_cache(cache_path);
+    let loaded = Cache {
+        version: cache.version,
+        sources: cache.sources.clone(),
+    };
     let mut next = Cache {
         version: CACHE_VERSION,
         sources: BTreeMap::new(),
@@ -171,7 +174,10 @@ fn parse_with(paths: &Paths, cache_path: &Path) -> Vec<UnifiedMessage> {
         }
         unique.insert(row.message_id.clone(), row.clone());
     }
-    save_cache(cache_path, &next);
+    // Token Monitor scans several times a minute; rewrite only on a change.
+    if next != loaded {
+        save_cache(cache_path, &next);
+    }
     order
         .into_iter()
         .filter_map(|id| unique.remove(&id))
@@ -180,10 +186,19 @@ fn parse_with(paths: &Paths, cache_path: &Path) -> Vec<UnifiedMessage> {
 }
 
 fn to_message(row: Row) -> UnifiedMessage {
+    // Routing tiers go through the `unpriced:` provider convention (as Unsloth
+    // does) rather than a provider-reported $0: the row stays cost-unknown
+    // instead of claiming an authoritative zero, and the lookup still refuses
+    // to price it. Without it, `efficient` resolves to Kilo's `kilo-auto/efficient`.
+    let provider = if ROUTING_TIERS.contains(&row.model.trim().to_ascii_lowercase().as_str()) {
+        UNPRICED_PROVIDER_ID
+    } else {
+        PROVIDER_ID
+    };
     let mut message = UnifiedMessage::new_with_dedup(
         CLIENT_ID,
         row.model.clone(),
-        PROVIDER_ID,
+        provider,
         row.session_id,
         row.created_at,
         TokenBreakdown {
@@ -196,9 +211,6 @@ fn to_message(row: Row) -> UnifiedMessage {
         0.0,
         Some(row.message_id),
     );
-    if ROUTING_TIERS.contains(&row.model.trim().to_ascii_lowercase().as_str()) {
-        message.cost_source = CostSource::ProviderReported;
-    }
     if let Some(key) = normalize_workspace_key(&row.workspace) {
         let label = workspace_label_from_key(&key);
         message.set_workspace(Some(key), label);
@@ -260,17 +272,6 @@ fn key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Session ids carry a namespace derived from the source path, matching the
-/// JS adapter's `sha256(path.normalize(path))[0..12]`.
-fn source_id(path: &Path) -> String {
-    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
-    digest
-        .iter()
-        .take(6)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 // --- value coercion, mirroring the JS adapter ---
 
 /// `Number(value)` truncated, rejecting negatives and non-finite values.
@@ -290,7 +291,8 @@ fn numeric(value: Option<&Value>) -> Option<i64> {
         }
         _ => return None,
     };
-    (number.is_finite() && number >= 0.0).then(|| number.trunc() as i64)
+    (number.is_finite() && (0.0..=js::MAX_SAFE_INTEGER).contains(&number))
+        .then(|| number.trunc() as i64)
 }
 
 /// `value ?? 0` before [`numeric`].
@@ -299,61 +301,6 @@ fn numeric_or_zero(value: Option<&Value>) -> Option<i64> {
         None | Some(Value::Null) => Some(0),
         some => numeric(some),
     }
-}
-
-fn epoch_number_ms(number: f64) -> i64 {
-    if number > 0.0 && number < 1e12 {
-        (number * 1000.0) as i64
-    } else {
-        number as i64
-    }
-}
-
-/// Mirrors the JS `timestampMs`: seconds vs milliseconds by magnitude,
-/// numeric strings, then `Date.parse` (date-times without an offset are
-/// local time, date-only strings are UTC).
-fn timestamp_ms(value: Option<&Value>) -> i64 {
-    match value {
-        Some(Value::Number(number)) => number.as_f64().map(epoch_number_ms).unwrap_or(0),
-        Some(Value::String(text)) => parse_time_text(text),
-        _ => 0,
-    }
-}
-
-fn parse_time_text(text: &str) -> i64 {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return 0;
-    }
-    if let Ok(number) = trimmed.parse::<f64>() {
-        return if number.is_finite() {
-            epoch_number_ms(number)
-        } else {
-            0
-        };
-    }
-    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
-        return parsed.timestamp_millis();
-    }
-    for format in [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, format) {
-            return naive
-                .and_local_timezone(chrono::Local)
-                .earliest()
-                .map(|local| local.timestamp_millis())
-                .unwrap_or(0);
-        }
-    }
-    chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
-        .ok()
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .map(|naive| naive.and_utc().timestamp_millis())
-        .unwrap_or(0)
 }
 
 fn display_model(code: &str) -> String {
@@ -439,9 +386,9 @@ fn sql_json(value: &rusqlite::types::Value) -> Option<Value> {
 fn sql_time(value: &rusqlite::types::Value) -> i64 {
     use rusqlite::types::Value as Sql;
     match value {
-        Sql::Integer(number) => epoch_number_ms(*number as f64),
-        Sql::Real(number) if number.is_finite() => epoch_number_ms(*number),
-        Sql::Text(text) => parse_time_text(text),
+        Sql::Integer(number) => js::epoch_number_ms(*number as f64),
+        Sql::Real(number) if number.is_finite() => js::epoch_number_ms(*number),
+        Sql::Text(text) => js::parse_time_text(text),
         _ => 0,
     }
 }
@@ -515,29 +462,50 @@ fn read_db(path: &Path) -> Result<Vec<Row>, String> {
     } else {
         USAGE_SQL_NO_PROJECT
     };
-    let source = source_id(path);
+    let source = js::path_namespace(path);
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|err| format!("prepare failed: {err}"))?;
+    let mut cursor = statement
+        .query([])
+        .map_err(|err| format!("query failed: {err}"))?;
     let mut rows = Vec::new();
     let mut count = 0usize;
     let mut bytes = 0usize;
-    let mut over_budget: Option<String> = None;
-    let scan = sqlite_for_each_row_on(&conn, path, sql, Some("Qoder CN usage"), &mut |row| {
-        if over_budget.is_some() {
-            return Ok(());
-        }
+    // Stop stepping at the budget: the point of it is to bound the read.
+    while let Some(row) = cursor
+        .next()
+        .map_err(|err| format!("query did not complete: {err}"))?
+    {
         count += 1;
         if count > DB_MAX_ROWS {
-            over_budget = Some(format!("rows limit {DB_MAX_ROWS}"));
-            return Ok(());
+            return Err(format!("read budget exceeded (rows limit {DB_MAX_ROWS})"));
         }
         let db_row = DbRow {
-            row_id: row.get(0)?,
-            id: row.get(1)?,
-            session_id: row.get(2)?,
-            request_id: row.get(3)?,
-            token_info: row.get(4)?,
-            model_info: row.get(5)?,
-            gmt_create: row.get(6)?,
-            project_name: row.get(7)?,
+            row_id: row
+                .get(0)
+                .map_err(|err| format!("row decode failed: {err}"))?,
+            id: row
+                .get(1)
+                .map_err(|err| format!("row decode failed: {err}"))?,
+            session_id: row
+                .get(2)
+                .map_err(|err| format!("row decode failed: {err}"))?,
+            request_id: row
+                .get(3)
+                .map_err(|err| format!("row decode failed: {err}"))?,
+            token_info: row
+                .get(4)
+                .map_err(|err| format!("row decode failed: {err}"))?,
+            model_info: row
+                .get(5)
+                .map_err(|err| format!("row decode failed: {err}"))?,
+            gmt_create: row
+                .get(6)
+                .map_err(|err| format!("row decode failed: {err}"))?,
+            project_name: row
+                .get(7)
+                .map_err(|err| format!("row decode failed: {err}"))?,
         };
         for value in [&db_row.token_info, &db_row.model_info] {
             if let rusqlite::types::Value::Text(text) = value {
@@ -545,19 +513,11 @@ fn read_db(path: &Path) -> Result<Vec<Row>, String> {
             }
         }
         if bytes > DB_MAX_BYTES {
-            over_budget = Some(format!("bytes limit {DB_MAX_BYTES}"));
-            return Ok(());
+            return Err(format!("read budget exceeded (bytes limit {DB_MAX_BYTES})"));
         }
         if let Some(normalized) = normalize_db_row(db_row, &source) {
             rows.push(normalized);
         }
-        Ok(())
-    });
-    if let Some(reason) = over_budget {
-        return Err(format!("read budget exceeded ({reason})"));
-    }
-    if scan != SqliteScan::Ran {
-        return Err(format!("query did not complete ({scan:?})"));
     }
     Ok(rows)
 }
@@ -683,7 +643,7 @@ fn normalize_jsonl_row(obj: &Value, source: &str) -> Option<Row> {
         input: (prompt - cached).max(0),
         output,
         cache_read: prompt.min(cached),
-        created_at: timestamp_ms(obj.get("timestamp")),
+        created_at: js::timestamp_ms(obj.get("timestamp")),
     })
 }
 
@@ -727,7 +687,7 @@ fn list_jsonl(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) -> Result<(), 
 fn read_jsonl_file(path: &Path, bytes_read: &mut u64) -> Result<Vec<Row>, String> {
     let file = std::fs::File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let mut reader = BufReader::new(file);
-    let source = source_id(path);
+    let source = js::path_namespace(path);
     let mut rows = Vec::new();
     let mut line = Vec::new();
     loop {
@@ -818,6 +778,7 @@ fn collect_jsonl(root: &Path, cache: &mut Cache, next: &mut Cache) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::CostSource;
     use serde_json::json;
 
     fn paths(dir: &Path) -> Paths {
@@ -927,7 +888,8 @@ mod tests {
         assert!(kimi.session_id.starts_with("qodercn:") && kimi.session_id.ends_with(":sess"));
         let auto = messages.iter().find(|m| m.model_id == "Auto").unwrap();
         assert_eq!(auto.timestamp, 1_790_848_800_000);
-        assert_eq!(auto.cost_source, CostSource::ProviderReported);
+        assert_eq!(auto.provider_id, "unpriced:qodercn");
+        assert_eq!(auto.cost_source, CostSource::Unknown);
         assert_eq!(auto.workspace_label, None);
     }
 
@@ -991,18 +953,72 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_scan_does_not_rewrite_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        write_jsonl(
+            &p.projects.join("s-1.jsonl"),
+            &[assistant("m1", "gmodel", 7, 0, 3, "")],
+        );
+        parse_with(&p, &cache);
+        let written = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(parse_with(&p, &cache).len(), 1);
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().modified().unwrap(),
+            written
+        );
+    }
+
+    #[test]
+    fn token_counts_beyond_the_safe_integer_range_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let conn = create_db(&p.db);
+        conn.execute_batch(
+            r#"INSERT INTO chat_message VALUES ('a', 's', 'r', 'assistant',
+                 '{"prompt_tokens":1e30,"completion_tokens":9223372036854775807}', '{}', 1790848800000);
+               INSERT INTO chat_message VALUES ('b', 's', 'r2', 'assistant',
+                 '{"prompt_tokens":10,"completion_tokens":5}', '{}', 1790848800000);"#,
+        )
+        .unwrap();
+        drop(conn);
+        write_jsonl(
+            &p.projects.join("s-1.jsonl"),
+            &[assistant("m1", "gmodel", 7, 0, i64::MAX, "")],
+        );
+        let messages = parse_with(&p, &dir.path().join("cache.json"));
+        let total: i64 = messages
+            .iter()
+            .map(|m| m.tokens.input + m.tokens.output)
+            .sum();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(total, 15);
+    }
+
+    #[test]
     fn timestamps_follow_the_js_rules() {
-        assert_eq!(timestamp_ms(Some(&json!(1_790_848_800))), 1_790_848_800_000);
         assert_eq!(
-            timestamp_ms(Some(&json!(1_790_848_800_000_i64))),
+            js::timestamp_ms(Some(&json!(1_790_848_800))),
             1_790_848_800_000
         );
-        assert_eq!(timestamp_ms(Some(&json!("1790848800"))), 1_790_848_800_000);
         assert_eq!(
-            timestamp_ms(Some(&json!("2026-10-01T10:00:00Z"))),
+            js::timestamp_ms(Some(&json!(1_790_848_800_000_i64))),
             1_790_848_800_000
         );
-        assert_eq!(timestamp_ms(Some(&json!("2026-10-01"))), 1_790_812_800_000);
-        assert_eq!(timestamp_ms(Some(&json!(""))), 0);
+        assert_eq!(
+            js::timestamp_ms(Some(&json!("1790848800"))),
+            1_790_848_800_000
+        );
+        assert_eq!(
+            js::timestamp_ms(Some(&json!("2026-10-01T10:00:00Z"))),
+            1_790_848_800_000
+        );
+        assert_eq!(
+            js::timestamp_ms(Some(&json!("2026-10-01"))),
+            1_790_812_800_000
+        );
+        assert_eq!(js::timestamp_ms(Some(&json!(""))), 0);
     }
 }

@@ -4,11 +4,16 @@
 //! lines carry Anthropic-style `usage`; several streamed chunks share one
 //! message id (thinking / tool_use / text), so each id keeps its largest chunk
 //! and the latest timestamp among its chunks.
+//!
+//! One deliberate difference: the JS adapter reported every row under the
+//! provider `proma`. Here the provider is inferred from the model, because
+//! tokscale prices with it as a hint; `proma` matches no catalog provider and
+//! lost the cache-read rate for some models.
 
+use super::js;
 use crate::sessions::UnifiedMessage;
 use crate::TokenBreakdown;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -22,22 +27,13 @@ pub fn parse(home_dir: &str) -> Vec<UnifiedMessage> {
     parse_root(&root(home_dir))
 }
 
-/// Session ids carry a namespace derived from the root so the same file name
-/// under two roots (host and WSL) stays two sessions, matching the JS adapter.
-fn source_namespace(root: &Path) -> String {
-    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
-    digest
-        .iter()
-        .take(6)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 pub fn parse_root(root: &Path) -> Vec<UnifiedMessage> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
-    let namespace = source_namespace(root);
+    // Session ids carry a namespace derived from the root, so the same file
+    // name under two roots (host and WSL) stays two sessions.
+    let namespace = js::path_namespace(root);
     let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -50,50 +46,9 @@ pub fn parse_root(root: &Path) -> Vec<UnifiedMessage> {
         .collect()
 }
 
-fn number(value: Option<&Value>) -> i64 {
-    match value {
-        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite()).unwrap_or(0.0) as i64,
-        Some(Value::String(s)) => s
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|f| f.is_finite())
-            .unwrap_or(0.0) as i64,
-        _ => 0,
-    }
-}
-
-fn first_number(usage: &Value, keys: &[&str]) -> i64 {
-    keys.iter()
-        .map(|key| number(usage.get(*key)))
-        .find(|value| *value != 0)
-        .unwrap_or(0)
-}
-
-fn timestamp_ms(value: Option<&Value>) -> i64 {
-    let from_number = |n: f64| -> i64 {
-        if n > 0.0 && n < 1e12 {
-            (n * 1000.0) as i64
-        } else {
-            n as i64
-        }
-    };
-    match value {
-        Some(Value::Number(n)) => n
-            .as_f64()
-            .filter(|f| f.is_finite())
-            .map(from_number)
-            .unwrap_or(0),
-        Some(Value::String(s)) if !s.trim().is_empty() => {
-            if let Ok(n) = s.trim().parse::<f64>() {
-                return from_number(n);
-            }
-            chrono::DateTime::parse_from_rfc3339(s.trim())
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or(0)
-        }
-        _ => 0,
-    }
+/// `numberValue(a || b)`: the first truthy field, as a finite count.
+fn count(usage: &Value, keys: &[&str]) -> i64 {
+    js::safe_count(js::js_number(js::first_truthy(usage, keys))).unwrap_or(0)
 }
 
 struct Chunk {
@@ -107,9 +62,11 @@ fn total(tokens: &TokenBreakdown) -> i64 {
 }
 
 fn parse_file(path: &Path, namespace: &str) -> Vec<UnifiedMessage> {
-    let Ok(content) = std::fs::read_to_string(path) else {
+    // Like Node's utf8 decoding, an invalid byte costs only the line it is on.
+    let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
     };
+    let content = String::from_utf8_lossy(&bytes);
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -129,49 +86,42 @@ fn parse_file(path: &Path, namespace: &str) -> Vec<UnifiedMessage> {
         if obj.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let Some(message) = obj.get("message") else {
+        let Some(message) = obj.get("message").filter(|m| js::truthy(m)) else {
             continue;
         };
-        let Some(usage) = message.get("usage").filter(|u| !u.is_null()) else {
+        let Some(usage) = message.get("usage").filter(|u| js::truthy(u)) else {
             continue;
         };
-        let id = message
+        // Message ID: some tools set message.id, Proma uses the line's uuid.
+        let Some(id) = message
             .get("id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                obj.get("uuid")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-            });
-        let Some(id) = id else { continue };
+            .filter(|v| js::truthy(v))
+            .or_else(|| obj.get("uuid").filter(|v| js::truthy(v)))
+            .map(js::js_string)
+        else {
+            continue;
+        };
+        let id = id.as_str();
         let model = message
             .get("model")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                obj.get("_channelModelId")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or("unknown")
-            .to_string();
+            .filter(|v| js::truthy(v))
+            .or_else(|| obj.get("_channelModelId").filter(|v| js::truthy(v)))
+            .map(js::js_string)
+            .unwrap_or_else(|| "unknown".to_string());
         let tokens = TokenBreakdown {
-            input: first_number(usage, &["input_tokens", "inputTokens"]),
-            output: first_number(usage, &["output_tokens", "outputTokens"]),
-            cache_read: first_number(usage, &["cache_read_input_tokens", "cacheReadInputTokens"]),
-            cache_write: first_number(
+            input: count(usage, &["input_tokens", "inputTokens"]),
+            output: count(usage, &["output_tokens", "outputTokens"]),
+            cache_read: count(usage, &["cache_read_input_tokens", "cacheReadInputTokens"]),
+            cache_write: count(
                 usage,
                 &["cache_creation_input_tokens", "cacheCreationInputTokens"],
             ),
             reasoning: 0,
         };
-        let created_at = ["_createdAt", "createdAt", "created_at", "timestamp"]
-            .iter()
-            .map(|key| obj.get(*key))
-            .find(|value| value.is_some_and(|v| !v.is_null() && v != &Value::String(String::new())))
-            .map(timestamp_ms)
-            .unwrap_or(0);
+        let created_at = js::timestamp_ms(js::first_truthy(
+            &obj,
+            &["_createdAt", "createdAt", "created_at", "timestamp"],
+        ));
         if !groups.contains_key(id) {
             order.push(id.to_string());
         }
@@ -252,6 +202,48 @@ mod tests {
         assert_eq!(messages[0].tokens.input + messages[0].tokens.output, 100);
         assert_eq!(messages[0].timestamp, 1_790_848_809_000);
         assert_eq!(messages[0].client, "proma");
+    }
+
+    #[test]
+    fn skips_falsy_usage_and_keeps_the_first_truthy_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "s1.jsonl",
+            &[
+                serde_json::json!({ "type": "assistant", "message": { "id": "a", "usage": false } }),
+                serde_json::json!({ "type": "assistant", "message": { "id": "b", "usage": 0 } }),
+                serde_json::json!({ "type": "assistant", "message": { "id": "c", "usage": "" } }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "_createdAt": 0,
+                    "createdAt": "2026-10-01T10:00:00Z",
+                    "message": { "id": 7, "model": "m", "usage": { "input_tokens": 0, "inputTokens": "5", "output_tokens": "Infinity" } }
+                }),
+            ],
+        );
+        let messages = parse_root(dir.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1_790_848_800_000);
+        assert_eq!(messages[0].tokens.input, 5);
+        assert_eq!(messages[0].tokens.output, 0);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some(format!("proma:{}:7", messages[0].session_id).as_str())
+        );
+    }
+
+    #[test]
+    fn an_invalid_utf8_byte_costs_only_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = assistant("m1", "claude-sonnet", 10, 5, "2026-10-01T10:00:00Z").to_string();
+        let mut body = b"{\"type\":\"assistant\",\"message\":\"\xff\"}\n".to_vec();
+        body.extend_from_slice(good.as_bytes());
+        body.push(b'\n');
+        std::fs::write(dir.path().join("s1.jsonl"), body).unwrap();
+        let messages = parse_root(dir.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 10);
     }
 
     #[test]
