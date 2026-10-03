@@ -493,6 +493,8 @@ mod tests {
 
     fn make_msg(client: &str, session_id: &str, timestamp: i64) -> UnifiedMessage {
         UnifiedMessage {
+            qoder_prompt_tokens: None,
+            qoder_inclusive_output_tokens: None,
             client: client.to_string().into(),
             model_id: "test-model".to_string().into(),
             provider_id: "test-provider".to_string().into(),
