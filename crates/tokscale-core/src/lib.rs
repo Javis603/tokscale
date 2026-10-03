@@ -1196,6 +1196,43 @@ fn flushed_message_identity(
     Some((date, canonical_model_id(&model_id)))
 }
 
+/// A per-call pricing optimization, never part of a persisted cache entry.
+/// Dates must be tested in the same timezone as the final report flush.
+struct PricingWindow<'a> {
+    year: Option<&'a str>,
+    since: Option<&'a str>,
+    until: Option<&'a str>,
+    timezone: bucket_tz::BucketTimezone,
+}
+
+impl<'a> PricingWindow<'a> {
+    fn new(options: &'a ReportOptions, settings: &scanner::ScannerSettings) -> Option<Self> {
+        if options.year.is_none() && options.since.is_none() && options.until.is_none() {
+            return None;
+        }
+        Some(Self {
+            year: options.year.as_deref(),
+            since: options.since.as_deref(),
+            until: options.until.as_deref(),
+            timezone: bucket_tz::BucketTimezone::from_scanner_settings(settings),
+        })
+    }
+
+    fn matches(&self, message: &UnifiedMessage) -> bool {
+        let pinned_date = self
+            .timezone
+            .is_pinned()
+            .then(|| message.date_in_timezone(&self.timezone))
+            .flatten();
+        date_passes_report_filter(
+            pinned_date.as_deref().unwrap_or(&message.date),
+            self.year,
+            self.since,
+            self.until,
+        )
+    }
+}
+
 fn parse_all_messages_with_pricing_with_env_strategy(
     home_dir: &str,
     clients: &[String],
@@ -1210,6 +1247,34 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         use_env_roots,
         scanner_settings,
         SourceCachePolicy::Persistent,
+        None,
+    )
+}
+
+/// Same as [`parse_all_messages_with_pricing_with_env_strategy`], with an
+/// optional report window threaded down to the warm-cache pricing pass.
+///
+/// A window gates only warm estimated pricing, never parsing or reduction.
+/// Claude's cross-file merge still reprices merged usage; other opted-in lanes
+/// retain whole messages without folding skipped estimates into surviving rows.
+/// Raw cache entries and derived-field refresh are independent of the window.
+#[cfg(test)]
+fn parse_all_messages_with_pricing_with_env_strategy_and_window(
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+    use_env_roots: bool,
+    scanner_settings: &scanner::ScannerSettings,
+    price_window: Option<&ReportOptions>,
+) -> Vec<UnifiedMessage> {
+    parse_all_messages_with_pricing_with_cache_policy(
+        home_dir,
+        clients,
+        pricing,
+        use_env_roots,
+        scanner_settings,
+        SourceCachePolicy::Persistent,
+        price_window,
     )
 }
 
@@ -1517,6 +1582,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
     cache_policy: SourceCachePolicy,
+    price_window: Option<&ReportOptions>,
 ) -> Vec<UnifiedMessage> {
     parse_all_messages_with_coverage(
         home_dir,
@@ -1525,6 +1591,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         use_env_roots,
         scanner_settings,
         cache_policy,
+        price_window,
     )
     .0
 }
@@ -1536,7 +1603,11 @@ fn parse_all_messages_with_coverage(
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
     cache_policy: SourceCachePolicy,
+    price_window: Option<&ReportOptions>,
 ) -> (Vec<UnifiedMessage>, Option<claude_desktop::Coverage>) {
+    // The scanner settings passed to this call are authoritative, just as they
+    // are for the final flush. ReportOptions carries only the date predicates.
+    let price_window = price_window.and_then(|window| PricingWindow::new(window, scanner_settings));
     let mut messages: Vec<UnifiedMessage> = Vec::new();
     let outcome = parse_all_messages_streaming(
         home_dir,
@@ -1545,6 +1616,7 @@ fn parse_all_messages_with_coverage(
         use_env_roots,
         scanner_settings,
         cache_policy,
+        price_window.as_ref(),
         &mut messages,
     );
     // This established collection boundary never exposes deferred ownership.
@@ -1559,6 +1631,11 @@ fn parse_all_messages_with_coverage(
         clients,
         timezone.is_pinned().then_some(&timezone),
     );
+    // Reconcile recovery against source costs first, then apply current rates.
+    // Overrides never enter source caches, so removing them restores the source.
+    for message in &mut messages {
+        apply_custom_pricing_if_available(message, pricing);
+    }
     (messages, outcome.coverage)
 }
 
@@ -1577,6 +1654,7 @@ fn parse_all_messages_deferred(
         use_env_roots,
         scanner_settings,
         SourceCachePolicy::PersistentDeferred,
+        None,
         &mut messages,
     );
     let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
@@ -1586,8 +1664,6 @@ fn parse_all_messages_deferred(
         clients,
         timezone.is_pinned().then_some(&timezone),
     );
-    // Reconcile recovery against source costs first, then apply current rates.
-    // Overrides never enter source caches, so removing them restores the source.
     for message in &mut messages {
         apply_custom_pricing_if_available(message, pricing);
     }
@@ -1730,6 +1806,7 @@ fn emit_dsh_scan_warnings(warnings: Mutex<Vec<(PathBuf, String)>>) {
     tui_signal::update_dsh_scan_warnings(messages);
 }
 
+#[allow(clippy::too_many_arguments)] // price_window rides beside pricing through the shared loader chain
 fn parse_all_messages_streaming<S: MessageSink>(
     home_dir: &str,
     clients: &[String],
@@ -1737,6 +1814,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
     cache_policy: SourceCachePolicy,
+    price_window: Option<&PricingWindow<'_>>,
     sink: &mut S,
 ) -> StreamingParseOutcome {
     let mut desktop_coverage = None;
@@ -1752,10 +1830,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         messages: &mut [UnifiedMessage],
         pricing: Option<&pricing::PricingService>,
     ) {
-        for message in messages {
-            message.refresh_derived_fields();
-            apply_pricing_if_available(message, pricing);
-        }
+        refresh_and_price_sieved(messages, pricing, None);
     }
 
     /// Takes the entry's messages by value: the cache handed this entry to
@@ -1773,6 +1848,25 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
         apply_pricing_to_messages(&mut messages, pricing);
         messages
+    }
+
+    /// Refresh every message, gating only estimated pricing by the final report
+    /// date. All messages remain available to reducers and authoritative costs
+    /// remain untouched. Claude cross-file merges reprice the merged usage.
+    fn refresh_and_price_sieved(
+        messages: &mut [UnifiedMessage],
+        pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
+    ) {
+        for message in messages {
+            message.refresh_derived_fields();
+            if pricing.is_some()
+                && !message.has_authoritative_cost()
+                && price_window.is_none_or(|window| window.matches(message))
+            {
+                apply_pricing_if_available(message, pricing);
+            }
+        }
     }
 
     /// A Codex rollout's messages, and the turns they came from (see
@@ -1813,6 +1907,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             is_headless,
             &parsed.fallback_timestamp_indices,
             fallback_timestamp,
+            None,
         );
         if !parsed.parse_succeeded || parsed.unresolved_model_events {
             return (
@@ -1855,13 +1950,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
         is_headless: bool,
         fallback_timestamp_indices: &[usize],
         fallback_timestamp: i64,
+        price_window: Option<&PricingWindow<'_>>,
     ) -> Vec<UnifiedMessage> {
         for index in fallback_timestamp_indices {
             if let Some(message) = messages.get_mut(*index) {
                 message.set_timestamp(fallback_timestamp);
             }
         }
-        apply_pricing_to_messages(&mut messages, pricing);
+        refresh_and_price_sieved(&mut messages, pricing, price_window);
         for message in &mut messages {
             apply_headless_agent(message, is_headless);
         }
@@ -1969,11 +2065,13 @@ fn parse_all_messages_streaming<S: MessageSink>(
         retained
     }
 
+    #[allow(clippy::too_many_arguments)] // price_window rides beside pricing through the shared loader chain
     fn load_or_parse_source_with_fingerprint_and_policy<F, FingerprintFn>(
         identity: message_cache::CacheIdentity,
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         history: HistoryRetention,
         fingerprint_from_path: FingerprintFn,
         parse: F,
@@ -1990,6 +2088,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             path,
             source_cache,
             pricing,
+            price_window,
             history,
             fingerprint_from_path,
             |path, fingerprint| {
@@ -2032,6 +2131,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         history: HistoryRetention,
         fingerprint_from_path: FingerprintFn,
         parse: F,
@@ -2101,8 +2201,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 };
                 if !rebuild_retention_provenance && !entry.messages.is_empty() {
                     let retained_message_keys = entry.retained_message_keys();
+                    let mut messages = entry.messages;
+                    refresh_and_price_sieved(&mut messages, pricing, price_window);
                     return CachedParseOutcome {
-                        messages: cached_messages(entry, pricing),
+                        messages,
                         retained_message_keys,
                         cache_entry: None,
                         invalidate_cache: false,
@@ -2121,8 +2223,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 && !entry.messages.is_empty()
             {
                 let retained_message_keys = entry.retained_message_keys();
+                let mut messages = entry.messages;
+                refresh_and_price_sieved(&mut messages, pricing, price_window);
                 return CachedParseOutcome {
-                    messages: cached_messages(entry, pricing),
+                    messages,
                     retained_message_keys,
                     cache_entry: None,
                     invalidate_cache: false,
@@ -2234,6 +2338,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         fingerprint_from_path: FingerprintFn,
         parse: F,
     ) -> CachedParseOutcome
@@ -2249,6 +2354,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             path,
             source_cache,
             pricing,
+            price_window,
             HistoryRetention::LiveFileOnly,
             fingerprint_from_path,
             |path, _| (parse(path), true),
@@ -2272,6 +2378,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         key_is_globally_stable: fn(&str) -> bool,
         fingerprint_from_path: FingerprintFn,
         parse: F,
@@ -2289,6 +2396,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             path,
             source_cache,
             pricing,
+            price_window,
             HistoryRetention::RetainObserved {
                 key_is_globally_stable,
             },
@@ -2335,6 +2443,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         fingerprint_from_path: FingerprintFn,
         parse: F,
     ) -> CachedParseOutcome
@@ -2350,6 +2459,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             path,
             source_cache,
             pricing,
+            price_window,
             HistoryRetention::LiveFileOnly,
             fingerprint_from_path,
             |path, fingerprint| (parse(path, fingerprint), true),
@@ -2361,6 +2471,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         parse: F,
     ) -> CachedParseOutcome
     where
@@ -2371,6 +2482,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             path,
             source_cache,
             pricing,
+            price_window,
             message_cache::SourceFingerprint::check_path_samples_only,
             parse,
         )
@@ -2390,6 +2502,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         scan_result: &scanner::ScanResult,
         source_cache: &mut message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         all_messages: &mut Vec<UnifiedMessage>,
         machine_labeler: &machine_label::MachineLabeler,
         scan_client: ClientId,
@@ -2402,8 +2515,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .get(scan_client)
             .par_iter()
             .map(|path| {
-                let mut outcome =
-                    load_or_parse_source(cache_identity, path, source_cache, pricing, &parse);
+                let mut outcome = load_or_parse_source(
+                    cache_identity,
+                    path,
+                    source_cache,
+                    pricing,
+                    price_window,
+                    &parse,
+                );
                 machine_labeler.label_messages(path, &mut outcome.messages);
                 outcome
             })
@@ -2428,6 +2547,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         scan_result: &scanner::ScanResult,
         source_cache: &mut message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         all_messages: &mut Vec<UnifiedMessage>,
         machine_labeler: &machine_label::MachineLabeler,
         scan_client: ClientId,
@@ -2440,8 +2560,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .get(scan_client)
             .par_iter()
             .map(|path| {
-                let mut outcome =
-                    load_or_parse_source(cache_identity, path, source_cache, pricing, &parse);
+                let mut outcome = load_or_parse_source(
+                    cache_identity,
+                    path,
+                    source_cache,
+                    pricing,
+                    price_window,
+                    &parse,
+                );
                 machine_labeler.label_messages(path, &mut outcome.messages);
                 outcome
             })
@@ -2676,6 +2802,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             path,
             source_cache,
             pricing,
+            None,
             message_cache::SourceFingerprint::check_sqlite_path,
             parse,
         )
@@ -2933,6 +3060,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        price_window: Option<&PricingWindow<'_>>,
         headless_roots: &[PathBuf],
     ) -> CodexSourceOutcome {
         fn preserve_cached(
@@ -2940,6 +3068,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             _path: &Path,
             pricing: Option<&pricing::PricingService>,
             is_headless: bool,
+            price_window: Option<&PricingWindow<'_>>,
         ) -> CodexSourceOutcome {
             let missing_usage = entry
                 .codex_incremental
@@ -2957,7 +3086,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 .unwrap_or_default();
             (
                 CachedParseOutcome {
-                    messages: finalize_codex_messages(entry.messages, pricing, is_headless, &[], 0),
+                    messages: finalize_codex_messages(
+                        entry.messages,
+                        pricing,
+                        is_headless,
+                        &[],
+                        0,
+                        price_window,
+                    ),
                     retained_message_keys: HashSet::new(),
                     cache_entry: None,
                     invalidate_cache: false,
@@ -2982,7 +3118,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         ) else {
             let entry = cached.expect("cached source checked above");
             if entry.billing_identity_generation == 0 {
-                return preserve_cached(entry, path, pricing, is_headless);
+                return preserve_cached(entry, path, pricing, is_headless, price_window);
             }
             let (mut outcome, coverage, missing_usage, archive_failure) =
                 parse_full_log_source(path, pricing, is_headless);
@@ -3007,7 +3143,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     && cached.billing_identity_generation == 0
                     && !cached.messages.is_empty()
                 {
-                    let mut preserved = preserve_cached(cached.clone(), path, pricing, is_headless);
+                    let mut preserved =
+                        preserve_cached(cached.clone(), path, pricing, is_headless, price_window);
                     preserved.3 = archive_failure;
                     return preserved;
                 }
@@ -3035,15 +3172,17 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         .as_ref()
                         .map(|incremental| incremental.state.turn_coverage.clone())
                         .unwrap_or_default();
+                    let messages = finalize_codex_messages(
+                        cached.messages,
+                        pricing,
+                        is_headless,
+                        &cached.fallback_timestamp_indices,
+                        fallback_timestamp,
+                        price_window,
+                    );
                     return (
                         CachedParseOutcome {
-                            messages: finalize_codex_messages(
-                                cached.messages,
-                                pricing,
-                                is_headless,
-                                &cached.fallback_timestamp_indices,
-                                fallback_timestamp,
-                            ),
+                            messages,
                             retained_message_keys: HashSet::new(),
                             cache_entry: None,
                             invalidate_cache: false,
@@ -3098,6 +3237,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                                     is_headless,
                                     &fallback_timestamp_indices,
                                     fallback_timestamp,
+                                    None,
                                 );
 
                                 return (
@@ -3222,6 +3362,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 |path| {
                     sessions::opencode::parse_opencode_file(path)
                         .into_iter()
@@ -3294,6 +3435,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 sessions::claudecode::dedup_key_is_globally_stable,
                 |path, cached| {
                     message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
@@ -3444,8 +3586,13 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Codex)
         .par_iter()
         .map(|path| {
-            let mut outcome =
-                load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots);
+            let mut outcome = load_or_parse_codex_source(
+                path,
+                &source_cache,
+                pricing,
+                price_window,
+                &headless_roots,
+            );
             machine_labeler.label_messages(path, &mut outcome.0.messages);
             (path.clone(), outcome)
         })
@@ -3519,15 +3666,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         None,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Copilot,
         sessions::copilot::parse_copilot_file,
     );
     merge_copilot_rows_in_place(&mut all_messages);
-    for message in &mut all_messages {
-        apply_pricing_if_available(message, pricing);
-    }
+    refresh_and_price_sieved(&mut all_messages, pricing, price_window);
     let copilot_otel_sessions: HashSet<String> = all_messages
         .iter()
         .filter(|message| message.client == "copilot")
@@ -3621,6 +3767,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 HistoryRetention::LiveFileOnly,
                 message_cache::SourceFingerprint::check_path_samples_only,
                 |path, _| {
@@ -3664,6 +3811,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     path,
                     &source_cache,
                     pricing,
+                    price_window,
                     |path| {
                         let parsed = sessions::cursor::parse_cursor_file_checked(path);
                         unreadable.set(parsed.is_none());
@@ -3725,6 +3873,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Mcode,
@@ -3735,6 +3884,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Warp,
@@ -3753,6 +3903,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_grok_path_samples_only,
                 sessions::grok::parse_grok_file,
             );
@@ -3780,6 +3931,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_jcode_path_samples_only,
                 sessions::jcode::parse_jcode_file,
             );
@@ -3804,6 +3956,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Amp,
@@ -3820,6 +3973,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     path,
                     &source_cache,
                     pricing,
+                    price_window,
                     sessions::codebuff::parse_codebuff_file,
                 );
                 machine_labeler.label_messages(path, &mut outcome.messages);
@@ -3851,6 +4005,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     path,
                     &source_cache,
                     pricing,
+                    price_window,
                     sessions::freebuff::parse_freebuff_file,
                 );
                 machine_labeler.label_messages(path, &mut outcome.messages);
@@ -3876,6 +4031,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_droid_path_samples_only,
                 sessions::droid::parse_droid_file,
             );
@@ -3932,8 +4088,13 @@ fn parse_all_messages_streaming<S: MessageSink>(
         let rollout_outcomes: Vec<(PathBuf, CodexSourceOutcome)> = openclaw_codex_rollouts
             .par_iter()
             .map(|path| {
-                let mut outcome =
-                    load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots);
+                let mut outcome = load_or_parse_codex_source(
+                    path,
+                    &source_cache,
+                    pricing,
+                    price_window,
+                    &headless_roots,
+                );
                 machine_labeler.label_messages(path, &mut outcome.0.messages);
                 ((*path).clone(), outcome)
             })
@@ -3985,6 +4146,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     db_path,
                     &source_cache,
                     pricing,
+                    price_window,
                     HistoryRetention::LiveFileOnly,
                     message_cache::SourceFingerprint::check_sqlite_path,
                     |path, _| {
@@ -4004,6 +4166,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     path,
                     &source_cache,
                     pricing,
+                    price_window,
                     sessions::openclaw::parse_openclaw_transcript,
                 );
                 machine_labeler.label_messages(path, &mut outcome.messages);
@@ -4054,6 +4217,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Aside,
@@ -4068,6 +4232,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Pi,
@@ -4112,6 +4277,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 sessions::kimchi::parse_kimchi_file,
             );
             machine_labeler.label_messages(path, &mut outcome.messages);
@@ -4140,6 +4306,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_reasonix_path_samples_only,
                 sessions::reasonix::parse_reasonix_file,
             );
@@ -4160,6 +4327,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Senpi,
@@ -4170,6 +4338,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Omp,
@@ -4185,6 +4354,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 sessions::proma::parse_proma_file,
             );
             machine_labeler.label_messages(path, &mut outcome.messages);
@@ -4209,6 +4379,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 sessions::augment::parse_augment_file,
             );
             machine_labeler.label_messages(path, &mut outcome.messages);
@@ -4355,6 +4526,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 sessions::cherrystudio::parse_cherrystudio_file,
             );
             machine_labeler.label_messages(path, &mut outcome.messages);
@@ -4403,6 +4575,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 HistoryRetention::LiveFileOnly,
                 message_cache::SourceFingerprint::check_path_samples_only,
                 |path, _| {
@@ -4438,6 +4611,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::LmStudio,
@@ -4484,6 +4658,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Hindsight,
@@ -4503,6 +4678,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Muse,
@@ -4515,6 +4691,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Vibe,
@@ -4550,6 +4727,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::OpenCodeReview,
@@ -4571,6 +4749,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_kimi_path_samples_only,
                 parse,
             );
@@ -4601,6 +4780,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Qwen,
@@ -4616,6 +4796,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_roo_path_samples_only,
                 sessions::roocode::parse_roocode_file,
             );
@@ -4639,6 +4820,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_roo_path_samples_only,
                 sessions::kilocode::parse_kilocode_file,
             );
@@ -4662,6 +4844,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_cline_path_samples_only,
                 sessions::cline::parse_cline_file,
             );
@@ -4686,6 +4869,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &scan_result,
         &mut source_cache,
         pricing,
+        price_window,
         &mut all_messages,
         &machine_labeler,
         ClientId::Mux,
@@ -4712,6 +4896,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_fx_path_samples_only,
                 sessions::fx::parse_fx_file,
             );
@@ -4884,6 +5069,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 message_cache::SourceFingerprint::check_kiro_path_samples_only,
                 sessions::kiro::parse_kiro_file,
             );
@@ -4963,6 +5149,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 sessions::codebuddy::parse_codebuddy_file,
             );
             machine_labeler.label_messages(path, &mut outcome.messages);
@@ -5000,6 +5187,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     path,
                     &source_cache,
                     pricing,
+                    price_window,
                     |path, cached| {
                         message_cache::SourceFingerprint::check_devin_desktop_path_samples_only(
                             path,
@@ -5059,6 +5247,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 path,
                 &source_cache,
                 pricing,
+                price_window,
                 sessions::workbuddy::parse_workbuddy_file,
             );
             machine_labeler.label_messages(path, &mut outcome.messages);
@@ -5769,6 +5958,7 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
         options.use_env_roots,
         &options.scanner_settings,
         SourceCachePolicy::Persistent,
+        Some(&options),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -6112,6 +6302,7 @@ async fn generate_graph_with_loaded_pricing(
             options.use_env_roots,
             &options.scanner_settings,
             SourceCachePolicy::Persistent,
+            None,
             &mut collector,
         );
         recovery::apply(
@@ -6396,6 +6587,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
         use_env_roots,
         scanner_settings,
         SourceCachePolicy::Persistent,
+        None,
         &mut sink,
     )
 }
@@ -6782,33 +6974,29 @@ fn message_passes_report_filter(message: &UnifiedMessage, options: &ReportOption
     {
         return false;
     }
-    if let Some(year) = &options.year {
-        // Matching the prefix in place rather than building `format!("{year}-")`
-        // keeps this predicate allocation-free. The streaming path runs it once
-        // per parsed message, so an allocation here is one heap round-trip per
-        // message on a corpus this change exists to make cheap.
-        if !message
-            .date
-            .strip_prefix(year.as_str())
+    date_passes_report_filter(
+        &message.date,
+        options.year.as_deref(),
+        options.since.as_deref(),
+        options.until.as_deref(),
+    )
+}
+
+fn date_passes_report_filter(
+    date: &str,
+    year: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> bool {
+    if let Some(year) = year {
+        if !date
+            .strip_prefix(year)
             .is_some_and(|rest| rest.starts_with('-'))
         {
             return false;
         }
     }
-
-    if let Some(since) = &options.since {
-        if message.date.as_str() < since.as_str() {
-            return false;
-        }
-    }
-
-    if let Some(until) = &options.until {
-        if message.date.as_str() > until.as_str() {
-            return false;
-        }
-    }
-
-    true
+    since.is_none_or(|since| date >= since) && until.is_none_or(|until| date <= until)
 }
 
 fn filter_messages_for_report(
@@ -7259,6 +7447,7 @@ fn parse_local_unified_messages_resolved(
         options.use_env_roots,
         &options.scanner_settings,
         cache_policy,
+        None,
     );
     Ok(filter_unified_messages(messages, &options))
 }
@@ -8886,29 +9075,32 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 
 #[cfg(test)]
 mod tests {
+    mod window_dates;
+
     use super::{
         aggregate_by_date_v2, aggregate_hourly_usage_entries, aggregate_model_usage_entries,
         aggregate_monthly_usage_v2_entries, apply_pricing_if_available, build_graph_from_messages,
-        calculate_cost_with_service_tier, dedupe_antigravity_family_messages,
-        dedupe_latest_trae_messages, filter_messages_for_report,
-        generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
-        merge_claude_cross_file_duplicate, merge_copilot_rows_in_place, message_cache,
-        message_passes_report_filter, normalize_model_for_grouping, normalize_syntactic,
-        opencode_json_superseded_by_sqlite, parse_all_messages_with_pricing_with_cache_policy,
-        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
+        dedupe_antigravity_family_messages, dedupe_latest_trae_messages,
+        filter_messages_for_report, generate_graph_with_loaded_pricing, get_home_dir_string,
+        is_generic_routing_label, merge_claude_cross_file_duplicate, merge_copilot_rows_in_place,
+        message_cache, message_passes_report_filter, normalize_model_for_grouping,
+        normalize_syntactic, opencode_json_superseded_by_sqlite,
+        parse_all_messages_with_pricing_with_cache_policy,
+        parse_all_messages_with_pricing_with_env_strategy,
+        parse_all_messages_with_pricing_with_env_strategy_and_window, parse_local_clients,
         parse_local_unified_messages, parse_local_unified_messages_deferred, parsed_to_unified,
         paths, prepare_submission_pricing, pricing, retain_for_requested_clients, scanner,
         select_best_covered_hermes_groups, select_local_parse_pricing, sessions, unified_to_parsed,
         validate_priced_messages, ClientId, GraphPricingRequirement, GraphSink, GroupBy,
-        LocalParseOptions, MessageSink, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2,
+        LocalParseOptions, MessageSink, ModelUsage, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2,
         ReportOptions, SourceCachePolicy, TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage,
         AMBIGUOUS_MODEL_PRICING_REASON, GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON,
         MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
         UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
     use super::{
-        apply_custom_pricing_if_available, parse_all_messages_streaming_with_env_strategy,
-        CostSource, CustomPricingSink,
+        apply_custom_pricing_if_available, calculate_cost_with_service_tier,
+        parse_all_messages_streaming_with_env_strategy, CostSource, CustomPricingSink,
     };
     // Kept as its own statement rather than folded into the list above: that list
     // is edited by nearly every PR that touches this file, and sharing it made
@@ -13033,6 +13225,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
             &mut messages,
         );
 
@@ -13118,6 +13311,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
             &mut messages,
         );
 
@@ -13182,6 +13376,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
             &mut messages,
         );
 
@@ -13209,6 +13404,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::Persistent,
+            None,
             &mut cold_messages,
         );
         assert_eq!(
@@ -13237,6 +13433,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::Persistent,
+            None,
             &mut warm_messages,
         );
 
@@ -13340,6 +13537,7 @@ mod tests {
                 false,
                 &scanner::ScannerSettings::default(),
                 SourceCachePolicy::Persistent,
+                None,
                 &mut messages,
             );
 
@@ -18096,6 +18294,7 @@ mod tests {
                 true,
                 &scanner::ScannerSettings::default(),
                 SourceCachePolicy::Persistent,
+                None,
             );
             assert_eq!(openclaw_usage_by_client_session(&messages), expected);
         }
@@ -18122,6 +18321,7 @@ mod tests {
             true,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::Persistent,
+            None,
         );
         assert_eq!(codex_only.len(), 2);
         assert!(codex_only.iter().all(|message| message.client == "codex"));
@@ -18197,6 +18397,7 @@ mod tests {
             true,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::Persistent,
+            None,
         );
         assert_eq!(openclaw_usage_by_client_session(&default_home), expected);
 
@@ -18208,6 +18409,7 @@ mod tests {
             true,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::Persistent,
+            None,
         );
         assert_eq!(openclaw_usage_by_client_session(&cold), expected);
         let warm = parse_all_messages_with_pricing_with_cache_policy(
@@ -18217,6 +18419,7 @@ mod tests {
             true,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::Persistent,
+            None,
         );
         assert_eq!(openclaw_usage_by_client_session(&warm), expected);
 
@@ -18241,6 +18444,7 @@ mod tests {
             true,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::Persistent,
+            None,
         );
         assert_eq!(codex_only.len(), 2);
         assert!(codex_only.iter().all(|message| message.client == "codex"));
@@ -20176,6 +20380,756 @@ mod tests {
             assert_eq!(cached_messages.len(), 1);
             assert_eq!(cached_messages[0].cost, 0.0);
         }
+    }
+
+    fn redirect_window_test_cache_home(home: &std::path::Path) -> crate::paths::test_env::EnvGuard {
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "HOME",
+            "TOKSCALE_CONFIG_DIR",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_EXTRA_DIRS",
+        ]);
+        point_cache_home(&mut env, home);
+        // Conflicting roots ensure these tests exercise only their source fixtures.
+        env.set("CODEX_HOME", home.join("external-codex"));
+        env.set("CLAUDE_CONFIG_DIR", home.join("external-claude"));
+        let extra = home.join("external-cursor");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(
+            extra.join("usage.csv"),
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n\
+             \"2026-09-15T12:00:00.000Z\",\"Included\",\"Composer 1.5\",\"No\",\"1200\",\"1000\",\"5000\",\"2000\",\"8000\",\"Included\"\n",
+        )
+        .unwrap();
+        env.set("TOKSCALE_EXTRA_DIRS", format!("cursor:{}", extra.display()));
+        env
+    }
+
+    fn window_test_scanner_settings() -> scanner::ScannerSettings {
+        scanner::ScannerSettings {
+            bucket_timezone: Some("UTC".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn parse_window_test_messages_with_pricing(
+        home: &str,
+        clients: &[String],
+        pricing: Option<&pricing::PricingService>,
+    ) -> Vec<UnifiedMessage> {
+        parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            clients,
+            pricing,
+            false,
+            &window_test_scanner_settings(),
+        )
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_window_sieve_pricing_matches_full_pricing_after_filter_codex() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
+        let today = "2026-09-15".to_string();
+
+        let codex_dir = source_home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let mut content = String::new();
+        content.push_str(r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#);
+        content.push('\n');
+        for n in 1..=3 {
+            content.push_str(&format!(
+                r#"{{"timestamp":"2025-01-01T00:00:0{}.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{n},"output_tokens":1}},"last_token_usage":{{"input_tokens":10,"output_tokens":3,"cached_input_tokens":2}}}}}}}}"#,
+                n
+            ));
+            content.push('\n');
+        }
+        // Codex assigns each usage event the previous accepted event timestamp.
+        // Two events are needed for the final message to fall on the selected day.
+        for n in 4..=5 {
+            content.push_str(&format!(
+                r#"{{"timestamp":"{today}T00:00:0{}.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{n},"output_tokens":1}},"last_token_usage":{{"input_tokens":10,"output_tokens":3,"cached_input_tokens":2}}}}}}}}"#,
+                n % 2,
+            ));
+            content.push('\n');
+        }
+        std::fs::write(codex_dir.join("rollout.jsonl"), content).unwrap();
+
+        let pricing = {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "gpt-5.4".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0005),
+                    ..Default::default()
+                },
+            );
+            pricing::PricingService::new(litellm, HashMap::new())
+        };
+        let window = ReportOptions {
+            since: Some(today.clone()),
+            until: Some(today.clone()),
+            ..Default::default()
+        };
+
+        // Prime the cache: cold parses price every message; the window gate applies only to warm hits.
+        parse_window_test_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["codex".to_string()],
+            Some(&pricing),
+        );
+
+        // Mechanism: outside-window cached messages are refreshed but left
+        // unpriced when a window is threaded down.
+        let sieved = parse_all_messages_with_pricing_with_env_strategy_and_window(
+            source_home.path().to_str().unwrap(),
+            &["codex".to_string()],
+            Some(&pricing),
+            false,
+            &window_test_scanner_settings(),
+            Some(&window),
+        );
+        let outside: Vec<&UnifiedMessage> = sieved
+            .iter()
+            .filter(|m| m.date.as_str() < today.as_str())
+            .collect();
+        assert_eq!(
+            outside.len(),
+            4,
+            "four historical messages outside the window"
+        );
+        assert!(
+            outside.iter().all(|m| m.cost == 0.0),
+            "outside-window messages must not be repriced"
+        );
+        let inside: Vec<&UnifiedMessage> = sieved.iter().filter(|m| m.date == today).collect();
+        assert_eq!(inside.len(), 1);
+        assert!(inside[0].cost > 0.0);
+
+        // Equivalence: sieved + filter == full pricing + filter.
+        let filtered_sieved = filter_messages_for_report(sieved, &window);
+        let full = parse_window_test_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["codex".to_string()],
+            Some(&pricing),
+        );
+        let filtered_full = filter_messages_for_report(full, &window);
+        assert_eq!(filtered_sieved.len(), filtered_full.len());
+        for (a, b) in filtered_sieved.iter().zip(filtered_full.iter()) {
+            assert!(
+                (a.cost - b.cost).abs() < 1e-12,
+                "cost mismatch: {} vs {}",
+                a.cost,
+                b.cost
+            );
+        }
+        // Acceptance-gate 2: full-field comparison over the aggregated report.
+        let entries_sieved = aggregate_model_usage_entries_with_rollup(
+            filtered_sieved,
+            &window.group_by,
+            window.worktree_rollup,
+        );
+        let entries_full = aggregate_model_usage_entries_with_rollup(
+            filtered_full,
+            &window.group_by,
+            window.worktree_rollup,
+        );
+        assert_report_equivalence(&entries_sieved, &entries_full, "codex window sieve");
+    }
+
+    /// Full-field normalized comparison of two model reports (acceptance-gate 2):
+    /// entries sorted by their grouping identity, then every field compared —
+    /// tokens, messages, provider, cost (tolerance), and performance. `processingTimeMs` is not part of the struct, so nothing
+    /// to ignore there.
+    fn assert_report_equivalence(left: &[ModelUsage], right: &[ModelUsage], context: &str) {
+        let sort_key = |e: &&ModelUsage| {
+            (
+                e.client.clone(),
+                e.model.clone(),
+                e.session_id.clone().unwrap_or_default(),
+                e.workspace_key.clone().unwrap_or_default(),
+            )
+        };
+        let mut a: Vec<&ModelUsage> = left.iter().collect();
+        let mut b: Vec<&ModelUsage> = right.iter().collect();
+        a.sort_by_key(sort_key);
+        b.sort_by_key(sort_key);
+        assert_eq!(a.len(), b.len(), "{context}: entry count");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.client, y.client, "{context}: client");
+            assert_eq!(x.model, y.model, "{context}: model");
+            assert_eq!(x.session_id, y.session_id, "{context}: session");
+            assert_eq!(x.provider, y.provider, "{context}: provider");
+            assert_eq!(
+                x.merged_clients, y.merged_clients,
+                "{context}: merged_clients"
+            );
+            assert_eq!(x.workspace_key, y.workspace_key, "{context}: workspace_key");
+            assert_eq!(
+                x.workspace_label, y.workspace_label,
+                "{context}: workspace_label"
+            );
+            assert_eq!(x.input, y.input, "{context}: input tokens");
+            assert_eq!(x.output, y.output, "{context}: output tokens");
+            assert_eq!(x.cache_read, y.cache_read, "{context}: cache_read");
+            assert_eq!(x.cache_write, y.cache_write, "{context}: cache_write");
+            assert_eq!(x.reasoning, y.reasoning, "{context}: reasoning");
+            assert_eq!(x.message_count, y.message_count, "{context}: message_count");
+            assert!(
+                (x.cost - y.cost).abs() < 1e-9,
+                "{context}: cost {} vs {}",
+                x.cost,
+                y.cost
+            );
+            assert_eq!(
+                x.performance.ms_per_1k_tokens, y.performance.ms_per_1k_tokens,
+                "{context}: performance ms/1k"
+            );
+            assert_eq!(
+                x.performance.total_duration_ms, y.performance.total_duration_ms,
+                "{context}: performance duration"
+            );
+            assert_eq!(
+                x.performance.timed_tokens, y.performance.timed_tokens,
+                "{context}: performance timed_tokens"
+            );
+            assert_eq!(
+                x.performance.sample_count, y.performance.sample_count,
+                "{context}: performance sample_count"
+            );
+            assert!(
+                (x.performance.token_coverage - y.performance.token_coverage).abs() < 1e-9,
+                "{context}: performance token_coverage"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_window_sieve_equivalence_after_claude_compact_and_reload() {
+        // Acceptance-gate coverage: Claude compacts a transcript in place (the
+        // live file loses rows the cache still holds as retained history), the
+        // cache reloads from disk on every parse, and the sieve must neither
+        // lose the retained rows nor diverge from a full-pricing run — across
+        // the cold reseed, the compacted warm hit, and a wide-window pass.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
+        let today = "2026-09-15".to_string();
+
+        let claude_dir = source_home.path().join(".claude/projects/proj");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let live = claude_dir.join("session.jsonl");
+        // Pre-compact: two assistant turns from 2025 (outside any today window).
+        let full_history = format!(
+            "{}{}",
+            r#"{"type":"assistant","timestamp":"2025-01-01T10:00:00.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-3-5-sonnet","usage":{"input_tokens":1000,"output_tokens":100}}}"#,
+            "\n"
+        );
+        let full_history2 = format!(
+            "{}{}",
+            r#"{"type":"assistant","timestamp":"2025-01-02T10:00:00.000Z","requestId":"req_b","message":{"id":"msg_b","model":"claude-3-5-sonnet","usage":{"input_tokens":2000,"output_tokens":200}}}"#,
+            "\n"
+        );
+        std::fs::write(&live, format!("{full_history}{full_history2}")).unwrap();
+
+        let pricing = {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "claude-3-5-sonnet".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0005),
+                    ..Default::default()
+                },
+            );
+            pricing::PricingService::new(litellm, HashMap::new())
+        };
+        let window_today = ReportOptions {
+            since: Some(today.clone()),
+            until: Some(today.clone()),
+            ..Default::default()
+        };
+        let run = |window: Option<&ReportOptions>| {
+            parse_all_messages_with_pricing_with_env_strategy_and_window(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                Some(&pricing),
+                false,
+                &window_test_scanner_settings(),
+                window,
+            )
+        };
+
+        // Cold reseed: both historical messages cached.
+        assert_eq!(run(None).len(), 2);
+
+        // Compact: the live transcript is rewritten down to one turn, plus a
+        // fresh in-window message. The dropped turn survives only as retained
+        // history in the cache.
+        let compacted = format!(
+            "{}{}",
+            r#"{"type":"assistant","timestamp":"2025-01-02T10:00:00.000Z","requestId":"req_b","message":{"id":"msg_b","model":"claude-3-5-sonnet","usage":{"input_tokens":2000,"output_tokens":200}}}"#,
+            "\n"
+        );
+        std::fs::write(&live, format!("{compacted}{}", format!(
+            r#"{{"type":"assistant","timestamp":"{today}T12:00:00.000Z","requestId":"req_c","message":{{"id":"msg_c","model":"claude-3-5-sonnet","usage":{{"input_tokens":3000,"output_tokens":300}}}}}}"#
+        ) + "\n")).unwrap();
+
+        // Sieved run after compact + reload.
+        let sieved = run(Some(&window_today));
+        let sieved_filtered = filter_messages_for_report(sieved.clone(), &window_today);
+        let full = run(None);
+        let full_filtered = filter_messages_for_report(full.clone(), &window_today);
+
+        // The retained turn (dropped from the live file) must still be served —
+        // the sieve must not drop it from history, only skip its pricing.
+        let wide = ReportOptions {
+            since: Some("2000-01-01".to_string()),
+            until: Some("2099-12-31".to_string()),
+            ..Default::default()
+        };
+        let sieved_wide = filter_messages_for_report(run(Some(&wide)), &wide);
+        let sieved_wide_len = sieved_wide.len();
+        let full_wide = filter_messages_for_report(run(None), &wide);
+        let full_wide_len = full_wide.len();
+        // Every full-pricing message must exist with identical cost under the sieve.
+        assert_report_equivalence(
+            &aggregate_model_usage_entries_with_rollup(
+                sieved_wide,
+                &wide.group_by,
+                wide.worktree_rollup,
+            ),
+            &aggregate_model_usage_entries_with_rollup(
+                full_wide,
+                &wide.group_by,
+                wide.worktree_rollup,
+            ),
+            "claude compact wide window",
+        );
+        // And the today-window reports match full pricing too.
+        assert_report_equivalence(
+            &aggregate_model_usage_entries_with_rollup(
+                sieved_filtered,
+                &window_today.group_by,
+                window_today.worktree_rollup,
+            ),
+            &aggregate_model_usage_entries_with_rollup(
+                full_filtered,
+                &window_today.group_by,
+                window_today.worktree_rollup,
+            ),
+            "claude compact today window",
+        );
+        // Retained sanity: the compacted-away turn (msg_a) is still reported
+        // by the wide window on BOTH paths — the sieve lost no data.
+        assert_eq!(full_wide_len, 3, "retained + live + today = 3 turns");
+        assert_eq!(
+            sieved_wide_len, full_wide_len,
+            "sieve must not drop retained rows"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_window_sieve_leaves_no_persistent_state_across_window_sequence() {
+        // State-dimension equivalence: the sieve only gates estimated pricing
+        // on warm hits and never writes back (warm hits return no cache entry),
+        // so any sequence of windows over one cache must reproduce the
+        // full-pricing answer for each window — including after the source
+        // changes and takes the cold/incremental path again.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
+        let today = "2026-09-15".to_string();
+
+        let cursor_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let mut csv = String::from(
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n",
+        );
+        for n in 1..=3 {
+            csv.push_str(&format!(
+                "\"2025-01-0{n}T12:00:00.000Z\",\"Included\",\"Composer 1.5\",\"No\",\"1200\",\"1000\",\"5000\",\"2000\",\"8000\",\"Included\"\n"
+            ));
+        }
+        csv.push_str(&format!(
+            "\"{today}T12:00:00.000Z\",\"Included\",\"Composer 1.5\",\"No\",\"1200\",\"1000\",\"5000\",\"2000\",\"8000\",\"Included\"\n"
+        ));
+        std::fs::write(cursor_dir.join("usage.csv"), csv).unwrap();
+
+        let pricing = {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "Composer 1.5".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0005),
+                    ..Default::default()
+                },
+            );
+            pricing::PricingService::new(litellm, HashMap::new())
+        };
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = ["cursor".to_string()];
+
+        // Step 1: seed the cache (no window, cold build).
+        parse_window_test_messages_with_pricing(&home, &clients, Some(&pricing));
+
+        let window_today = ReportOptions {
+            since: Some(today.clone()),
+            until: Some(today.clone()),
+            ..Default::default()
+        };
+        let run = |window: Option<&ReportOptions>| {
+            parse_all_messages_with_pricing_with_env_strategy_and_window(
+                &home,
+                &clients,
+                Some(&pricing),
+                false,
+                &window_test_scanner_settings(),
+                window,
+            )
+        };
+
+        // Step 2: today with the sieve.
+        let r2 = filter_messages_for_report(run(Some(&window_today)), &window_today);
+        // Step 3: wide window — sieve prices everything.
+        let wide = ReportOptions {
+            since: Some("2000-01-01".to_string()),
+            until: Some("2099-12-31".to_string()),
+            ..Default::default()
+        };
+        let r3 = filter_messages_for_report(run(Some(&wide)), &window_today);
+        // Step 4: today again — any persistent pollution would show here.
+        let r4 = filter_messages_for_report(run(Some(&window_today)), &window_today);
+
+        assert_eq!(r2.len(), 1);
+        assert_eq!(
+            r3.len(),
+            r2.len(),
+            "wide-window run filtered to today matches"
+        );
+        assert_eq!(r4.len(), r2.len());
+        for i in 0..r2.len() {
+            assert!((r2[i].cost - r3[i].cost).abs() < 1e-12);
+            assert!(
+                (r2[i].cost - r4[i].cost).abs() < 1e-12,
+                "sieve left persistent state"
+            );
+        }
+
+        // Step 5: append to the source (cold/incremental path re-engages),
+        // then a sieved run must still match the full-pricing answer.
+        let mut csv = std::fs::read_to_string(cursor_dir.join("usage.csv")).unwrap();
+        csv.push_str(&format!(
+            "\"{today}T18:00:00.000Z\",\"Included\",\"Composer 1.5\",\"No\",\"2400\",\"2000\",\"5000\",\"4000\",\"8000\",\"Included\"\n"
+        ));
+        std::fs::write(cursor_dir.join("usage.csv"), csv).unwrap();
+
+        parse_window_test_messages_with_pricing(&home, &clients, Some(&pricing));
+        let r6 = filter_messages_for_report(run(Some(&window_today)), &window_today);
+        let full_after = filter_messages_for_report(run(None), &window_today);
+        assert_eq!(r6.len(), full_after.len());
+        for (a, b) in r6.iter().zip(full_after.iter()) {
+            assert!((a.cost - b.cost).abs() < 1e-12, "append path diverged");
+        }
+        let entries_r6 = aggregate_model_usage_entries_with_rollup(
+            r6,
+            &window_today.group_by,
+            window_today.worktree_rollup,
+        );
+        let entries_full_after = aggregate_model_usage_entries_with_rollup(
+            full_after,
+            &window_today.group_by,
+            window_today.worktree_rollup,
+        );
+        assert_report_equivalence(
+            &entries_r6,
+            &entries_full_after,
+            "window sequence after append",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_window_sieve_equivalence_survives_claude_cross_file_merge() {
+        // The one downstream consumer of sieve output whose semantics touch
+        // cost: Claude's cross-file merge folds same-key messages and then
+        // reprices from the merged tokens (`merge_message_completeness` merges
+        // usage only; its cost hand-off covers provider-reported values, which
+        // the sieve never touches). Mathematically the merged cost is a pure
+        // function of merged tokens + catalog, identical on both paths; this
+        // test locks that: an outside-window candidate folds into an
+        // in-window existing, and the reported cost must equal the
+        // full-pricing run bit for bit — including the candidate's token
+        // contribution (max-merge), proving the skipped estimate did not leak.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
+        let today = "2026-09-15".to_string();
+
+        let proj = source_home.path().join(".claude/projects/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // Path order sets collection order: the in-window message is the
+        // existing side, the outside-window replay is the candidate.
+        let in_window = r#"{"type":"assistant","timestamp": "__TODAY__T12:00:00.000Z","requestId":"req_x","message":{"id":"msg_x","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#;
+        let out_window = r#"{"type":"assistant","timestamp":"2025-01-01T12:00:00.000Z","requestId":"req_x","message":{"id":"msg_x","model":"claude-3-5-sonnet","usage":{"input_tokens":5000,"output_tokens":50,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#;
+        std::fs::write(
+            proj.join("session-a.jsonl"),
+            in_window.replace("__TODAY__", &today) + "\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("session-b.jsonl"), out_window.to_string() + "\n").unwrap();
+
+        let pricing = {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "claude-3-5-sonnet".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0005),
+                    cache_creation_input_token_cost: Some(0.001),
+                    ..Default::default()
+                },
+            );
+            pricing::PricingService::new(litellm, HashMap::new())
+        };
+        let window = ReportOptions {
+            since: Some(today.clone()),
+            until: Some(today.clone()),
+            ..Default::default()
+        };
+
+        parse_window_test_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+        );
+
+        let sieved = parse_all_messages_with_pricing_with_env_strategy_and_window(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+            false,
+            &window_test_scanner_settings(),
+            Some(&window),
+        );
+        let filtered_sieved = filter_messages_for_report(sieved, &window);
+        let full = parse_window_test_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+        );
+        let filtered_full = filter_messages_for_report(full, &window);
+
+        assert_eq!(
+            filtered_sieved.len(),
+            1,
+            "merged message lands on the in-window date"
+        );
+        assert_eq!(filtered_full.len(), filtered_sieved.len());
+        let a = &filtered_sieved[0];
+        let b = &filtered_full[0];
+        assert!(
+            (a.cost - b.cost).abs() < 1e-12,
+            "merge-repriced cost must match the full-pricing run: {} vs {}",
+            a.cost,
+            b.cost
+        );
+        // The outside-window candidate's tokens took part (max-merge 5000), so
+        // the merged cost reflects them — the skip did not zero anything that
+        // reaches the report.
+        assert!(
+            a.cost > 4.0,
+            "merged cost must be computed from the max-merged tokens (input 5000), got {}",
+            a.cost
+        );
+        // Full-field comparison over the merged report.
+        let entries_sieved = aggregate_model_usage_entries_with_rollup(
+            filtered_sieved,
+            &window.group_by,
+            window.worktree_rollup,
+        );
+        let entries_full = aggregate_model_usage_entries_with_rollup(
+            filtered_full,
+            &window.group_by,
+            window.worktree_rollup,
+        );
+        assert_report_equivalence(&entries_sieved, &entries_full, "claude merge window sieve");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_window_sieve_uses_pinned_bucket_timezone() {
+        // Warm pricing predicts the pinned day used by the final flush.
+        // Historical messages remain present but do not need an estimate.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
+        let today = "2026-09-15".to_string();
+
+        let codex_dir = source_home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let mut content = String::new();
+        content.push_str(r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#);
+        content.push('\n');
+        content.push_str(
+            r#"{"timestamp":"2025-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1},"last_token_usage":{"input_tokens":10,"output_tokens":3,"cached_input_tokens":2}}}}"#,
+        );
+        content.push('\n');
+        content.push_str(&format!(
+            r#"{{"timestamp":"{today}T00:00:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":2,"output_tokens":1}},"last_token_usage":{{"input_tokens":10,"output_tokens":3,"cached_input_tokens":2}}}}}}}}"#
+        ));
+        content.push('\n');
+        std::fs::write(codex_dir.join("rollout.jsonl"), content).unwrap();
+
+        let pricing = {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "gpt-5.4".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0005),
+                    ..Default::default()
+                },
+            );
+            pricing::PricingService::new(litellm, HashMap::new())
+        };
+
+        parse_window_test_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["codex".to_string()],
+            Some(&pricing),
+        );
+
+        let scanner_settings = scanner::ScannerSettings {
+            bucket_timezone: Some("Asia/Shanghai".to_string()),
+            ..Default::default()
+        };
+        let window = ReportOptions {
+            since: Some(today.clone()),
+            until: Some(today.clone()),
+            scanner_settings: scanner_settings.clone(),
+            ..Default::default()
+        };
+
+        let sieved = parse_all_messages_with_pricing_with_env_strategy_and_window(
+            source_home.path().to_str().unwrap(),
+            &["codex".to_string()],
+            Some(&pricing),
+            false,
+            &scanner_settings,
+            Some(&window),
+        );
+        assert_eq!(sieved.len(), 2);
+        // The pinned scan can skip historical estimates without losing rows.
+        let outside = sieved
+            .iter()
+            .find(|m| m.date.as_str() < today.as_str())
+            .unwrap();
+        assert!(
+            outside.cost == 0.0,
+            "pinned scans must skip estimates outside the final report date window"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_window_sieve_pricing_matches_full_pricing_after_filter_generic_lane() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
+        let today = "2026-09-15".to_string();
+
+        // A generic-lane client (Cursor) exercises the shared loader path that
+        // the coverage matrix classifies as the common entry point.
+        let cursor_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let mut csv = String::from(
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n",
+        );
+        for n in 1..=3 {
+            csv.push_str(&format!(
+                "\"2025-01-0{n}T12:00:00.000Z\",\"Included\",\"Composer 1.5\",\"No\",\"1200\",\"1000\",\"5000\",\"2000\",\"8000\",\"Included\"\n"
+            ));
+        }
+        csv.push_str(&format!(
+            "\"{today}T12:00:00.000Z\",\"Included\",\"Composer 1.5\",\"No\",\"1200\",\"1000\",\"5000\",\"2000\",\"8000\",\"Included\"\n"
+        ));
+        std::fs::write(cursor_dir.join("usage.csv"), csv).unwrap();
+
+        let pricing = {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "Composer 1.5".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0005),
+                    ..Default::default()
+                },
+            );
+            pricing::PricingService::new(litellm, HashMap::new())
+        };
+        let window = ReportOptions {
+            since: Some(today.clone()),
+            until: Some(today.clone()),
+            ..Default::default()
+        };
+
+        parse_window_test_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            Some(&pricing),
+        );
+
+        let sieved = parse_all_messages_with_pricing_with_env_strategy_and_window(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            Some(&pricing),
+            false,
+            &window_test_scanner_settings(),
+            Some(&window),
+        );
+        let outside: Vec<&UnifiedMessage> = sieved
+            .iter()
+            .filter(|m| m.date.as_str() < today.as_str())
+            .collect();
+        assert_eq!(outside.len(), 3, "three historical rows outside the window");
+        assert!(outside.iter().all(|m| m.cost == 0.0));
+
+        let filtered_sieved = filter_messages_for_report(sieved, &window);
+        let full = parse_window_test_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            Some(&pricing),
+        );
+        let filtered_full = filter_messages_for_report(full, &window);
+        assert_eq!(filtered_sieved.len(), filtered_full.len());
+        for (a, b) in filtered_sieved.iter().zip(filtered_full.iter()) {
+            assert!((a.cost - b.cost).abs() < 1e-12);
+        }
+        let entries_sieved = aggregate_model_usage_entries_with_rollup(
+            filtered_sieved,
+            &window.group_by,
+            window.worktree_rollup,
+        );
+        let entries_full = aggregate_model_usage_entries_with_rollup(
+            filtered_full,
+            &window.group_by,
+            window.worktree_rollup,
+        );
+        assert_report_equivalence(&entries_sieved, &entries_full, "cursor window sieve");
     }
 
     #[test]
@@ -23555,6 +24509,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
         );
 
         assert_eq!(messages.len(), 1);
@@ -23618,6 +24573,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
         );
 
         assert_eq!(
@@ -23701,6 +24657,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
         );
 
         let embedded = messages
@@ -23750,6 +24707,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
         );
 
         let explicit_zero = messages
@@ -23798,6 +24756,7 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
             SourceCachePolicy::InMemory,
+            None,
         );
 
         assert_eq!(messages.len(), 1);
@@ -24020,6 +24979,7 @@ mod tests {
                 ..Default::default()
             },
             SourceCachePolicy::InMemory,
+            None,
             &mut messages,
         );
 
