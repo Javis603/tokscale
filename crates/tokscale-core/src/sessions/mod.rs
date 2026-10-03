@@ -420,13 +420,24 @@ impl UnifiedMessage {
 
     /// Re-derive the day bucket under an explicitly chosen timezone.
     ///
-    /// `UnifiedMessage::new` is a constructor called from 92 sites across 42
-    /// parser files, so the zone cannot be threaded into it without touching
-    /// every one. It does not need to be: `date` is a derived field, already
+    /// `UnifiedMessage::new` is shared by the parsers, so threading a zone into
+    /// it would require changing every constructor call. It does not need to
+    /// be: `date` is a derived field, already
     /// recomputed from `timestamp` after construction. This lets the one
     /// post-parse pass that holds the user's settings re-key every message at
     /// once, which is the only place the pinned zone is actually known.
     pub(crate) fn rebucket_date(&mut self, timezone: &crate::bucket_tz::BucketTimezone) {
+        if let Some(key) = self.date_in_timezone(timezone) {
+            self.date = key;
+        }
+    }
+
+    /// Predict the same day key as `rebucket_date` without changing the message.
+    /// Warm pricing uses this before reducers; only the final flush mutates dates.
+    pub(crate) fn date_in_timezone(
+        &self,
+        timezone: &crate::bucket_tz::BucketTimezone,
+    ) -> Option<String> {
         // A non-positive timestamp is the parsers' "no usable time" sentinel,
         // not an instant before 1970. Re-keying it would move garbage between
         // two equally wrong days, and it is also what bounds the window the
@@ -434,7 +445,7 @@ impl UnifiedMessage {
         // makes `AGREEMENT_WINDOW_START_MS` a real lower bound rather than a
         // convenient one.
         if self.timestamp <= 0 {
-            return;
+            return None;
         }
 
         let key = timezone.day_key(self.timestamp);
@@ -442,9 +453,7 @@ impl UnifiedMessage {
         // date is wrong by at most the offset between two zones; replacing it
         // with `""` would collapse the message into a bucket that is not a day
         // at all, and that bucket would then be submitted.
-        if !key.is_empty() {
-            self.date = key;
-        }
+        (!key.is_empty()).then_some(key)
     }
 
     pub(crate) fn set_timestamp(&mut self, timestamp: i64) {
