@@ -501,6 +501,28 @@ fn workspace_key_from_qoder_path(path: &Path) -> Option<String> {
 
 /// Parse a Qoder or Qoder CN `.jsonl` transcript file into [`UnifiedMessage`] records.
 pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
+    parse_qoder_source(path, false, |sink| for_each_json_line(path, sink))
+}
+
+/// Token Monitor counts reported tokens only; managed-model text estimates
+/// must not enter the same accounting plane as measured usage.
+pub fn parse_qoder_file_measured(path: &Path) -> Vec<UnifiedMessage> {
+    parse_qoder_source(path, true, |sink| for_each_json_line(path, sink))
+}
+
+/// Share upstream fragment assembly with the bounded CN source reader.
+pub(crate) fn parse_qoder_measured_source(
+    path: &Path,
+    visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
+) -> Vec<UnifiedMessage> {
+    parse_qoder_source(path, true, visit)
+}
+
+fn parse_qoder_source(
+    path: &Path,
+    measured_only: bool,
+    visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
+) -> Vec<UnifiedMessage> {
     if should_skip_qoder_file(path) {
         return Vec::new();
     }
@@ -529,7 +551,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut turn_index_by_key: HashMap<String, usize> = HashMap::new();
     let mut anonymous_turn_counter: usize = 0;
 
-    for_each_json_line(path, &mut |_line_idx, trimmed| {
+    visit(&mut |_line_idx, trimmed| {
         let mut bytes = trimmed.as_bytes().to_vec();
         let Ok(value) = simd_json::from_slice::<Value>(&mut bytes) else {
             return;
@@ -938,6 +960,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
 
     turns
         .into_iter()
+        .filter(|turn| !measured_only || turn.authoritative_tokens.is_some())
         .filter_map(AssembledAssistantTurn::into_unified_message)
         .collect()
 }

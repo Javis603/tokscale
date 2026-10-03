@@ -2296,7 +2296,7 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Bb => 3,
         // v1->v2: extract workspace key from project ancestors avoiding
         // subagents and canonicalize BYOK/managed provider metadata.
-        ClientId::Qoder => crate::sessions::qoder::QODER_PARSER_BASE_VERSION,
+        ClientId::Qoder => 1000 + crate::sessions::qoder::QODER_PARSER_BASE_VERSION,
         // Shared-family members are versioned by `SHARED_PARSER_FAMILIES`
         // through the roster lookup at the top of this function. Listing
         // them here keeps the match exhaustive at compile time; reaching
@@ -9022,7 +9022,7 @@ mod tests {
 
     #[test]
     fn test_qoder_parser_version() {
-        assert_eq!(parser_version(ClientId::Qoder), 4);
+        assert_eq!(parser_version(ClientId::Qoder), 1004);
     }
 
     #[test]
@@ -9051,7 +9051,7 @@ mod tests {
         .unwrap();
 
         let current_identity = CacheIdentity::for_client(ClientId::Qoder);
-        assert_eq!(current_identity.parser_version, 4);
+        assert_eq!(current_identity.parser_version, 1004);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 3,
@@ -9113,7 +9113,7 @@ mod tests {
         let rebuilt = cache
             .get(current_identity, &source)
             .expect("the v4 parse must replace the stale v3 row");
-        assert_eq!(rebuilt.parser_version, 4);
+        assert_eq!(rebuilt.parser_version, 1004);
         assert_eq!(rebuilt.messages.len(), 1);
         assert_eq!(rebuilt.messages[0].model_id, "qmodel_preview");
     }

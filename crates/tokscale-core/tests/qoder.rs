@@ -76,25 +76,25 @@ async fn test_qoder_and_qoder_cn_scanning_and_fork_dedup() {
         false,
         &ScannerSettings::default(),
     );
-    assert_eq!(scan.get(ClientId::Qoder).len(), 3);
+    assert_eq!(scan.get(ClientId::Qoder).len(), 2);
 
     let parsed = parse_local_clients(qoder_options(home)).unwrap();
     // 2 unique messages from ~/.qoder (msg_intl_1 deduplicated across fork + msg_intl_2)
-    // + 1 message from ~/.qoder-cn (msg_cn_1) = 3 total messages
-    assert_eq!(parsed.counts.get(ClientId::Qoder), 3);
-    assert_eq!(parsed.messages.len(), 3);
+    // CN is independently selected and must not enter the international partition.
+    assert_eq!(parsed.counts.get(ClientId::Qoder), 2);
+    assert_eq!(parsed.messages.len(), 2);
 
     let uncached = parse_local_unified_messages_with_pricing_uncached(qoder_options(home), None)
         .await
         .unwrap();
-    assert_eq!(uncached.len(), 3);
+    assert_eq!(uncached.len(), 2);
 }
 
 #[tokio::test]
 async fn test_qoder_gist_representative_schema_periods() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
-    let qoder_cn_proj = home.join(".qoder-cn/projects/sample-periods");
+    let qoder_cn_proj = home.join(".qoder/projects/sample-periods");
     std::fs::create_dir_all(&qoder_cn_proj).unwrap();
 
     // 1. Period 01 (v1.1.5): assistant message has NO usage field at all.
@@ -200,34 +200,13 @@ async fn test_qoder_gist_representative_schema_periods() {
     assert_eq!(scan.get(ClientId::Qoder).len(), 6);
 
     let parsed = parse_local_clients(qoder_options(home)).unwrap();
-    // 1 (p1) + 1 (p2) + 1 (p5) + 2 (p7 turns 1 & 2) + 1 (fallback) + 2 (dynamic) = 8 messages
-    assert_eq!(parsed.counts.get(ClientId::Qoder), 8);
-    assert_eq!(parsed.messages.len(), 8);
-
-    // Check Period 01: absent usage -> estimated tokens
-    let m01 = parsed
+    // Missing/zero counters remain absent: text estimates are not measured usage.
+    assert_eq!(parsed.counts.get(ClientId::Qoder), 6);
+    assert_eq!(parsed.messages.len(), 6);
+    assert!(!parsed
         .messages
         .iter()
-        .find(|m| m.session_id.as_ref() == "sess-01")
-        .expect("sess-01");
-    assert_eq!(m01.model_id.as_ref(), "qmodel_preview");
-    assert_eq!(m01.provider_id.as_ref(), "qwen");
-    assert_eq!(m01.pricing_model_id.as_deref(), None);
-    assert_eq!(m01.input, 100);
-    assert_eq!(m01.output, 150);
-    assert_eq!(m01.reasoning, 50);
-
-    // Check Period 02: zeroed usage -> estimated tokens
-    let m02 = parsed
-        .messages
-        .iter()
-        .find(|m| m.session_id.as_ref() == "sess-02")
-        .expect("sess-02");
-    assert_eq!(m02.model_id.as_ref(), "qmodel_38max");
-    assert_eq!(m02.provider_id.as_ref(), "qwen");
-    assert_eq!(m02.pricing_model_id.as_deref(), None);
-    assert_eq!(m02.input, 200);
-    assert_eq!(m02.output, 100);
+        .any(|m| matches!(m.session_id.as_ref(), "sess-01" | "sess-02")));
 
     // Check Period 05: authoritative non-zero usage
     let m05 = parsed
@@ -306,5 +285,5 @@ async fn test_qoder_gist_representative_schema_periods() {
     let uncached = parse_local_unified_messages_with_pricing_uncached(qoder_options(home), None)
         .await
         .unwrap();
-    assert_eq!(uncached.len(), 8);
+    assert_eq!(uncached.len(), 6);
 }
