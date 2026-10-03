@@ -360,6 +360,8 @@ impl ModelPerformance {
 pub struct ParsedMessage {
     pub client: String,
     pub model_id: String,
+    /// Conflicting source evidence prevents pricing this row by its model id.
+    pub model_attribution_conflicted: bool,
     pub provider_id: String,
     pub session_id: String,
     pub workspace_key: Option<String>,
@@ -891,6 +893,20 @@ impl MessageSink for Vec<UnifiedMessage> {
     }
 }
 
+/// Override only messages leaving the parser, after deduplication and cache
+/// writes. Keeping source costs intact makes price changes and removal safe.
+struct CustomPricingSink<'a, S> {
+    sink: &'a mut S,
+    pricing: Option<&'a pricing::PricingService>,
+}
+
+impl<S: MessageSink> MessageSink for CustomPricingSink<'_, S> {
+    fn accept(&mut self, mut message: UnifiedMessage) {
+        apply_custom_pricing_if_available(&mut message, self.pricing);
+        self.sink.accept(message);
+    }
+}
+
 /// Inputs for the three whole-set passes that used to run once at the end of
 /// the parse. Each is stateless per message, so applying them at flush time is
 /// equivalent to applying them to the finished vector -- and it lets messages
@@ -1048,6 +1064,11 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         clients,
         timezone.is_pinned().then_some(&timezone),
     );
+    // Reconcile recovery against source costs first, then apply current rates.
+    // Overrides never enter source caches, so removing them restores the source.
+    for message in &mut messages {
+        apply_custom_pricing_if_available(message, pricing);
+    }
     messages
 }
 
@@ -4893,6 +4914,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
     scanner_settings: &scanner::ScannerSettings,
     sink: &mut S,
 ) {
+    let mut sink = CustomPricingSink { sink, pricing };
     parse_all_messages_streaming(
         home_dir,
         clients,
@@ -4900,7 +4922,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
         use_env_roots,
         scanner_settings,
         SourceCachePolicy::Persistent,
-        sink,
+        &mut sink,
     );
 }
 
@@ -4955,7 +4977,9 @@ fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
         || pricing::lookup::is_routing_label(model_id)
 }
 
-fn has_positive_token_usage(tokens: &TokenBreakdown) -> bool {
+/// Whether any token bucket contains usage, independent of corrupt negative
+/// counters in other buckets. Cost calculation clamps negative counters to zero.
+pub fn has_positive_token_usage(tokens: &TokenBreakdown) -> bool {
     tokens.input > 0
         || tokens.output > 0
         || tokens.cache_read > 0
@@ -5370,8 +5394,31 @@ pub fn calculate_cost_with_service_tier(
     tokens: &TokenBreakdown,
     service_tier: Option<&str>,
 ) -> f64 {
+    if let Some(cost) = pricing.calculate_custom_cost(model_id, tokens) {
+        return cost;
+    }
     pricing.calculate_cost_with_provider(model_id, provider_id, tokens)
         * openai_fast_mode_multiplier(provider_id, service_tier)
+}
+
+fn apply_custom_pricing_if_available(
+    message: &mut UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+) {
+    // Aggregate spend without token attribution cannot be reconstructed from
+    // a per-token rate. Conflicting model evidence cannot identify an override.
+    if message.model_attribution_conflicted || !has_positive_token_usage(&message.tokens) {
+        return;
+    }
+    let Some(cost) =
+        pricing.and_then(|p| p.calculate_custom_cost(&message.model_id, &message.tokens))
+    else {
+        return;
+    };
+    // Custom rates are the user's effective prices: do not add hosted markup
+    // or service-tier premiums, and accept an explicit free price.
+    message.cost = cost;
+    message.mark_estimated_cost();
 }
 
 fn apply_pricing_if_available(
@@ -6801,6 +6848,7 @@ fn unified_to_parsed(msg: &UnifiedMessage) -> ParsedMessage {
     ParsedMessage {
         client: msg.client.clone(),
         model_id: msg.model_id.clone(),
+        model_attribution_conflicted: msg.model_attribution_conflicted,
         provider_id: msg.provider_id.clone(),
         session_id: msg.session_id.clone(),
         workspace_key: msg.workspace_key.clone(),
@@ -6944,7 +6992,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         dedup_key: None,
         session_title: None,
         is_turn_start: false,
-        model_attribution_conflicted: false,
+        model_attribution_conflicted: msg.model_attribution_conflicted,
     }
 }
 
@@ -6967,6 +7015,10 @@ mod tests {
         GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
         ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL, UNVERIFIED_MODEL_IDENTITY_REASON,
         UNVERIFIED_PROVIDER_IDENTITY_REASON,
+    };
+    use super::{
+        apply_custom_pricing_if_available, calculate_cost_with_service_tier,
+        parse_all_messages_streaming_with_env_strategy, CostSource, CustomPricingSink,
     };
     // Kept as its own statement rather than folded into the list above: that list
     // is edited by nearly every PR that touches this file, and sharing it made
@@ -9683,6 +9735,130 @@ mod tests {
                 second[0].cost
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_custom_pricing_micode_cold_warm_changed_free_and_removed() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let db_path = source_home.path().join(".local/share/mimocode/mimocode.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "custom-cost",
+                "custom-session",
+                r#"{"role":"assistant","modelID":"mimo-v2.5-pro","providerID":"mimo","cost":0.05,"tokens":{"input":1000,"output":500,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000000000}}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let clients = vec!["micode".to_string()];
+        for (rates, expected) in [
+            (Some(0.001), 2.0),
+            (Some(0.002), 4.0),
+            (Some(0.0), 0.0),
+            (None, 0.05),
+        ] {
+            let custom = rates.map_or_else(HashMap::new, |input| {
+                HashMap::from([(
+                    "mimo-v2.5-pro".into(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(input),
+                        output_cost_per_token: Some(input * 2.0),
+                        ..Default::default()
+                    },
+                )])
+            });
+            let pricing = pricing::PricingService::new_with_custom(
+                pricing::custom::CustomPricing::from_models(custom),
+                HashMap::from([(
+                    "mimo-v2.5-pro".into(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(1.0),
+                        output_cost_per_token: Some(2.0),
+                        ..Default::default()
+                    },
+                )]),
+                HashMap::new(),
+            );
+            let messages = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                Some(&pricing),
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(
+                (messages[0].cost - expected).abs() < 1e-12,
+                "rates {rates:?}"
+            );
+            assert_eq!(messages[0].has_authoritative_cost(), rates.is_none());
+            assert_eq!(messages[0].tokens.total(), 1500);
+
+            // The graph uses streaming rather than the collecting report path.
+            let mut sink =
+                GraphSink::new(None, Some(&pricing), GraphPricingRequirement::Submission);
+            parse_all_messages_streaming_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                Some(&pricing),
+                false,
+                &scanner::ScannerSettings::default(),
+                &mut sink,
+            );
+            let graph = sink
+                .finish(
+                    std::time::Instant::now(),
+                    &crate::bucket_tz::BucketTimezone::Local,
+                )
+                .unwrap();
+            assert!((graph.summary.total_cost - expected).abs() < 1e-12);
+            assert_eq!(graph.summary.total_tokens, 1500);
+            assert!(graph.unpriced_submission_usage.is_empty());
+
+            for grouping in [
+                GroupBy::Model,
+                GroupBy::ClientModel,
+                GroupBy::ClientProviderModel,
+                GroupBy::Session,
+                GroupBy::ClientSession,
+                GroupBy::ClientWorkspaceSession,
+            ] {
+                let entries = aggregate_model_usage_entries(messages.clone(), &grouping);
+                assert_eq!(entries.len(), 1);
+                assert!((entries[0].cost - expected).abs() < 1e-12);
+            }
+            let cache = message_cache::SourceMessageCache::load();
+            let entry = cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::MiMoCode),
+                    &db_path,
+                )
+                .unwrap();
+            assert_eq!(
+                entry.messages[0].cost, 0.05,
+                "override must never replace cached source cost"
+            );
+            assert!(entry.messages[0].has_authoritative_cost());
+        }
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(messages[0].cost, 0.05);
     }
 
     #[test]
@@ -16609,6 +16785,287 @@ mod tests {
             Some(&pricing)
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_custom_pricing_overrides_reported_cost_without_provider_multipliers() {
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "custom-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(2e-6),
+                    output_cost_per_token: Some(4e-6),
+                    cache_read_input_token_cost: Some(0.5e-6),
+                    cache_creation_input_token_cost: Some(3e-6),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let tokens = TokenBreakdown {
+            input: 1000,
+            output: 400,
+            reasoning: 100,
+            cache_read: 100,
+            cache_write: 100,
+            cache_write_1h: 0,
+        };
+        for (client, provider) in [
+            ("micode", "mimo"),
+            ("cursor", "openai"),
+            ("hermes", "openai"),
+            ("gjc", "openai"),
+            ("junie", "openai"),
+            ("trae", "openai"),
+            ("zed", sessions::zed::ZED_HOSTED_PROVIDER),
+            ("codex", "openai-codex"),
+        ] {
+            for reported in [0.0, 99.0] {
+                let mut message = UnifiedMessage::new(
+                    client,
+                    "custom-model",
+                    provider,
+                    "custom-session",
+                    1_733_011_200_000,
+                    tokens.clone(),
+                    reported,
+                );
+                message.mark_provider_reported_cost();
+                message.service_tier = Some("priority".into());
+                let mut output = Vec::new();
+                let mut sink = CustomPricingSink {
+                    sink: &mut output,
+                    pricing: Some(&pricing),
+                };
+                sink.accept(message);
+                assert!((output[0].cost - 0.00435).abs() < 1e-12, "{client}");
+                assert_eq!(output[0].cost_source, CostSource::Estimated);
+                assert_eq!(output[0].tokens, tokens);
+            }
+        }
+        assert!(
+            (calculate_cost_with_service_tier(
+                &pricing,
+                "custom-model",
+                Some("openai"),
+                &tokens,
+                Some("fast")
+            ) - 0.00435)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_custom_pricing_applies_after_recovery_reconciliation() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let _recovery_env =
+            crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_RECOVERY_DISABLE"]);
+        std::env::remove_var("TOKSCALE_RECOVERY_DISABLE");
+        let mut archived = UnifiedMessage::new(
+            "micode",
+            "custom-model",
+            "mimo",
+            "recovered-session",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1000,
+                output: 500,
+                ..Default::default()
+            },
+            99.0,
+        );
+        archived.mark_provider_reported_cost();
+        archived.dedup_key = Some("archived-request".into());
+        let path = crate::recovery::path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "home": source_home.path().to_str().unwrap(),
+                "messages": [archived], "daily_floors": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "custom-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().into()),
+            clients: Some(vec!["micode".into()]),
+            use_env_roots: false,
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let graph = runtime
+            .block_on(generate_graph_with_loaded_pricing(
+                options,
+                Some(&pricing),
+                GraphPricingRequirement::Lenient,
+            ))
+            .unwrap();
+        assert_eq!(graph.summary.total_tokens, 1500);
+        assert_eq!(graph.summary.total_cost, 2.0);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(original["messages"][0]["cost"], 99.0);
+    }
+
+    #[test]
+    fn test_custom_pricing_streaming_and_collecting_clamp_negative_buckets() {
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "custom-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.001),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut message = UnifiedMessage::new(
+            "micode",
+            "custom-model",
+            "mimo",
+            "session",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 100,
+                output: -200,
+                ..Default::default()
+            },
+            99.0,
+        );
+        message.mark_provider_reported_cost();
+        let mut collecting = message.clone();
+        apply_custom_pricing_if_available(&mut collecting, Some(&pricing));
+        let mut streaming = Vec::new();
+        CustomPricingSink {
+            sink: &mut streaming,
+            pricing: Some(&pricing),
+        }
+        .accept(message);
+        assert!((collecting.cost - 0.1).abs() < 1e-12);
+        assert_eq!(collecting.cost_source, CostSource::Estimated);
+        assert_eq!(streaming, vec![collecting]);
+    }
+
+    #[test]
+    fn test_custom_pricing_keeps_reported_cost_when_a_used_rate_is_missing() {
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "partial-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.000002),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut message = UnifiedMessage::new(
+            "micode",
+            "partial-model",
+            "mimo",
+            "session",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                ..Default::default()
+            },
+            10.0,
+        );
+        message.mark_provider_reported_cost();
+        let original = message.clone();
+        apply_custom_pricing_if_available(&mut message, Some(&pricing));
+        assert_eq!(message, original);
+        let mut output = Vec::new();
+        CustomPricingSink {
+            sink: &mut output,
+            pricing: Some(&pricing),
+        }
+        .accept(original.clone());
+        assert_eq!(output, vec![original]);
+    }
+
+    #[test]
+    fn test_parsed_round_trip_preserves_model_attribution_conflict() {
+        for conflicted in [false, true] {
+            let mut message = UnifiedMessage::new(
+                "grok",
+                "grok-unknown",
+                "xai",
+                "session",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input: 100,
+                    ..Default::default()
+                },
+                0.0,
+            );
+            message.model_attribution_conflicted = conflicted;
+            let parsed = unified_to_parsed(&message);
+            assert_eq!(
+                parsed_to_unified(&parsed, 0.0).model_attribution_conflicted,
+                conflicted
+            );
+        }
+    }
+
+    #[test]
+    fn test_custom_pricing_keeps_unmatched_conflicted_and_aggregate_spend() {
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "custom-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        for (model, input, conflicted) in [
+            ("other-model", 1000, false),
+            ("custom-model", 1000, true),
+            ("custom-model", 0, false),
+        ] {
+            let mut message = UnifiedMessage::new(
+                "cursor",
+                model,
+                "openai",
+                "session",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input,
+                    ..Default::default()
+                },
+                99.0,
+            );
+            message.mark_provider_reported_cost();
+            message.model_attribution_conflicted = conflicted;
+            let original = message.clone();
+            apply_custom_pricing_if_available(&mut message, Some(&pricing));
+            assert_eq!(message, original);
+        }
     }
 
     #[test]

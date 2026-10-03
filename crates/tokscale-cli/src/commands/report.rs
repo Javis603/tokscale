@@ -14,8 +14,8 @@ use tokscale_core::content_extractor::{extract_session_content, metadata_only_co
 use tokscale_core::pricing::PricingService;
 use tokscale_core::wiki::{WikiDb, WikiEntry};
 use tokscale_core::{
-    calculate_cost_with_service_tier, parse_local_clients, CostSource, LocalParseOptions,
-    ParsedMessage, TokenBreakdown,
+    calculate_cost_with_service_tier, has_positive_token_usage, parse_local_clients, CostSource,
+    LocalParseOptions, ParsedMessage, TokenBreakdown,
 };
 
 pub struct ReportOptions {
@@ -1562,14 +1562,32 @@ fn load_pricing_service() -> Option<std::sync::Arc<PricingService>> {
     fresh.or_else(|| PricingService::load_cached_any_age().map(std::sync::Arc::new))
 }
 
-/// Computes a message's cost. A provider-reported cost is used as-is, the same
-/// way the submit lane never reprices an authoritative figure: some sources
-/// (fx session snapshots, for one) report a cost for a row that carries no
-/// tokens at all, and pricing that row from its tokens would record $0.00.
+/// A custom rate covering every populated bucket overrides reported spend
+/// when token counts exist and model attribution is unambiguous.
+/// Otherwise provider-reported spend is used as-is: aggregate-only snapshots
+/// cannot be reconstructed from a per-token rate.
 /// Anything else is priced with the canonical [`PricingService`], honoring
 /// per-model rates and every billed token type (input/output/cache read/cache
 /// write/reasoning). Returns 0.0 when no pricing dataset is available.
 fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f64 {
+    // Conflicting model evidence cannot justify any model-based estimate.
+    // Retain the parser's original cost, including an unpriced zero.
+    if msg.model_attribution_conflicted {
+        return msg.cost;
+    }
+    let tokens = TokenBreakdown {
+        input: msg.input,
+        output: msg.output,
+        cache_read: msg.cache_read,
+        cache_write: msg.cache_write,
+        cache_write_1h: msg.cache_write_1h,
+        reasoning: msg.reasoning,
+    };
+    if has_positive_token_usage(&tokens) {
+        if let Some(cost) = pricing.and_then(|p| p.calculate_custom_cost(&msg.model_id, &tokens)) {
+            return cost;
+        }
+    }
     if msg.cost_source == CostSource::ProviderReported {
         return msg.cost;
     }
@@ -1580,14 +1598,7 @@ fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f6
         pricing,
         &msg.model_id,
         Some(&msg.provider_id),
-        &TokenBreakdown {
-            input: msg.input,
-            output: msg.output,
-            cache_read: msg.cache_read,
-            cache_write: msg.cache_write,
-            cache_write_1h: msg.cache_write_1h,
-            reasoning: msg.reasoning,
-        },
+        &tokens,
         msg.service_tier.as_deref(),
     )
 }
@@ -1650,6 +1661,7 @@ mod tests {
         ParsedMessage {
             client: "claude".to_string(),
             model_id: model_id.to_string(),
+            model_attribution_conflicted: false,
             provider_id: "anthropic".to_string(),
             session_id: "s1".to_string(),
             workspace_key: None,
@@ -1856,6 +1868,161 @@ mod tests {
     fn compute_msg_cost_without_pricing_is_zero() {
         let msg = parsed_message("claude-haiku-4");
         assert_eq!(compute_msg_cost(&msg, None), 0.0);
+    }
+
+    #[test]
+    fn compute_msg_cost_custom_pricing_overrides_reported_cost_and_fast_tier() {
+        let mut msg = parsed_message("custom-model");
+        msg.provider_id = "openai".into();
+        msg.cost = 99.0;
+        msg.cost_source = CostSource::ProviderReported;
+        msg.service_tier = Some("priority".into());
+        for rate in [0.0, 0.001] {
+            let pricing = PricingService::new_with_custom(
+                tokscale_core::pricing::custom::CustomPricing::from_models(
+                    std::collections::HashMap::from([(
+                        "custom-model".into(),
+                        tokscale_core::pricing::ModelPricing {
+                            input_cost_per_token: Some(rate),
+                            output_cost_per_token: Some(rate * 2.0),
+                            cache_read_input_token_cost: Some(rate * 0.1),
+                            ..Default::default()
+                        },
+                    )]),
+                ),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            assert!((compute_msg_cost(&msg, Some(&pricing)) - rate * 2200.0).abs() < 1e-12);
+            let mut aggregate_only = msg.clone();
+            aggregate_only.input = 0;
+            aggregate_only.output = 0;
+            aggregate_only.cache_read = 0;
+            assert_eq!(compute_msg_cost(&aggregate_only, Some(&pricing)), 99.0);
+        }
+    }
+
+    #[test]
+    fn wiki_custom_pricing_uses_positive_buckets_when_the_total_is_nonpositive() {
+        for rate in [0.0, 0.001] {
+            let pricing = PricingService::new_with_custom(
+                tokscale_core::pricing::custom::CustomPricing::from_models(HashMap::from([(
+                    "custom-model".into(),
+                    ModelPricing {
+                        input_cost_per_token: Some(rate),
+                        output_cost_per_token: Some(rate),
+                        cache_read_input_token_cost: Some(rate),
+                        cache_creation_input_token_cost: Some(rate),
+                        ..Default::default()
+                    },
+                )])),
+                HashMap::new(),
+                HashMap::new(),
+            );
+            for (input, output, cache_read, cache_write, reasoning) in [
+                (100, -200, 0, 0, 0),
+                (-200, 100, 0, 0, 0),
+                (-200, 0, 100, 0, 0),
+                (-200, 0, 0, 100, 0),
+                (-200, 0, 0, 0, 100),
+            ] {
+                let mut msg = parsed_message("custom-model");
+                msg.input = input;
+                msg.output = output;
+                msg.cache_read = cache_read;
+                msg.cache_write = cache_write;
+                msg.reasoning = reasoning;
+                msg.cost_source = CostSource::ProviderReported;
+                for reported_cost in [0.0, 99.0] {
+                    msg.cost = reported_cost;
+                    assert!((compute_msg_cost(&msg, Some(&pricing)) - rate * 100.0).abs() < 1e-12);
+                }
+            }
+            // No positive bucket means aggregate spend cannot be repriced,
+            // even when corrupt negative counters are present.
+            let mut msg = parsed_message("custom-model");
+            msg.input = -100;
+            msg.output = 0;
+            msg.cache_read = 0;
+            msg.cost = 99.0;
+            msg.cost_source = CostSource::ProviderReported;
+            assert_eq!(compute_msg_cost(&msg, Some(&pricing)), 99.0);
+        }
+    }
+
+    #[test]
+    fn wiki_keeps_reported_cost_when_custom_pricing_is_incomplete() {
+        let pricing = PricingService::new_with_custom(
+            tokscale_core::pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "partial-model".into(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000002),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut msg = parsed_message("partial-model");
+        msg.input = 1_000_000;
+        msg.output = 1_000_000;
+        msg.cache_read = 0;
+        msg.cost = 10.0;
+        msg.cost_source = CostSource::ProviderReported;
+        assert_eq!(compute_msg_cost(&msg, Some(&pricing)), 10.0);
+        let home = tempfile::TempDir::new().unwrap();
+        let db = WikiDb::open(&home.path().join("wiki.db")).unwrap();
+        record_new_sessions(&db, &[msg.clone()], Some(&pricing)).unwrap();
+        assert_eq!(
+            db.get_entry(&msg.session_id).unwrap().unwrap().total_cost,
+            10.0
+        );
+    }
+
+    #[test]
+    fn wiki_does_not_price_conflicted_model_attribution() {
+        let home = tempfile::TempDir::new().unwrap();
+        let logs = home.path().join(".grok/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("unified.jsonl"),
+            r#"{"ts":"2026-07-31T00:00:01Z","pid":19,"msg":"subagent spawn credentials","ctx":{"subagent_id":"child","effective_model":"grok-4.8"}}
+{"ts":"2026-07-31T00:00:02Z","pid":19,"sid":"child","msg":"model changed","ctx":{"model":"grok-code"}}
+{"ts":"2026-07-31T00:00:03Z","pid":19,"msg":"subagent failed","ctx":{"subagent_id":"child","effective_model":"grok-4.9"}}
+{"ts":"2026-07-31T00:00:04Z","pid":19,"sid":"child","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"cached_prompt_tokens":60,"completion_tokens":25,"reasoning_tokens":5}}"#,
+        ).unwrap();
+        let pricing = PricingService::new_with_custom(
+            tokscale_core::pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "grok-unknown".into(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0001),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        for scan in ["cold", "warm"] {
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(home.path().to_str().unwrap().into()),
+                use_env_roots: false,
+                clients: Some(vec!["grok".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(parsed.messages.len(), 1, "{scan}");
+            let msg = &parsed.messages[0];
+            assert_eq!(msg.model_id, "grok-unknown");
+            assert!(msg.input > 0 && msg.output > 0);
+            let db = WikiDb::open(&home.path().join(format!("wiki-{scan}.db"))).unwrap();
+            record_new_sessions(&db, &parsed.messages, Some(&pricing)).unwrap();
+            assert_eq!(
+                db.get_entry(&msg.session_id).unwrap().unwrap().total_cost,
+                0.0,
+                "{scan}"
+            );
+        }
     }
 
     #[test]

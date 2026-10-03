@@ -501,12 +501,17 @@ impl PricingService {
         openrouter_data: Option<HashMap<String, ModelPricing>>,
         models_dev_data: Option<HashMap<String, ModelPricing>>,
     ) -> Option<Self> {
-        if litellm_data.is_none() && openrouter_data.is_none() && models_dev_data.is_none() {
+        let custom = CustomPricing::load_from_default_path();
+        if litellm_data.is_none()
+            && openrouter_data.is_none()
+            && models_dev_data.is_none()
+            && custom.is_empty()
+        {
             return None;
         }
 
         Some(Self::new_with_custom_and_models_dev(
-            CustomPricing::load_from_default_path(),
+            custom,
             Self::filter_litellm_data(litellm_data.unwrap_or_default()),
             openrouter_data.unwrap_or_default(),
             models_dev_data.unwrap_or_default(),
@@ -610,6 +615,8 @@ impl PricingService {
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> f64 {
+        // Keep legacy partial-row estimates separate from the coverage-aware
+        // API used to replace an already reported cost.
         if let Some(result) = self.custom.lookup_with_key(model_id) {
             return compute_cost(
                 result.pricing,
@@ -624,6 +631,29 @@ impl PricingService {
 
         self.lookup
             .calculate_cost_with_provider(model_id, provider_id, usage)
+    }
+
+    /// An explicit custom rate, including zero, covering every populated token
+    /// bucket without market-price fallback. An incomplete row returns `None`.
+    /// Callers use this to override reported spend without treating every
+    /// available catalog price as permission to replace the source's cost.
+    pub fn calculate_custom_cost(&self, model_id: &str, usage: &TokenBreakdown) -> Option<f64> {
+        if self.custom.is_empty() {
+            return None;
+        }
+        let result = self.custom.lookup_with_key(model_id)?;
+        if !result.pricing.covers_usage(usage) {
+            return None;
+        }
+        Some(compute_cost(
+            result.pricing,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.cache_write_1h,
+            usage.reasoning,
+        ))
     }
 
     pub fn covers_usage_with_provider(
@@ -2466,8 +2496,39 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_from_cached_datasets_returns_none_when_both_sources_missing() {
+        let config = tempfile::TempDir::new().unwrap();
+        let mut env = crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"]);
+        env.set("TOKSCALE_CONFIG_DIR", config.path());
         assert!(PricingService::from_cached_datasets(None, None, None).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn custom_pricing_loads_offline_without_any_catalog_cache() {
+        let config = tempfile::TempDir::new().unwrap();
+        let mut env = crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"]);
+        env.set("TOKSCALE_CONFIG_DIR", config.path());
+        std::fs::write(config.path().join("custom-pricing.json"),
+            r#"{"models":{"custom-only":{"input_cost_per_million_tokens":2,"output_cost_per_million_tokens":4}}}"#,
+        ).unwrap();
+        let service =
+            PricingService::load_cached_any_age().expect("custom prices need no upstream cache");
+        assert_eq!(
+            service.calculate_cost("custom-only", 1_000_000, 0, 0, 0, 0),
+            2.0
+        );
+        assert_eq!(
+            service.calculate_custom_cost(
+                "not-custom",
+                &TokenBreakdown {
+                    input: 1000,
+                    ..Default::default()
+                }
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2509,6 +2570,113 @@ mod tests {
 
         assert_eq!(result.source, "Models.dev");
         assert_eq!(result.matched_key, "openai/gpt-fixture-model");
+    }
+
+    #[test]
+    fn custom_reported_cost_override_requires_coverage_of_each_used_bucket() {
+        let service = custom_service(
+            HashMap::from([(
+                "partial-model".into(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000002),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::from([("partial-model".into(), model_pricing(0.00001, 0.00003))]),
+            HashMap::new(),
+        );
+        for usage in [
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                input: 1_000_000,
+                cache_read: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                input: 1_000_000,
+                cache_write: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                input: 1_000_000,
+                reasoning: 1,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                service.calculate_custom_cost("partial-model", &usage),
+                None,
+                "{usage:?}"
+            );
+            // Legacy estimates still honor partial custom rows and do not fill
+            // omitted rates from a catalog behind the user's back.
+            assert_eq!(
+                service.calculate_cost_with_provider("partial-model", None, &usage),
+                2.0
+            );
+        }
+        assert_eq!(
+            service.calculate_custom_cost(
+                "partial-model",
+                &TokenBreakdown {
+                    input: 1_000_000,
+                    ..Default::default()
+                }
+            ),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn custom_reported_cost_override_covers_explicitly_free_models() {
+        let service = custom_service(
+            HashMap::from([("free-model".into(), model_pricing(0.0, 0.0))]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert_eq!(
+            service.calculate_custom_cost("free-model", &all_bucket_usage()),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn custom_reported_cost_override_prices_one_hour_cache_writes_like_estimates() {
+        let five_minute = ModelPricing {
+            cache_creation_input_token_cost: Some(3.75e-6),
+            ..Default::default()
+        };
+        let service = custom_service(
+            HashMap::from([
+                (
+                    "hourly-model".into(),
+                    ModelPricing {
+                        cache_creation_input_token_cost_above_1hr: Some(6e-6),
+                        ..five_minute.clone()
+                    },
+                ),
+                ("five-minute-model".into(), five_minute),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let usage = TokenBreakdown {
+            cache_write: 1_000_000,
+            cache_write_1h: 400_000,
+            ..Default::default()
+        };
+        // A published 1-hour rate prices only the 1-hour portion; without one
+        // the whole write keeps the 5-minute rate, exactly as estimates do.
+        for (model, expected) in [("hourly-model", 4.65), ("five-minute-model", 3.75)] {
+            let custom = service.calculate_custom_cost(model, &usage).unwrap();
+            let estimate = service.calculate_cost_with_provider(model, None, &usage);
+            assert!((custom - expected).abs() < 1e-9, "{model}: {custom}");
+            assert!((custom - estimate).abs() < 1e-12, "{model}: {estimate}");
+        }
     }
 
     #[test]
