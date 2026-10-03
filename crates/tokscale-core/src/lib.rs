@@ -23,6 +23,7 @@ pub mod recovery;
 pub mod scanner;
 pub mod sessionize;
 pub mod sessions;
+pub mod token_monitor;
 pub mod tui_signal;
 pub mod wiki;
 
@@ -5170,18 +5171,34 @@ fn parse_all_messages_streaming<S: MessageSink>(
         sessions::qwen::parse_qwen_file,
     );
 
-    // Parse Qoder and Qoder CN JSONL transcripts
-    parse_cached_lane_deduped_with_fingerprint(
-        &scan_result,
-        &mut source_cache,
-        pricing,
-        price_window,
-        &mut all_messages,
-        &machine_labeler,
-        ClientId::Qoder,
-        message_cache::SourceFingerprint::check_qoder_path_with_meta_samples_only,
-        sessions::qoder::parse_qoder_file,
-    );
+    // Qoder transcript copies can retain different stages of one request.
+    let qoder_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Qoder)
+        .par_iter()
+        .map(|path| {
+            let mut outcome = load_or_parse_source_with_fingerprint(
+                message_cache::CacheIdentity::for_client(ClientId::Qoder),
+                path,
+                &source_cache,
+                pricing,
+                price_window,
+                message_cache::SourceFingerprint::check_qoder_path_with_meta_samples_only,
+                sessions::qoder::parse_qoder_file_measured,
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
+        })
+        .collect();
+    let mut qoder_copies = Vec::new();
+    for outcome in qoder_outcomes {
+        qoder_copies.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    let mut qoder_messages = sessions::qoder::reconcile_request_copies(qoder_copies);
+    refresh_and_price_sieved(&mut qoder_messages, pricing, price_window);
+    all_messages.extend(qoder_messages);
 
     let roocode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::RooCode)
@@ -5680,6 +5697,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         workbuddy_fallback_messages,
     ));
 
+    token_monitor::extend_requested(home_dir, clients, use_env_roots, pricing, &mut all_messages);
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
             let mut outcome = load_or_parse_sqlite_source(
@@ -9011,13 +9029,11 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let qoder_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Qoder)
         .par_iter()
-        .flat_map(|path| sessions::qoder::parse_qoder_file(path))
+        .flat_map(|path| sessions::qoder::parse_qoder_file_measured(path))
         .collect();
-    let mut qoder_seen: HashSet<String> = HashSet::new();
-    let qoder_msgs: Vec<ParsedMessage> = qoder_msgs_raw
-        .into_iter()
-        .filter(|message| should_keep_deduped_message(&mut qoder_seen, message))
-        .map(|message| unified_to_parsed(&message))
+    let qoder_msgs: Vec<ParsedMessage> = sessions::qoder::reconcile_request_copies(qoder_msgs_raw)
+        .iter()
+        .map(unified_to_parsed)
         .collect();
     let qoder_count = summed_parsed_message_count(&qoder_msgs);
     counts.set(ClientId::Qoder, qoder_count);
@@ -9382,6 +9398,11 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Jcode, jcode_count);
     messages.extend(jcode_msgs);
 
+    messages.extend(
+        token_monitor::requested_messages(&home_dir, &clients, options.use_env_roots)
+            .iter()
+            .map(unified_to_parsed),
+    );
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
             let synthetic_msgs: Vec<ParsedMessage> =
@@ -9878,6 +9899,7 @@ fn filter_parsed_messages(
 
 pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
     UnifiedMessage {
+        qoder_prompt_tokens: None,
         client: msg.client.clone(),
         model_id: msg.model_id.clone(),
         provider_id: msg.provider_id.clone(),

@@ -131,7 +131,7 @@ fn canonicalize_qoder_model_and_provider(
     (canonical_model, provider_id)
 }
 
-fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
+fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool, Option<i64>)> {
     let obj = usage.as_object()?;
 
     // Check Gemini/Qwen-style usageMetadata fields first if present
@@ -183,6 +183,7 @@ fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
                 reasoning,
             },
             cache_read > 0,
+            Some(prompt),
         ));
     }
 
@@ -264,6 +265,7 @@ fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
             reasoning,
         },
         reports_cache_split,
+        None,
     ))
 }
 
@@ -381,6 +383,7 @@ struct AssembledAssistantTurn {
     agent: Option<String>,
     authoritative_tokens: Option<TokenBreakdown>,
     reports_cache_split: bool,
+    inclusive_prompt_tokens: Option<i64>,
     input_context_chars: usize,
     output_chars: usize,
     reasoning_chars: usize,
@@ -388,7 +391,13 @@ struct AssembledAssistantTurn {
 }
 
 impl AssembledAssistantTurn {
-    fn merge_authoritative(&mut self, incoming: TokenBreakdown, incoming_split: bool) {
+    fn merge_authoritative(
+        &mut self,
+        incoming: TokenBreakdown,
+        incoming_split: bool,
+        prompt: Option<i64>,
+    ) {
+        self.inclusive_prompt_tokens = self.inclusive_prompt_tokens.max(prompt);
         if let Some(existing) = &mut self.authoritative_tokens {
             match (incoming_split, self.reports_cache_split) {
                 (true, false) => {
@@ -437,6 +446,14 @@ impl AssembledAssistantTurn {
         }
         tokens.cache_write_1h = tokens.cache_write_1h.min(tokens.cache_write);
 
+        if let Some(prompt) = self.inclusive_prompt_tokens {
+            tokens.input = if tokens.cache_read > prompt {
+                prompt
+            } else {
+                prompt - tokens.cache_read
+            };
+        }
+
         let mut msg = UnifiedMessage::new_with_dedup(
             CLIENT_ID,
             self.canonical_model,
@@ -447,6 +464,7 @@ impl AssembledAssistantTurn {
             0.0,
             Some(self.dedup_key),
         );
+        msg.qoder_prompt_tokens = self.inclusive_prompt_tokens;
         msg.preserve_pricing_model(&self.raw_model);
         msg.cost_source = CostSource::Estimated;
         msg.is_turn_start = self.is_turn_start;
@@ -499,8 +517,91 @@ fn workspace_key_from_qoder_path(path: &Path) -> Option<String> {
     workspace_key_from_path(path).filter(|k| k != "subagents" && k != "projects")
 }
 
+/// Reconcile streaming snapshots before collapsing request copies. Keep the
+/// first source identity while retaining each complete reported token bucket.
+pub(crate) fn reconcile_request_copies(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
+    let mut merged: Vec<UnifiedMessage> = Vec::new();
+    let mut indices = std::collections::HashMap::new();
+    for message in messages {
+        if let Some(key) = message.dedup_key.as_ref().filter(|key| !key.is_empty()) {
+            if let Some(&index) = indices.get(key) {
+                let existing: &mut UnifiedMessage = &mut merged[index];
+                let prompt = if existing.qoder_prompt_tokens.is_some()
+                    || message.qoder_prompt_tokens.is_some()
+                {
+                    Some(
+                        existing
+                            .qoder_prompt_tokens
+                            .unwrap_or_else(|| {
+                                existing
+                                    .tokens
+                                    .input
+                                    .saturating_add(existing.tokens.cache_read)
+                            })
+                            .max(message.qoder_prompt_tokens.unwrap_or_else(|| {
+                                message
+                                    .tokens
+                                    .input
+                                    .saturating_add(message.tokens.cache_read)
+                            })),
+                    )
+                } else {
+                    None
+                };
+                existing.tokens.input = existing.tokens.input.max(message.tokens.input);
+                existing.tokens.output = existing.tokens.output.max(message.tokens.output);
+                existing.tokens.cache_read =
+                    existing.tokens.cache_read.max(message.tokens.cache_read);
+                existing.tokens.cache_write =
+                    existing.tokens.cache_write.max(message.tokens.cache_write);
+                existing.tokens.cache_write_1h = existing
+                    .tokens
+                    .cache_write_1h
+                    .max(message.tokens.cache_write_1h);
+                existing.tokens.reasoning = existing.tokens.reasoning.max(message.tokens.reasoning);
+                existing.qoder_prompt_tokens = prompt;
+                if let Some(prompt) = prompt {
+                    existing.tokens.input = if existing.tokens.cache_read <= prompt {
+                        prompt - existing.tokens.cache_read
+                    } else {
+                        prompt
+                    };
+                }
+                existing.duration_ms = existing.duration_ms.max(message.duration_ms);
+                existing.is_turn_start |= message.is_turn_start;
+                continue;
+            }
+            indices.insert(key.clone(), merged.len());
+        }
+        merged.push(message);
+    }
+    merged
+}
+
 /// Parse a Qoder or Qoder CN `.jsonl` transcript file into [`UnifiedMessage`] records.
 pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
+    parse_qoder_source(path, false, |sink| for_each_json_line(path, sink))
+}
+
+/// Token Monitor counts reported tokens only; managed-model text estimates
+/// must not enter the same accounting plane as measured usage.
+pub fn parse_qoder_file_measured(path: &Path) -> Vec<UnifiedMessage> {
+    parse_qoder_measured_source(path, |sink| for_each_json_line(path, sink))
+}
+
+/// Parse reported usage with caller-supplied source traversal.
+pub(crate) fn parse_qoder_measured_source(
+    path: &Path,
+    visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
+) -> Vec<UnifiedMessage> {
+    parse_qoder_source(path, true, visit)
+}
+
+fn parse_qoder_source(
+    path: &Path,
+    measured_only: bool,
+    visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
+) -> Vec<UnifiedMessage> {
     if should_skip_qoder_file(path) {
         return Vec::new();
     }
@@ -529,7 +630,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut turn_index_by_key: HashMap<String, usize> = HashMap::new();
     let mut anonymous_turn_counter: usize = 0;
 
-    for_each_json_line(path, &mut |_line_idx, trimmed| {
+    visit(&mut |_line_idx, trimmed| {
         let mut bytes = trimmed.as_bytes().to_vec();
         let Ok(value) = simd_json::from_slice::<Value>(&mut bytes) else {
             return;
@@ -642,7 +743,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                 let Some(data) = value.get("data") else {
                     return;
                 };
-                let Some((breakdown, reports_split)) = extract_usage_breakdown(data) else {
+                let Some((breakdown, reports_split, prompt)) = extract_usage_breakdown(data) else {
                     return;
                 };
                 let raw_model_candidate = data
@@ -696,7 +797,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                     .unwrap_or(fallback_timestamp);
 
                 if let Some(&existing_idx) = turn_index_by_key.get(&turn_key) {
-                    turns[existing_idx].merge_authoritative(breakdown, reports_split);
+                    turns[existing_idx].merge_authoritative(breakdown, reports_split, prompt);
                 } else {
                     let idx = turns.len();
                     turn_index_by_key.insert(turn_key.clone(), idx);
@@ -715,6 +816,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                         agent: None,
                         authoritative_tokens: Some(breakdown),
                         reports_cache_split: reports_split,
+                        inclusive_prompt_tokens: prompt,
                         input_context_chars: 0,
                         output_chars: 0,
                         reasoning_chars: 0,
@@ -849,8 +951,8 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
 
                 if let Some(&existing_idx) = turn_index_by_key.get(&turn_key) {
                     let turn = &mut turns[existing_idx];
-                    if let Some((breakdown, reports_split)) = usage_breakdown {
-                        turn.merge_authoritative(breakdown, reports_split);
+                    if let Some((breakdown, reports_split, prompt)) = usage_breakdown {
+                        turn.merge_authoritative(breakdown, reports_split, prompt);
                     }
                     turn.output_chars = turn.output_chars.saturating_add(out_chars);
                     turn.reasoning_chars = turn.reasoning_chars.saturating_add(reas_chars);
@@ -901,10 +1003,11 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                 let input_snapshot = context_chars;
                 context_chars = context_chars.saturating_add(out_chars.saturating_add(reas_chars));
 
-                let (authoritative_tokens, reports_cache_split) = match usage_breakdown {
-                    Some((b, s)) => (Some(b), s),
-                    None => (None, false),
-                };
+                let (authoritative_tokens, reports_cache_split, inclusive_prompt_tokens) =
+                    match usage_breakdown {
+                        Some((b, s, p)) => (Some(b), s, p),
+                        None => (None, false, None),
+                    };
 
                 let idx = turns.len();
                 turn_index_by_key.insert(turn_key.clone(), idx);
@@ -923,6 +1026,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                     agent: sidechain_agent_cache.clone(),
                     authoritative_tokens,
                     reports_cache_split,
+                    inclusive_prompt_tokens,
                     input_context_chars: input_snapshot,
                     output_chars: out_chars,
                     reasoning_chars: reas_chars,
@@ -938,7 +1042,8 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
 
     turns
         .into_iter()
-        .filter_map(AssembledAssistantTurn::into_unified_message)
+        .filter(|turn| !measured_only || turn.authoritative_tokens.is_some())
+        .filter_map(|turn| turn.into_unified_message())
         .collect()
 }
 

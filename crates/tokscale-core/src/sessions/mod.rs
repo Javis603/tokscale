@@ -150,6 +150,10 @@ pub struct UnifiedMessage {
     pub timestamp: i64,
     pub date: SharedStr,
     pub tokens: TokenBreakdown,
+    /// Qoder Gemini prompt before its cache split. Kept in source caches so
+    /// transcript copies reconcile one inclusive prompt envelope.
+    #[serde(skip)]
+    pub qoder_prompt_tokens: Option<i64>,
     pub cost: f64,
     #[serde(default)]
     pub cost_source: CostSource,
@@ -541,6 +545,7 @@ impl UnifiedMessage {
             timestamp,
             date: SharedStr::from(date),
             tokens,
+            qoder_prompt_tokens: None,
             cost,
             cost_source: CostSource::Unknown,
             service_tier: None,
