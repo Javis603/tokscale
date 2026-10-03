@@ -2296,7 +2296,7 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Bb => 3,
         // v1->v2: extract workspace key from project ancestors avoiding
         // subagents and canonicalize BYOK/managed provider metadata.
-        ClientId::Qoder => crate::sessions::qoder::QODER_PARSER_BASE_VERSION,
+        ClientId::Qoder => 1001 + crate::sessions::qoder::QODER_PARSER_BASE_VERSION,
         // Shared-family members are versioned by `SHARED_PARSER_FAMILIES`
         // through the roster lookup at the top of this function. Listing
         // them here keeps the match exhaustive at compile time; reaching
@@ -2541,6 +2541,8 @@ struct LegacyUnifiedMessageV7 {
 impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
     fn from(message: LegacyUnifiedMessageV7) -> Self {
         Self {
+            qoder_prompt_tokens: None,
+            qoder_inclusive_output_tokens: None,
             client: message.client.into(),
             model_id: message.model_id.into(),
             provider_id: message.provider_id.into(),
@@ -2634,6 +2636,8 @@ struct LegacyUnifiedMessageV8 {
 impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
     fn from(message: LegacyUnifiedMessageV8) -> Self {
         Self {
+            qoder_prompt_tokens: None,
+            qoder_inclusive_output_tokens: None,
             client: message.client.into(),
             model_id: message.model_id.into(),
             provider_id: message.provider_id.into(),
@@ -2725,6 +2729,8 @@ struct LegacyUnifiedMessageV9 {
 impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
     fn from(message: LegacyUnifiedMessageV9) -> Self {
         Self {
+            qoder_prompt_tokens: None,
+            qoder_inclusive_output_tokens: None,
             client: message.client.into(),
             model_id: message.model_id.into(),
             provider_id: message.provider_id.into(),
@@ -2887,6 +2893,8 @@ struct LegacyUnifiedMessageV10 {
 impl From<LegacyUnifiedMessageV10> for UnifiedMessage {
     fn from(message: LegacyUnifiedMessageV10) -> Self {
         Self {
+            qoder_prompt_tokens: None,
+            qoder_inclusive_output_tokens: None,
             client: message.client.into(),
             model_id: message.model_id.into(),
             provider_id: message.provider_id.into(),
@@ -4306,6 +4314,33 @@ fn read_shard_with_limit_unchecked(
         return ShardReadStatus::Stale;
     }
 
+    if identity.namespace == ClientId::Qoder.as_str() {
+        if envelope.format_version != CACHE_FORMAT_VERSION {
+            return ShardReadStatus::Stale;
+        }
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<(CachedSourceEntry, Vec<(Option<i64>, Option<i64>)>)>>(
+                &envelope.payload,
+            ) {
+            Ok(entries) => {
+                let mut restored = Vec::with_capacity(entries.len());
+                for (mut entry, prompts) in entries {
+                    if entry.messages.len() != prompts.len() {
+                        return ShardReadStatus::Invalid("Qoder prompt length mismatch".into());
+                    }
+                    for (message, (prompt, output)) in entry.messages.iter_mut().zip(prompts) {
+                        message.qoder_prompt_tokens = prompt;
+                        message.qoder_inclusive_output_tokens = output;
+                    }
+                    restored.push(entry);
+                }
+                ShardReadStatus::Loaded(restored)
+            }
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
     if identity.namespace == ClientId::Copilot.as_str() {
         if envelope.format_version != COPILOT_CACHE_FORMAT_VERSION {
             return ShardReadStatus::Stale;
@@ -4689,7 +4724,27 @@ fn write_shard_with_limit(
     let is_micode = identity.namespace == ClientId::MiMoCode.as_str();
     let is_copilot = identity.namespace == ClientId::Copilot.as_str();
     let is_claude = identity.namespace == ClientId::Claude.as_str();
-    let payload = if is_copilot {
+    let payload = if identity.namespace == ClientId::Qoder.as_str() {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let prompts: Vec<_> = entry
+                    .messages
+                    .iter()
+                    .map(|message| {
+                        (
+                            message.qoder_prompt_tokens,
+                            message.qoder_inclusive_output_tokens,
+                        )
+                    })
+                    .collect();
+                (entry, prompts)
+            })
+            .collect();
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(&entries)
+    } else if is_copilot {
         let entries: Vec<_> = entries
             .iter()
             .map(|entry| {
@@ -6558,6 +6613,9 @@ mod tests {
             None,
         );
         let before = bincode::options().serialize(&message).unwrap();
+        message.qoder_prompt_tokens = Some(100);
+        message.qoder_inclusive_output_tokens = Some(30);
+        assert_eq!(bincode::options().serialize(&message).unwrap(), before);
         message.copilot_context = Some(CopilotContextProvenance {
             model: ContextOrigin::Missing,
             session: ContextOrigin::Trace,
@@ -8530,7 +8588,7 @@ mod tests {
         // from the running version: this is the row that release left on disk.
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
-            parser_version: 3,
+            parser_version: 1005,
         };
         let fingerprint = SourceFingerprint::from_path(&source).unwrap();
         let stale_entry = CachedSourceEntry::new(
@@ -9022,12 +9080,12 @@ mod tests {
 
     #[test]
     fn test_qoder_parser_version() {
-        assert_eq!(parser_version(ClientId::Qoder), 4);
+        assert_eq!(parser_version(ClientId::Qoder), 1006);
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_qoder_v3_shard_invalidates_and_reparses_to_v4() {
+    fn test_qoder_v1005_shard_invalidates_and_reparses_to_v1006() {
         let cache_home = TempDir::new().unwrap();
         let source_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(cache_home.path());
@@ -9051,10 +9109,10 @@ mod tests {
         .unwrap();
 
         let current_identity = CacheIdentity::for_client(ClientId::Qoder);
-        assert_eq!(current_identity.parser_version, 4);
+        assert_eq!(current_identity.parser_version, 1006);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
-            parser_version: 3,
+            parser_version: 1005,
         };
         let fingerprint = SourceFingerprint::from_path(&source).unwrap();
         let stale_message = UnifiedMessage::new(
@@ -9093,7 +9151,7 @@ mod tests {
         let initial_cache = SourceMessageCache::load();
         assert!(
             initial_cache.get(current_identity, &source).is_none(),
-            "stale v3 entry must not match v4 lookup identity"
+            "stale v1005 entry must not match v1006 lookup identity"
         );
 
         let messages = crate::parse_all_messages_with_pricing_with_env_strategy(
@@ -9112,8 +9170,8 @@ mod tests {
         let cache = SourceMessageCache::load();
         let rebuilt = cache
             .get(current_identity, &source)
-            .expect("the v4 parse must replace the stale v3 row");
-        assert_eq!(rebuilt.parser_version, 4);
+            .expect("the v1006 parse must replace the stale v1005 row");
+        assert_eq!(rebuilt.parser_version, 1006);
         assert_eq!(rebuilt.messages.len(), 1);
         assert_eq!(rebuilt.messages[0].model_id, "qmodel_preview");
     }
@@ -14201,5 +14259,60 @@ mod tests {
         retry.insert(test_entry(identity, source.path(), "second-process-retry"));
         retry.save_if_dirty();
         assert_eq!(std::fs::read(shard).unwrap(), original);
+    }
+    #[test]
+    fn qoder_inclusive_output_survives_source_cache_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("session.jsonl");
+        std::fs::write(&source, "{}\n").unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Qoder);
+        let partial = UnifiedMessage::new_with_dedup(
+            "qoder",
+            "model",
+            "provider",
+            "session",
+            0,
+            crate::TokenBreakdown {
+                input: 100,
+                output: 30,
+                ..Default::default()
+            },
+            0.0,
+            Some("qoder:msg:request".into()),
+        );
+        let mut complete = partial.clone();
+        complete.tokens.output = 20;
+        complete.tokens.reasoning = 10;
+        complete.qoder_inclusive_output_tokens = Some(30);
+        let entry = CachedSourceEntry::new(
+            identity,
+            &source,
+            SourceFingerprint::from_path(&source).unwrap(),
+            vec![partial, complete],
+            Vec::new(),
+            None,
+        );
+        let shard = dir.path().join("shard.bin");
+        write_shard_with_limit(&shard, identity, &[entry], MAX_CACHE_SHARD_BYTES).unwrap();
+        let ShardReadStatus::Loaded(entries) =
+            read_shard_with_limit(&shard, identity, MAX_CACHE_SHARD_BYTES)
+        else {
+            panic!("Qoder source cache must load");
+        };
+        assert_eq!(
+            entries[0].messages[1].qoder_inclusive_output_tokens,
+            Some(30)
+        );
+        let merged = crate::sessions::qoder::reconcile_request_copies(
+            entries
+                .into_iter()
+                .flat_map(|entry| entry.messages)
+                .collect(),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            (merged[0].tokens.output, merged[0].tokens.reasoning),
+            (20, 10)
+        );
     }
 }
