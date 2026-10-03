@@ -172,7 +172,7 @@ fn invalid_new_selectors_and_rates_are_visible_without_poisoning_good_rows() {
 }
 
 #[test]
-fn gateway_billing_does_not_change_fast_tier_or_borrow_another_scope() {
+fn gateway_custom_rates_are_final_and_do_not_borrow_another_scope() {
     let svc = service(
         json!({"provider_overrides":[rule("private-gateway","gpt-5.4-fast",2.),rule("openai","gpt-5.4-fast",99.)]}),
     );
@@ -187,8 +187,9 @@ fn gateway_billing_does_not_change_fast_tier_or_borrow_another_scope() {
     assert_eq!(svc.estimate_context(&context, &usage()).cost, 2.);
     context.service_tier = Some("priority");
     let estimate = svc.estimate_context(&context, &usage());
-    assert_eq!(estimate.cost, 4.);
-    assert_eq!(estimate.effective_multiplier, 2.);
+    // Token Monitor retains final custom prices without a Fast premium.
+    assert_eq!(estimate.cost, 2.);
+    assert_eq!(estimate.effective_multiplier, 1.);
     assert_eq!(
         estimate.selected.unwrap().matched_provider_id.as_deref(),
         Some("private-gateway")
@@ -292,18 +293,18 @@ fn scoped_free_and_authoritative_zero_have_distinct_success_states() {
     let zed = UnifiedMessage::new("zed", "atlas", "zed.dev", "s", 1, usage(), 0.)
         .with_billing(Some("zed.dev"), BillingIdentityOrigin::KnownHostedChannel);
     let explain = svc.explain_message(&zed);
-    assert_eq!(explain.effective_multiplier, 1.1);
-    assert_eq!(explain.final_estimate, 11.);
+    assert_eq!(explain.effective_multiplier, 1.0);
+    assert_eq!(explain.final_estimate, 10.);
 }
 
 #[test]
-fn zed_hosted_multiplier_uses_attribution_not_custom_billing_selector() {
+fn zed_custom_prices_remain_final_for_each_billing_scope() {
     let svc = service(
         json!({"models":{"atlas":{"input_cost_per_million_tokens":2.}},"provider_overrides":[rule("private","atlas",3.),rule("zed.dev","atlas",10.)]}),
     );
     for (attribution, billing, expected_rate, multiplier) in [
-        ("zed.dev", Some("private"), 3., 1.1),
-        ("zed.dev", None, 2., 1.1),
+        ("zed.dev", Some("private"), 3., 1.),
+        ("zed.dev", None, 2., 1.),
         ("openai", Some("zed.dev"), 10., 1.),
     ] {
         let message = UnifiedMessage::new("zed", "atlas", attribution, "s", 1, usage(), 0.)
