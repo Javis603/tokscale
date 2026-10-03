@@ -7,6 +7,7 @@ mod device;
 mod hindsight;
 mod paths;
 mod process_liveness;
+mod token_monitor;
 mod trae;
 mod tui;
 mod warp;
@@ -621,7 +622,7 @@ enum HindsightSubcommand {
 fn main() -> Result<()> {
     use std::io::IsTerminal;
 
-    let cli = Cli::parse();
+    let cli = token_monitor::parse_cli(std::env::args_os());
     // Install user-configured model aliases once, before any report/graph/TUI
     // path runs, so model-name variants fold consistently across every command.
     // Honors the global `--home` override exactly like scanner settings; an
@@ -1450,7 +1451,11 @@ pub struct DateRangeFlags {
 /// so the caller can scan all clients.
 fn build_client_filter(flags: ClientFlags, home_dir: &Option<String>) -> Option<Vec<String>> {
     let defaults = tui::settings::load_default_clients_for_home(home_dir);
-    build_client_filter_with_defaults(flags, &defaults)
+    let canonical_was_empty = flags.clients.is_empty();
+    token_monitor::merge_client_filter(
+        build_client_filter_with_defaults(flags, &defaults),
+        canonical_was_empty,
+    )
 }
 
 /// Pure variant of [`build_client_filter`] for unit-testable resolution.
