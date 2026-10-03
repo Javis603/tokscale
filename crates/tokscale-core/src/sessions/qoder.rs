@@ -45,7 +45,7 @@ use std::path::Path;
 /// - Version 4: Treats `qoder/` and `qoder-cn/` model prefixes as client
 ///   namespaces so BYOK rows retain their vendor attribution, and stops
 ///   attributing orphan transcripts to the `projects` layout directory.
-pub const QODER_PARSER_BASE_VERSION: u32 = 4;
+pub const QODER_PARSER_BASE_VERSION: u32 = 6;
 
 const CLIENT_ID: &str = "qoder";
 const DEFAULT_PROVIDER: &str = "qoder";
@@ -131,7 +131,9 @@ fn canonicalize_qoder_model_and_provider(
     (canonical_model, provider_id)
 }
 
-fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
+fn extract_usage_breakdown(
+    usage: &Value,
+) -> Option<(TokenBreakdown, bool, Option<i64>, Option<i64>)> {
     let obj = usage.as_object()?;
 
     // Check Gemini/Qwen-style usageMetadata fields first if present
@@ -183,6 +185,8 @@ fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
                 reasoning,
             },
             cache_read > 0,
+            Some(prompt),
+            thoughts_in_candidates.then_some(candidates),
         ));
     }
 
@@ -264,6 +268,8 @@ fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
             reasoning,
         },
         reports_cache_split,
+        None,
+        None,
     ))
 }
 
@@ -381,6 +387,8 @@ struct AssembledAssistantTurn {
     agent: Option<String>,
     authoritative_tokens: Option<TokenBreakdown>,
     reports_cache_split: bool,
+    inclusive_prompt_tokens: Option<i64>,
+    inclusive_output_tokens: Option<i64>,
     input_context_chars: usize,
     output_chars: usize,
     reasoning_chars: usize,
@@ -388,7 +396,30 @@ struct AssembledAssistantTurn {
 }
 
 impl AssembledAssistantTurn {
-    fn merge_authoritative(&mut self, incoming: TokenBreakdown, incoming_split: bool) {
+    fn upgrade_auto_model(&mut self, raw: &str, canonical: String, provider: String) {
+        if self.canonical_model.eq_ignore_ascii_case("auto")
+            && !canonical.eq_ignore_ascii_case("auto")
+        {
+            self.raw_model = raw.to_string();
+            self.canonical_model = canonical;
+            self.provider_id = provider;
+        }
+    }
+
+    fn merge_authoritative(
+        &mut self,
+        incoming: TokenBreakdown,
+        incoming_split: bool,
+        prompt: Option<i64>,
+        output: Option<i64>,
+    ) {
+        self.inclusive_output_tokens = merge_inclusive_output(
+            self.authoritative_tokens.as_ref(),
+            self.inclusive_output_tokens,
+            &incoming,
+            output,
+        );
+        self.inclusive_prompt_tokens = self.inclusive_prompt_tokens.max(prompt);
         if let Some(existing) = &mut self.authoritative_tokens {
             match (incoming_split, self.reports_cache_split) {
                 (true, false) => {
@@ -437,6 +468,18 @@ impl AssembledAssistantTurn {
         }
         tokens.cache_write_1h = tokens.cache_write_1h.min(tokens.cache_write);
 
+        if let Some(prompt) = self.inclusive_prompt_tokens {
+            tokens.input = if tokens.cache_read > prompt {
+                prompt
+            } else {
+                prompt - tokens.cache_read
+            };
+        }
+
+        if let Some(output) = self.inclusive_output_tokens {
+            tokens.output = output - tokens.reasoning;
+        }
+
         let mut msg = UnifiedMessage::new_with_dedup(
             CLIENT_ID,
             self.canonical_model,
@@ -447,6 +490,8 @@ impl AssembledAssistantTurn {
             0.0,
             Some(self.dedup_key),
         );
+        msg.qoder_prompt_tokens = self.inclusive_prompt_tokens;
+        msg.qoder_inclusive_output_tokens = self.inclusive_output_tokens;
         msg.preserve_pricing_model(&self.raw_model);
         msg.cost_source = CostSource::Estimated;
         msg.is_turn_start = self.is_turn_start;
@@ -499,8 +544,128 @@ fn workspace_key_from_qoder_path(path: &Path) -> Option<String> {
     workspace_key_from_path(path).filter(|k| k != "subagents" && k != "projects")
 }
 
+// Once a snapshot reports reasoning inside candidates, merge the inclusive
+// generated-token envelope before splitting it. A copy missing thoughts still
+// carries that envelope in its output bucket. Disjoint formats keep bucket maxima.
+fn merge_inclusive_output(
+    existing: Option<&TokenBreakdown>,
+    envelope: Option<i64>,
+    incoming: &TokenBreakdown,
+    incoming_envelope: Option<i64>,
+) -> Option<i64> {
+    if envelope.is_none() && incoming_envelope.is_none() {
+        return None;
+    }
+    let previous = envelope.unwrap_or_else(|| {
+        existing.map_or(0, |tokens| tokens.output.saturating_add(tokens.reasoning))
+    });
+    Some(previous.max(
+        incoming_envelope.unwrap_or_else(|| incoming.output.saturating_add(incoming.reasoning)),
+    ))
+}
+
+/// Reconcile streaming snapshots before collapsing request copies. Keep the
+/// first source identity while retaining each complete reported token bucket.
+pub(crate) fn reconcile_request_copies(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
+    let mut merged: Vec<UnifiedMessage> = Vec::new();
+    let mut indices = std::collections::HashMap::new();
+    for message in messages {
+        if let Some(key) = message.dedup_key.as_ref().filter(|key| !key.is_empty()) {
+            if let Some(&index) = indices.get(key) {
+                let existing: &mut UnifiedMessage = &mut merged[index];
+                if existing.model_id.eq_ignore_ascii_case("auto")
+                    && !message.model_id.eq_ignore_ascii_case("auto")
+                {
+                    existing.model_id = message.model_id.clone();
+                    existing.provider_id = message.provider_id.clone();
+                    existing.pricing_model_id = message.pricing_model_id.clone();
+                }
+                let output = merge_inclusive_output(
+                    Some(&existing.tokens),
+                    existing.qoder_inclusive_output_tokens,
+                    &message.tokens,
+                    message.qoder_inclusive_output_tokens,
+                );
+                let prompt = if existing.qoder_prompt_tokens.is_some()
+                    || message.qoder_prompt_tokens.is_some()
+                {
+                    Some(
+                        existing
+                            .qoder_prompt_tokens
+                            .unwrap_or_else(|| {
+                                existing
+                                    .tokens
+                                    .input
+                                    .saturating_add(existing.tokens.cache_read)
+                            })
+                            .max(message.qoder_prompt_tokens.unwrap_or_else(|| {
+                                message
+                                    .tokens
+                                    .input
+                                    .saturating_add(message.tokens.cache_read)
+                            })),
+                    )
+                } else {
+                    None
+                };
+                existing.tokens.input = existing.tokens.input.max(message.tokens.input);
+                existing.tokens.output = existing.tokens.output.max(message.tokens.output);
+                existing.tokens.cache_read =
+                    existing.tokens.cache_read.max(message.tokens.cache_read);
+                existing.tokens.cache_write =
+                    existing.tokens.cache_write.max(message.tokens.cache_write);
+                existing.tokens.cache_write_1h = existing
+                    .tokens
+                    .cache_write_1h
+                    .max(message.tokens.cache_write_1h);
+                existing.tokens.reasoning = existing.tokens.reasoning.max(message.tokens.reasoning);
+                existing.qoder_prompt_tokens = prompt;
+                existing.qoder_inclusive_output_tokens = output;
+                if let Some(output) = output {
+                    existing.tokens.output = output - existing.tokens.reasoning;
+                }
+                if let Some(prompt) = prompt {
+                    existing.tokens.input = if existing.tokens.cache_read <= prompt {
+                        prompt - existing.tokens.cache_read
+                    } else {
+                        prompt
+                    };
+                }
+                existing.duration_ms = existing.duration_ms.max(message.duration_ms);
+                existing.is_turn_start |= message.is_turn_start;
+                continue;
+            }
+            indices.insert(key.clone(), merged.len());
+        }
+        merged.push(message);
+    }
+    merged
+}
+
 /// Parse a Qoder or Qoder CN `.jsonl` transcript file into [`UnifiedMessage`] records.
 pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
+    parse_qoder_source(path, false, |sink| for_each_json_line(path, sink))
+}
+
+/// Token Monitor counts reported tokens only; managed-model text estimates
+/// must not enter the same accounting plane as measured usage.
+pub fn parse_qoder_file_measured(path: &Path) -> Vec<UnifiedMessage> {
+    parse_qoder_measured_source(path, |sink| for_each_json_line(path, sink))
+}
+
+/// Parse reported usage with caller-supplied source traversal.
+pub(crate) fn parse_qoder_measured_source(
+    path: &Path,
+    visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
+) -> Vec<UnifiedMessage> {
+    parse_qoder_source(path, true, visit)
+}
+
+fn parse_qoder_source(
+    path: &Path,
+    measured_only: bool,
+    visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
+) -> Vec<UnifiedMessage> {
     if should_skip_qoder_file(path) {
         return Vec::new();
     }
@@ -529,7 +694,7 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut turn_index_by_key: HashMap<String, usize> = HashMap::new();
     let mut anonymous_turn_counter: usize = 0;
 
-    for_each_json_line(path, &mut |_line_idx, trimmed| {
+    visit(&mut |_line_idx, trimmed| {
         let mut bytes = trimmed.as_bytes().to_vec();
         let Ok(value) = simd_json::from_slice::<Value>(&mut bytes) else {
             return;
@@ -642,7 +807,9 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                 let Some(data) = value.get("data") else {
                     return;
                 };
-                let Some((breakdown, reports_split)) = extract_usage_breakdown(data) else {
+                let Some((breakdown, reports_split, prompt, output)) =
+                    extract_usage_breakdown(data)
+                else {
                     return;
                 };
                 let raw_model_candidate = data
@@ -696,7 +863,13 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                     .unwrap_or(fallback_timestamp);
 
                 if let Some(&existing_idx) = turn_index_by_key.get(&turn_key) {
-                    turns[existing_idx].merge_authoritative(breakdown, reports_split);
+                    turns[existing_idx].upgrade_auto_model(raw_model, canonical_model, provider_id);
+                    turns[existing_idx].merge_authoritative(
+                        breakdown,
+                        reports_split,
+                        prompt,
+                        output,
+                    );
                 } else {
                     let idx = turns.len();
                     turn_index_by_key.insert(turn_key.clone(), idx);
@@ -715,6 +888,8 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                         agent: None,
                         authoritative_tokens: Some(breakdown),
                         reports_cache_split: reports_split,
+                        inclusive_prompt_tokens: prompt,
+                        inclusive_output_tokens: output,
                         input_context_chars: 0,
                         output_chars: 0,
                         reasoning_chars: 0,
@@ -849,8 +1024,9 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
 
                 if let Some(&existing_idx) = turn_index_by_key.get(&turn_key) {
                     let turn = &mut turns[existing_idx];
-                    if let Some((breakdown, reports_split)) = usage_breakdown {
-                        turn.merge_authoritative(breakdown, reports_split);
+                    turn.upgrade_auto_model(&raw_model, canonical_model, provider_id);
+                    if let Some((breakdown, reports_split, prompt, output)) = usage_breakdown {
+                        turn.merge_authoritative(breakdown, reports_split, prompt, output);
                     }
                     turn.output_chars = turn.output_chars.saturating_add(out_chars);
                     turn.reasoning_chars = turn.reasoning_chars.saturating_add(reas_chars);
@@ -901,9 +1077,14 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                 let input_snapshot = context_chars;
                 context_chars = context_chars.saturating_add(out_chars.saturating_add(reas_chars));
 
-                let (authoritative_tokens, reports_cache_split) = match usage_breakdown {
-                    Some((b, s)) => (Some(b), s),
-                    None => (None, false),
+                let (
+                    authoritative_tokens,
+                    reports_cache_split,
+                    inclusive_prompt_tokens,
+                    inclusive_output_tokens,
+                ) = match usage_breakdown {
+                    Some((b, s, p, o)) => (Some(b), s, p, o),
+                    None => (None, false, None, None),
                 };
 
                 let idx = turns.len();
@@ -923,6 +1104,8 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
                     agent: sidechain_agent_cache.clone(),
                     authoritative_tokens,
                     reports_cache_split,
+                    inclusive_prompt_tokens,
+                    inclusive_output_tokens,
                     input_context_chars: input_snapshot,
                     output_chars: out_chars,
                     reasoning_chars: reas_chars,
@@ -938,7 +1121,8 @@ pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
 
     turns
         .into_iter()
-        .filter_map(AssembledAssistantTurn::into_unified_message)
+        .filter(|turn| !measured_only || turn.authoritative_tokens.is_some())
+        .filter_map(|turn| turn.into_unified_message())
         .collect()
 }
 
@@ -1361,5 +1545,131 @@ mod tests {
         assert_eq!(msgs[0].pricing_model_id.as_deref(), None);
         assert_eq!(msgs[1].model_id.as_ref(), "dfmodel");
         assert_eq!(msgs[1].pricing_model_id.as_deref(), None);
+    }
+    #[test]
+    fn inclusive_reasoning_copies_split_after_assembly_and_reconciliation() {
+        use serde_json::json;
+        for cross_file in [false, true] {
+            for reverse in [false, true] {
+                for (total, incomplete_candidates, output) in
+                    [(130, 30, 20), (140, 30, 30), (130, 40, 30)]
+                {
+                    let dir = tempfile::tempdir().unwrap();
+                    let row = |complete: bool| {
+                        let mut usage = json!({"promptTokenCount":100,"candidatesTokenCount":30,"totalTokenCount":total});
+                        if complete {
+                            usage["thoughtsTokenCount"] = json!(10);
+                        } else if incomplete_candidates != 30 {
+                            usage["candidatesTokenCount"] = json!(incomplete_candidates);
+                            usage["totalTokenCount"] = json!(100 + incomplete_candidates);
+                        }
+                        json!({"type":"assistant","sessionId":"fixture","timestamp":"2026-11-12T10:00:02Z","message":{"id":"request","model":"gemini-2.5-pro","usage":usage}})
+                    };
+                    let mut rows = [row(false), row(true)];
+                    if reverse {
+                        rows.reverse();
+                    }
+                    let mut messages = Vec::new();
+                    if cross_file {
+                        for (i, row) in rows.iter().enumerate() {
+                            let path = dir.path().join(format!("{i}.jsonl"));
+                            std::fs::write(&path, format!("{row}\n")).unwrap();
+                            messages.extend(parse_qoder_file_measured(&path));
+                        }
+                    } else {
+                        let path = dir.path().join("session.jsonl");
+                        std::fs::write(
+                            &path,
+                            rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+                        )
+                        .unwrap();
+                        messages = parse_qoder_file_measured(&path);
+                    }
+                    let messages = reconcile_request_copies(messages);
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(
+                        (messages[0].tokens.output, messages[0].tokens.reasoning),
+                        (output, 10),
+                        "cross_file={cross_file} reverse={reverse} total={total}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn request_copies_upgrade_auto_model_without_changing_identity() {
+        for cross_file in [false, true] {
+            for reverse in [false, true] {
+                for initial_usage in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut first = serde_json::json!({"type":"assistant","sessionId":"stable-session","message":{"id":"same","model":"auto"}});
+                    if initial_usage {
+                        first["message"]["usage"] =
+                            serde_json::json!({"input_tokens":100,"output_tokens":2});
+                    }
+                    let complete = serde_json::json!({"type":"assistant","sessionId":"stable-session","message":{"id":"same","model":"openai/gpt-5","usage":{"input_tokens":100,"output_tokens":20}}});
+                    let mut rows = [first, complete];
+                    if reverse {
+                        rows.reverse();
+                    }
+                    let mut parsed = Vec::new();
+                    if cross_file {
+                        for (i, row) in rows.iter().enumerate() {
+                            let path = dir.path().join(format!("{i}.jsonl"));
+                            std::fs::write(&path, format!("{row}\n")).unwrap();
+                            parsed.extend(parse_qoder_file_measured(&path));
+                        }
+                    } else {
+                        let path = dir.path().join("s.jsonl");
+                        std::fs::write(
+                            &path,
+                            rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+                        )
+                        .unwrap();
+                        parsed = parse_qoder_file_measured(&path);
+                    }
+                    let identity = (parsed[0].session_id.clone(), parsed[0].dedup_key.clone());
+                    let messages = reconcile_request_copies(parsed);
+                    assert_eq!(messages.len(), 1);
+                    let message = &messages[0];
+                    assert_eq!(
+                        message.model_id, "gpt-5",
+                        "cross={cross_file} reverse={reverse} usage={initial_usage}"
+                    );
+                    assert_eq!(message.provider_id, "openai");
+                    assert_eq!(message.pricing_model_id.as_deref(), Some("openai/gpt-5"));
+                    assert_eq!(
+                        (message.session_id.clone(), message.dedup_key.clone()),
+                        identity
+                    );
+                    assert_eq!(message.tokens.total(), 120);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_copies_preserve_concrete_and_dynamic_model_choices() {
+        for model in ["gpt-5", "gfmodel"] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("s.jsonl");
+            let rows = [model, "claude-sonnet-4-6", "auto"].map(|m|serde_json::json!({"type":"assistant","sessionId":"s","message":{"id":"same","model":m,"usage":{"input_tokens":100,"output_tokens":20}}}));
+            std::fs::write(
+                &file,
+                rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+            )
+            .unwrap();
+            assert_eq!(parse_qoder_file_measured(&file)[0].model_id, model);
+            let copies = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(i, row)| {
+                    let file = dir.path().join(format!("{i}.jsonl"));
+                    std::fs::write(&file, format!("{row}\n")).unwrap();
+                    parse_qoder_file_measured(&file)
+                })
+                .collect();
+            assert_eq!(reconcile_request_copies(copies)[0].model_id, model);
+        }
     }
 }
