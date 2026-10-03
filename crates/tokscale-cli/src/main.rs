@@ -8,6 +8,7 @@ mod device;
 mod hindsight;
 mod paths;
 mod process_liveness;
+mod token_monitor;
 mod trae;
 mod tui;
 mod ui_glyphs;
@@ -694,7 +695,7 @@ fn validate_offline_command(command: Option<&Commands>) -> Result<()> {
 fn main() -> Result<()> {
     use std::io::IsTerminal;
 
-    let cli = Cli::parse();
+    let cli = token_monitor::parse_cli(std::env::args_os());
     if cli.offline {
         validate_offline_command(cli.command.as_ref())?;
         tokscale_core::network::go_offline();
@@ -1549,7 +1550,11 @@ pub struct DateRangeFlags {
 /// so the caller can scan all clients.
 fn build_client_filter(flags: ClientFlags, home_dir: &Option<String>) -> Option<Vec<String>> {
     let defaults = tui::settings::load_default_clients_for_home(home_dir);
-    build_client_filter_with_defaults(flags, &defaults)
+    let canonical_was_empty = flags.clients.is_empty();
+    token_monitor::merge_client_filter(
+        build_client_filter_with_defaults(flags, &defaults),
+        canonical_was_empty,
+    )
 }
 
 /// Pure variant of [`build_client_filter`] for unit-testable resolution.

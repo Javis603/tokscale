@@ -23,6 +23,7 @@ pub mod recovery;
 pub mod scanner;
 pub mod sessionize;
 pub mod sessions;
+pub mod token_monitor;
 pub mod tui_signal;
 pub mod wiki;
 
@@ -5277,6 +5278,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         workbuddy_fallback_messages,
     ));
 
+    token_monitor::extend_requested(home_dir, clients, pricing, &mut all_messages);
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
             let mut outcome = load_or_parse_sqlite_source(
@@ -8750,6 +8752,11 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Jcode, jcode_count);
     messages.extend(jcode_msgs);
 
+    messages.extend(
+        token_monitor::requested_messages(&home_dir, &clients)
+            .iter()
+            .map(unified_to_parsed),
+    );
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
             let synthetic_msgs: Vec<ParsedMessage> =
