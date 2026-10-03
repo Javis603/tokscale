@@ -962,6 +962,8 @@ mod tests {
         let timestamp = datetime.timestamp_millis();
 
         UnifiedMessage {
+            qoder_prompt_tokens: None,
+            qoder_inclusive_output_tokens: None,
             client: client.to_string().into(),
             model_id: model.to_string().into(),
             provider_id: "test-provider".to_string().into(),
@@ -1646,6 +1648,8 @@ mod tests {
         cost: f64,
     ) -> UnifiedMessage {
         UnifiedMessage {
+            qoder_prompt_tokens: None,
+            qoder_inclusive_output_tokens: None,
             client: client.to_string().into(),
             model_id: model.to_string().into(),
             provider_id: provider.to_string().into(),
