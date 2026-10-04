@@ -2633,6 +2633,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         ClientId::Mcode,
         sessions::mcode::parse_mcode_file,
     );
+    let token_monitor_counted = token_monitor::Counted::from_messages(&all_messages);
 
     parse_cached_lane(
         &scan_result,
@@ -3812,7 +3813,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
         workbuddy_fallback_messages,
     ));
 
-    token_monitor::extend_requested(home_dir, clients, pricing, &mut all_messages);
+    let scope = token_monitor::Scope {
+        home_dir,
+        use_env_roots,
+        counted: &token_monitor_counted,
+    };
+    token_monitor::extend_requested(clients, &scope, pricing, &mut all_messages);
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
             let outcome = load_or_parse_sqlite_source(
@@ -6499,6 +6505,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         .par_iter()
         .flat_map(|path| sessions::mcode::parse_mcode_file(path))
         .collect();
+    let token_monitor_counted = token_monitor::Counted::from_messages(&mcode_raw);
     let mut mcode_seen = HashSet::new();
     let mcode_msgs: Vec<ParsedMessage> = mcode_raw
         .into_iter()
@@ -6906,9 +6913,17 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     messages.extend(jcode_msgs);
 
     messages.extend(
-        token_monitor::requested_messages(&home_dir, &clients)
-            .iter()
-            .map(unified_to_parsed),
+        token_monitor::requested_messages(
+            &clients,
+            &token_monitor::Scope {
+                home_dir: &home_dir,
+                use_env_roots: options.use_env_roots,
+                counted: &token_monitor_counted,
+            },
+            &mut counts,
+        )
+        .iter()
+        .map(unified_to_parsed),
     );
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
