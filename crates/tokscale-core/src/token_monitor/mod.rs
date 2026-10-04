@@ -12,14 +12,22 @@
 //!   in place of `Cli::parse`, and `token_monitor::merge_client_filter` where
 //!   the client filter is built (see `tokscale-cli/src/token_monitor.rs`)
 //!
-//! A client here is requested only by name. It is never part of an unfiltered
-//! scan, so plain `tokscale` output is identical to upstream's.
+//! An owned client is requested only by name. It is never part of an
+//! unfiltered scan, so it never appears in plain `tokscale` output.
+//!
+//! A supplement adds a second source to an upstream client under that
+//! client's own id, for data upstream does not read yet; it is dropped once
+//! upstream reads that data itself. The CLI never strips its id, so the
+//! upstream lane runs as before, and the supplement runs wherever that lane
+//! does, filtered or not, so the id means the same data in every scan.
 
 mod js;
+mod mcode;
 mod proma;
 mod qodercn;
 
 use crate::sessions::UnifiedMessage;
+use crate::{ClientCounts, ClientId};
 
 /// A Token Monitor-owned client: its `--client` id and its parser.
 struct Client {
@@ -40,7 +48,20 @@ const CLIENTS: &[Client] = &[
     },
 ];
 
-/// Token Monitor-owned client ids.
+/// A source added to an upstream client: the upstream id it reports under and
+/// its parser, which also receives the scan's env-root strategy.
+struct Supplement {
+    id: &'static str,
+    parse: fn(&str, bool) -> Vec<UnifiedMessage>,
+}
+
+const SUPPLEMENTS: &[Supplement] = &[Supplement {
+    id: mcode::CLIENT_ID,
+    parse: mcode::parse,
+}];
+
+/// Token Monitor-owned client ids. Supplement ids are upstream ids, so they
+/// are not listed here.
 pub fn client_ids() -> impl Iterator<Item = &'static str> {
     CLIENTS.iter().map(|client| client.id)
 }
@@ -51,21 +72,53 @@ fn requested<'a>(clients: &'a [String]) -> impl Iterator<Item = &'static Client>
         .filter(move |owned| clients.iter().any(|client| client == owned.id))
 }
 
-/// Unpriced messages for every requested Token Monitor client.
-pub fn requested_messages(home_dir: &str, clients: &[String]) -> Vec<UnifiedMessage> {
+/// An empty filter scans every upstream client, so it runs every supplement.
+fn requested_supplements<'a>(
+    clients: &'a [String],
+) -> impl Iterator<Item = &'static Supplement> + 'a {
+    SUPPLEMENTS.iter().filter(move |supplement| {
+        clients.is_empty() || clients.iter().any(|client| client == supplement.id)
+    })
+}
+
+fn parse_requested(home_dir: &str, clients: &[String], use_env_roots: bool) -> Vec<UnifiedMessage> {
     requested(clients)
         .flat_map(|client| (client.parse)(home_dir))
+        .chain(
+            requested_supplements(clients)
+                .flat_map(|supplement| (supplement.parse)(home_dir, use_env_roots)),
+        )
         .collect()
 }
 
-/// Streaming-lane hook: parse, price and append the requested clients.
+/// Local-lane hook: unpriced messages for every requested Token Monitor client
+/// and supplement. Supplement messages are added to their upstream client's
+/// count.
+pub fn requested_messages(
+    home_dir: &str,
+    clients: &[String],
+    use_env_roots: bool,
+    counts: &mut ClientCounts,
+) -> Vec<UnifiedMessage> {
+    let messages = parse_requested(home_dir, clients, use_env_roots);
+    for message in &messages {
+        if let Some(client) = ClientId::from_str(&message.client) {
+            counts.add(client, message.message_count.max(0));
+        }
+    }
+    messages
+}
+
+/// Streaming-lane hook: parse, price and append the requested clients and
+/// supplements.
 pub(crate) fn extend_requested(
     home_dir: &str,
     clients: &[String],
+    use_env_roots: bool,
     pricing: Option<&crate::pricing::PricingService>,
     all_messages: &mut Vec<UnifiedMessage>,
 ) {
-    for mut message in requested_messages(home_dir, clients) {
+    for mut message in parse_requested(home_dir, clients, use_env_roots) {
         message.refresh_derived_fields();
         crate::apply_pricing_if_available(&mut message, pricing);
         all_messages.push(message);
@@ -85,5 +138,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["proma"]
         );
+    }
+
+    #[test]
+    fn supplements_are_requested_by_their_upstream_id_but_never_stripped() {
+        assert_eq!(
+            requested_supplements(&["mcode".to_string()])
+                .map(|supplement| supplement.id)
+                .collect::<Vec<_>>(),
+            vec!["mcode"]
+        );
+        assert_eq!(requested_supplements(&["claude".to_string()]).count(), 0);
+        assert_eq!(requested_supplements(&[]).count(), SUPPLEMENTS.len());
+        assert!(client_ids().all(|id| id != "mcode"));
+        assert!(SUPPLEMENTS
+            .iter()
+            .all(|supplement| ClientId::from_str(supplement.id).is_some()));
     }
 }

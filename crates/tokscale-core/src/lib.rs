@@ -3812,7 +3812,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         workbuddy_fallback_messages,
     ));
 
-    token_monitor::extend_requested(home_dir, clients, pricing, &mut all_messages);
+    token_monitor::extend_requested(home_dir, clients, use_env_roots, pricing, &mut all_messages);
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
             let outcome = load_or_parse_sqlite_source(
@@ -6906,7 +6906,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     messages.extend(jcode_msgs);
 
     messages.extend(
-        token_monitor::requested_messages(&home_dir, &clients)
+        token_monitor::requested_messages(&home_dir, &clients, options.use_env_roots, &mut counts)
             .iter()
             .map(unified_to_parsed),
     );
