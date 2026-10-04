@@ -17,13 +17,14 @@
 //! and usually leaves the model empty, so it is read only for Session metadata.
 //!
 //! A turn that upstream already counted from a headless capture is skipped
-//! here: the capture and the store carry the same Session and turn ids. The
-//! captures are the files the upstream lane found in this same scan.
+//! here: the capture and the store carry the same Session and turn ids. What
+//! upstream counted is taken from its lane's own output, recorded right after
+//! it parsed, never by reading the captures again.
 //!
 //! History files hold whole conversations, tool output included, and Token
-//! Monitor scans several times a minute, so the usage rows of each file (and
-//! the turns of each capture) are cached by length and mtime, per scanned
-//! home, and a file is reparsed only when it changes. A read that fails or
+//! Monitor scans several times a minute, so the usage rows of each file are
+//! cached by length and mtime, per scanned home, and a file is reparsed only
+//! when it changes. A read that fails or
 //! races a write is never cached; the last complete read is served instead.
 
 use super::{js, Scope};
@@ -36,7 +37,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub const CLIENT_ID: &str = "mcode";
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 const ENV_OVERRIDES: [&str; 2] = ["MINIMAX_DATA_DIR", "MAVIS_DATA_DIR"];
 /// The current default data directory and the one earlier releases used. A
@@ -111,19 +112,11 @@ struct CachedFile {
     rows: Vec<Row>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct CachedCapture {
-    fingerprint: Fingerprint,
-    turns: Vec<(String, String)>,
-}
-
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Cache {
     version: u32,
     /// Keyed by history file path.
     files: BTreeMap<String, CachedFile>,
-    /// Keyed by headless capture path.
-    captures: BTreeMap<String, CachedCapture>,
 }
 
 pub fn parse(scope: &Scope) -> Vec<UnifiedMessage> {
@@ -142,7 +135,12 @@ fn parse_with(scope: &Scope, cache_path: &Path) -> Vec<UnifiedMessage> {
         version: CACHE_VERSION,
         ..Cache::default()
     };
-    let captured = captured_turns(scope.scan.get(crate::ClientId::Mcode), &loaded, &mut next);
+    let captured: HashSet<(String, String)> = scope
+        .counted
+        .dedup_keys(CLIENT_ID)
+        .iter()
+        .filter_map(|key| headless_turn(key))
+        .collect();
     let mut seen_roots = HashSet::new();
     let mut seen_messages = HashSet::new();
     let mut messages = Vec::new();
@@ -177,55 +175,6 @@ fn parse_with(scope: &Scope, cache_path: &Path) -> Vec<UnifiedMessage> {
         save_cache(cache_path, &next);
     }
     messages
-}
-
-/// `(session id, turn id)` of every turn upstream counts from these headless
-/// captures, through the parser upstream uses.
-fn captured_turns(
-    paths: &[PathBuf],
-    loaded: &Cache,
-    next: &mut Cache,
-) -> HashSet<(String, String)> {
-    let mut turns = HashSet::new();
-    for path in paths {
-        let key = path.to_string_lossy().into_owned();
-        let previous = loaded.captures.get(&key);
-        let Some(before) = fingerprint(path) else {
-            continue;
-        };
-        // Upstream fingerprints a capture by reading it, and parses an
-        // unopenable one as empty, so in either lane it counts nothing from
-        // such a capture this scan. A cached turn set must not suppress the
-        // store's rows then, or the turn would be counted by neither; the
-        // entry is kept for when the file can be read again.
-        if std::fs::File::open(path).is_err() {
-            if let Some(entry) = previous {
-                next.captures.insert(key, entry.clone());
-            }
-            continue;
-        }
-        let entry = match previous.filter(|entry| entry.fingerprint == before) {
-            Some(entry) => entry.clone(),
-            None => {
-                let parsed = CachedCapture {
-                    fingerprint: before,
-                    turns: crate::sessions::mcode::parse_mcode_file(path)
-                        .into_iter()
-                        .filter_map(|message| headless_turn(message.dedup_key.as_deref()?))
-                        .collect(),
-                };
-                if fingerprint(path) != Some(before) {
-                    // Written while being read: use it now, reread next scan.
-                    turns.extend(parsed.turns);
-                    continue;
-                }
-                parsed
-            }
-        };
-        turns.extend(entry.turns.iter().cloned());
-        next.captures.insert(key, entry);
-    }
-    turns
 }
 
 /// Upstream keys a headless row
@@ -616,6 +565,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::paths::test_env::EnvGuard;
+    use crate::token_monitor::Counted;
     use serial_test::serial;
     use std::fs;
 
@@ -646,19 +596,32 @@ mod tests {
         dir
     }
 
-    fn scan(home: &Path, use_env_roots: bool) -> Vec<UnifiedMessage> {
-        let home_dir = home.to_str().unwrap();
+    /// What the upstream lane would count from the captures right now.
+    fn upstream_counted(home: &Path, use_env_roots: bool) -> Counted {
         let result = crate::scanner::scan_all_clients_with_env_strategy(
-            home_dir,
+            home.to_str().unwrap(),
             &[CLIENT_ID.to_string()],
             use_env_roots,
         );
+        let messages: Vec<UnifiedMessage> = result
+            .get(crate::ClientId::Mcode)
+            .iter()
+            .flat_map(|path| crate::sessions::mcode::parse_mcode_file(path))
+            .collect();
+        Counted::from_messages(&messages)
+    }
+
+    fn scan_with(home: &Path, use_env_roots: bool, counted: &Counted) -> Vec<UnifiedMessage> {
         let scope = Scope {
-            home_dir,
+            home_dir: home.to_str().unwrap(),
             use_env_roots,
-            scan: &result,
+            counted,
         };
         parse_with(&scope, &home.join("tm-cache/mcode.json"))
+    }
+
+    fn scan(home: &Path, use_env_roots: bool) -> Vec<UnifiedMessage> {
+        scan_with(home, use_env_roots, &upstream_counted(home, use_env_roots))
     }
 
     fn write_capture(home: &Path, turn_id: &str) {
@@ -927,7 +890,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn an_unreadable_capture_no_longer_suppresses_its_turn() {
+    fn overlap_follows_what_upstream_counted_not_the_capture_now() {
         let _env = clear_env();
         let home = tempfile::tempdir().unwrap();
         let dir = session_dir(&home.path().join(".minimax"));
@@ -936,26 +899,21 @@ mod tests {
             assistant("msg-a", "turn-1", 1791050552292, 704),
         )
         .unwrap();
-        write_capture(home.path(), "turn-1");
-        assert!(scan(home.path(), true).is_empty());
 
-        // Same length and mtime, but upstream can no longer read it, so the
-        // store row is what counts the turn now.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let capture = home
-                .path()
-                .join(".config/tokscale/headless/mcode/capture.jsonl");
-            fs::set_permissions(&capture, fs::Permissions::from_mode(0o000)).unwrap();
-            if fs::File::open(&capture).is_ok() {
-                // Running as root: permissions cannot make the read fail.
-                return;
-            }
-            assert_eq!(scan(home.path(), true).len(), 1);
-            fs::set_permissions(&capture, fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(scan(home.path(), true).is_empty());
-        }
+        // Upstream read the capture before its final result was written, so
+        // it counted nothing; the capture completes before the supplement runs.
+        let headless = home.path().join(".config/tokscale/headless/mcode");
+        fs::create_dir_all(&headless).unwrap();
+        fs::write(headless.join("capture.jsonl"), "").unwrap();
+        let before = upstream_counted(home.path(), true);
+        write_capture(home.path(), "turn-1");
+        assert_eq!(scan_with(home.path(), true, &before).len(), 1);
+
+        // Upstream counted the turn; the capture disappears before the
+        // supplement runs.
+        let counted = upstream_counted(home.path(), true);
+        fs::remove_file(headless.join("capture.jsonl")).unwrap();
+        assert!(scan_with(home.path(), true, &counted).is_empty());
     }
 
     #[test]

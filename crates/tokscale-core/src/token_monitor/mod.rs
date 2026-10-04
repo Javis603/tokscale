@@ -6,8 +6,10 @@
 //! Upstream files reach this module through these hooks:
 //!
 //! - `lib.rs`: `pub mod token_monitor;`
-//! - `lib.rs` streaming parse: `extend_requested` before the synthetic lane
-//! - `lib.rs` `parse_local_clients`: [`requested_messages`] before the synthetic lane
+//! - `lib.rs` streaming parse: [`Counted::from_messages`] after the mcode lane,
+//!   and `extend_requested` before the synthetic lane
+//! - `lib.rs` `parse_local_clients`: [`Counted::from_messages`] after the mcode
+//!   parse, and [`requested_messages`] before the synthetic lane
 //! - `tokscale-cli` `main.rs`: `mod token_monitor;`, `token_monitor::parse_cli`
 //!   in place of `Cli::parse`, and `token_monitor::merge_client_filter` where
 //!   the client filter is built (see `tokscale-cli/src/token_monitor.rs`)
@@ -28,6 +30,7 @@ mod qodercn;
 
 use crate::sessions::UnifiedMessage;
 use crate::{ClientCounts, ClientId};
+use std::collections::HashMap;
 
 /// A Token Monitor-owned client: its `--client` id and its parser.
 struct Client {
@@ -48,13 +51,48 @@ const CLIENTS: &[Client] = &[
     },
 ];
 
+/// What the upstream lanes produced for the clients that have a supplement,
+/// recorded in each lane right after its upstream parse. A supplement compares
+/// against this actual output instead of rereading upstream's files later in
+/// the scan, when they may have changed.
+#[derive(Debug, Default)]
+pub struct Counted {
+    dedup_keys: HashMap<String, Vec<String>>,
+}
+
+impl Counted {
+    /// Records the dedup keys of supplemented clients' messages; other
+    /// clients' messages in the same buffer are ignored.
+    pub fn from_messages(messages: &[UnifiedMessage]) -> Self {
+        let mut dedup_keys: HashMap<String, Vec<String>> = HashMap::new();
+        for message in messages {
+            if !SUPPLEMENTS
+                .iter()
+                .any(|supplement| supplement.id == message.client)
+            {
+                continue;
+            }
+            if let Some(key) = &message.dedup_key {
+                dedup_keys
+                    .entry(message.client.clone())
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+        Self { dedup_keys }
+    }
+
+    fn dedup_keys(&self, client: &str) -> &[String] {
+        self.dedup_keys.get(client).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// What a supplement sees of the scan it extends: the home, the env-root
-/// strategy, and the files the upstream lanes found, so it can tell what they
-/// already count without scanning again.
+/// strategy, and what the upstream lane already counted.
 pub struct Scope<'a> {
     pub home_dir: &'a str,
     pub use_env_roots: bool,
-    pub scan: &'a crate::scanner::ScanResult,
+    pub counted: &'a Counted,
 }
 
 /// A source added to an upstream client: the upstream id it reports under and
