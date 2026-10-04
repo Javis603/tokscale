@@ -193,14 +193,19 @@ fn captured_turns(
         let Some(before) = fingerprint(path) else {
             continue;
         };
+        // Upstream fingerprints a capture by reading it, and parses an
+        // unopenable one as empty, so in either lane it counts nothing from
+        // such a capture this scan. A cached turn set must not suppress the
+        // store's rows then, or the turn would be counted by neither; the
+        // entry is kept for when the file can be read again.
+        if std::fs::File::open(path).is_err() {
+            if let Some(entry) = previous {
+                next.captures.insert(key, entry.clone());
+            }
+            continue;
+        }
         let entry = match previous.filter(|entry| entry.fingerprint == before) {
             Some(entry) => entry.clone(),
-            // The parser reads an unopenable file as empty; that must not be
-            // cached as "no captured turns", or the store would count them again.
-            None if std::fs::File::open(path).is_err() => match previous {
-                Some(entry) => entry.clone(),
-                None => continue,
-            },
             None => {
                 let parsed = CachedCapture {
                     fingerprint: before,
@@ -918,6 +923,39 @@ mod tests {
         // The captured turn is skipped, and its first segment is not mistaken
         // for a different turn that happens to share it.
         assert_eq!(inputs, vec![800]);
+    }
+
+    #[test]
+    #[serial]
+    fn an_unreadable_capture_no_longer_suppresses_its_turn() {
+        let _env = clear_env();
+        let home = tempfile::tempdir().unwrap();
+        let dir = session_dir(&home.path().join(".minimax"));
+        fs::write(
+            dir.join("messages.jsonl"),
+            assistant("msg-a", "turn-1", 1791050552292, 704),
+        )
+        .unwrap();
+        write_capture(home.path(), "turn-1");
+        assert!(scan(home.path(), true).is_empty());
+
+        // Same length and mtime, but upstream can no longer read it, so the
+        // store row is what counts the turn now.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let capture = home
+                .path()
+                .join(".config/tokscale/headless/mcode/capture.jsonl");
+            fs::set_permissions(&capture, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::File::open(&capture).is_ok() {
+                // Running as root: permissions cannot make the read fail.
+                return;
+            }
+            assert_eq!(scan(home.path(), true).len(), 1);
+            fs::set_permissions(&capture, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(scan(home.path(), true).is_empty());
+        }
     }
 
     #[test]
