@@ -39,6 +39,10 @@ fn assistant(message_id: &str, turn_id: &str, input: i64) -> String {
 }
 
 fn write_home(home: &Path) {
+    write_home_with_captures(home, &home.join(".config/tokscale/headless/mcode"));
+}
+
+fn write_home_with_captures(home: &Path, headless: &Path) {
     let session = home.join(".minimax/v2/sessions/2026/05/28/20-26-40-000-session_c2Vzc2lvbg");
     std::fs::create_dir_all(&session).unwrap();
     std::fs::write(
@@ -56,8 +60,7 @@ fn write_home(home: &Path) {
     )
     .unwrap();
     // turn-1 was also run through `tokscale headless mcode exec`.
-    let headless = home.join(".config/tokscale/headless/mcode");
-    std::fs::create_dir_all(&headless).unwrap();
+    std::fs::create_dir_all(headless).unwrap();
     std::fs::write(
         headless.join("capture.jsonl"),
         serde_json::json!({
@@ -122,4 +125,29 @@ async fn an_unfiltered_scan_reads_the_store_too() {
         .await
         .unwrap();
     assert_eq!(messages.iter().filter(|m| m.client == "mcode").count(), 2);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn captures_under_an_extra_scan_path_are_not_counted_again() {
+    let cache = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set(&[("TOKSCALE_CONFIG_DIR", cache.path().as_os_str())]);
+    let home = tempfile::tempdir().unwrap();
+    let captures = home.path().join("elsewhere/mcode-captures");
+    write_home_with_captures(home.path(), &captures);
+    let mut options = options(home.path(), Some(vec!["mcode".to_string()]));
+    options
+        .scanner_settings
+        .extra_scan_paths
+        .insert("mcode".to_string(), vec![captures]);
+
+    let local = parse_local_clients(options.clone()).unwrap();
+    assert_eq!(local.messages.len(), 2);
+    assert_eq!(local.messages.iter().map(|m| m.input).sum::<i64>(), 3000);
+
+    let messages = parse_local_unified_messages_with_pricing(options, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 3000);
 }

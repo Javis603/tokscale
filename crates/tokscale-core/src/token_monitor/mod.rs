@@ -48,11 +48,20 @@ const CLIENTS: &[Client] = &[
     },
 ];
 
+/// What a supplement sees of the scan it extends: the home, the env-root
+/// strategy, and the files the upstream lanes found, so it can tell what they
+/// already count without scanning again.
+pub struct Scope<'a> {
+    pub home_dir: &'a str,
+    pub use_env_roots: bool,
+    pub scan: &'a crate::scanner::ScanResult,
+}
+
 /// A source added to an upstream client: the upstream id it reports under and
-/// its parser, which also receives the scan's env-root strategy.
+/// its parser.
 struct Supplement {
     id: &'static str,
-    parse: fn(&str, bool) -> Vec<UnifiedMessage>,
+    parse: fn(&Scope) -> Vec<UnifiedMessage>,
 }
 
 const SUPPLEMENTS: &[Supplement] = &[Supplement {
@@ -81,13 +90,10 @@ fn requested_supplements<'a>(
     })
 }
 
-fn parse_requested(home_dir: &str, clients: &[String], use_env_roots: bool) -> Vec<UnifiedMessage> {
+fn parse_requested(clients: &[String], scope: &Scope) -> Vec<UnifiedMessage> {
     requested(clients)
-        .flat_map(|client| (client.parse)(home_dir))
-        .chain(
-            requested_supplements(clients)
-                .flat_map(|supplement| (supplement.parse)(home_dir, use_env_roots)),
-        )
+        .flat_map(|client| (client.parse)(scope.home_dir))
+        .chain(requested_supplements(clients).flat_map(|supplement| (supplement.parse)(scope)))
         .collect()
 }
 
@@ -95,12 +101,11 @@ fn parse_requested(home_dir: &str, clients: &[String], use_env_roots: bool) -> V
 /// and supplement. Supplement messages are added to their upstream client's
 /// count.
 pub fn requested_messages(
-    home_dir: &str,
     clients: &[String],
-    use_env_roots: bool,
+    scope: &Scope,
     counts: &mut ClientCounts,
 ) -> Vec<UnifiedMessage> {
-    let messages = parse_requested(home_dir, clients, use_env_roots);
+    let messages = parse_requested(clients, scope);
     for message in &messages {
         if let Some(client) = ClientId::from_str(&message.client) {
             counts.add(client, message.message_count.max(0));
@@ -112,13 +117,12 @@ pub fn requested_messages(
 /// Streaming-lane hook: parse, price and append the requested clients and
 /// supplements.
 pub(crate) fn extend_requested(
-    home_dir: &str,
     clients: &[String],
-    use_env_roots: bool,
+    scope: &Scope,
     pricing: Option<&crate::pricing::PricingService>,
     all_messages: &mut Vec<UnifiedMessage>,
 ) {
-    for mut message in parse_requested(home_dir, clients, use_env_roots) {
+    for mut message in parse_requested(clients, scope) {
         message.refresh_derived_fields();
         crate::apply_pricing_if_available(&mut message, pricing);
         all_messages.push(message);

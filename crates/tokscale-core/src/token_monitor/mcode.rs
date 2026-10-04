@@ -14,26 +14,29 @@
 //!
 //! The runtime also projects usage into the SQLite `local_runtime_token_usage`
 //! table, but that projection is best effort (write failures are swallowed)
-//! and does not record the model, so it is read only for Session metadata.
+//! and usually leaves the model empty, so it is read only for Session metadata.
 //!
 //! A turn that upstream already counted from a headless capture is skipped
-//! here: the capture and the store carry the same Session and turn ids.
+//! here: the capture and the store carry the same Session and turn ids. The
+//! captures are the files the upstream lane found in this same scan.
 //!
 //! History files hold whole conversations, tool output included, and Token
-//! Monitor scans several times a minute, so the usage rows of each file are
-//! cached by its length and mtime and a file is reparsed only when it changes.
+//! Monitor scans several times a minute, so the usage rows of each file (and
+//! the turns of each capture) are cached by length and mtime, per scanned
+//! home, and a file is reparsed only when it changes. A read that fails or
+//! races a write is never cached; the last complete read is served instead.
 
-use crate::scanner;
-use crate::sessions::utils::{lossy_lines, open_readonly_sqlite_opt};
+use super::{js, Scope};
+use crate::sessions::utils::open_readonly_sqlite_opt;
 use crate::sessions::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub const CLIENT_ID: &str = "mcode";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 const ENV_OVERRIDES: [&str; 2] = ["MINIMAX_DATA_DIR", "MAVIS_DATA_DIR"];
 /// The current default data directory and the one earlier releases used. A
@@ -96,13 +99,22 @@ struct Row {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    reasoning: i64,
 }
+
+/// File length and mtime.
+type Fingerprint = (u64, u128);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CachedFile {
-    len: u64,
-    modified_ns: u128,
+    fingerprint: Fingerprint,
     rows: Vec<Row>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CachedCapture {
+    fingerprint: Fingerprint,
+    turns: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -110,26 +122,31 @@ struct Cache {
     version: u32,
     /// Keyed by history file path.
     files: BTreeMap<String, CachedFile>,
+    /// Keyed by headless capture path.
+    captures: BTreeMap<String, CachedCapture>,
 }
 
-pub fn parse(home_dir: &str, use_env_roots: bool) -> Vec<UnifiedMessage> {
+pub fn parse(scope: &Scope) -> Vec<UnifiedMessage> {
+    // One cache per scanned home: a host scan and a `--home` (WSL) scan visit
+    // different files, and sharing one cache would evict each other's rows.
+    let namespace = js::path_namespace(Path::new(scope.home_dir));
     let cache_path = crate::paths::get_cache_dir()
         .join("token-monitor")
-        .join("mcode.json");
-    parse_with(home_dir, use_env_roots, &cache_path)
+        .join(format!("mcode-{namespace}.json"));
+    parse_with(scope, &cache_path)
 }
 
-fn parse_with(home_dir: &str, use_env_roots: bool, cache_path: &Path) -> Vec<UnifiedMessage> {
-    let captured = headless_turns(home_dir, use_env_roots);
+fn parse_with(scope: &Scope, cache_path: &Path) -> Vec<UnifiedMessage> {
     let loaded = load_cache(cache_path);
     let mut next = Cache {
         version: CACHE_VERSION,
-        files: BTreeMap::new(),
+        ..Cache::default()
     };
+    let captured = captured_turns(scope.scan.get(crate::ClientId::Mcode), &loaded, &mut next);
     let mut seen_roots = HashSet::new();
     let mut seen_messages = HashSet::new();
     let mut messages = Vec::new();
-    for data_dir in data_dirs(home_dir, use_env_roots) {
+    for data_dir in data_dirs(scope.home_dir, scope.use_env_roots) {
         let sessions_root = data_dir.join("v2").join("sessions");
         // `.mavis` is often a link to `.minimax`; read each store once.
         let Ok(canonical) = std::fs::canonicalize(&sessions_root) else {
@@ -162,25 +179,63 @@ fn parse_with(home_dir: &str, use_env_roots: bool, cache_path: &Path) -> Vec<Uni
     messages
 }
 
-/// `(session id, turn id)` of every turn upstream counts from a headless
-/// capture, found through the same scan and parser upstream uses.
-fn headless_turns(home_dir: &str, use_env_roots: bool) -> HashSet<(String, String)> {
-    let scan = scanner::scan_all_clients_with_env_strategy(
-        home_dir,
-        &[CLIENT_ID.to_string()],
-        use_env_roots,
-    );
-    scan.get(crate::ClientId::Mcode)
-        .iter()
-        .flat_map(|path| crate::sessions::mcode::parse_mcode_file(path))
-        .filter_map(|message| {
-            // Upstream keys a headless row `mcode:<session>:<turn>:<index>:…`.
-            let key = message.dedup_key?;
-            let mut parts = key.splitn(4, ':');
-            (parts.next() == Some("mcode")).then_some(())?;
-            Some((parts.next()?.to_string(), parts.next()?.to_string()))
-        })
-        .collect()
+/// `(session id, turn id)` of every turn upstream counts from these headless
+/// captures, through the parser upstream uses.
+fn captured_turns(
+    paths: &[PathBuf],
+    loaded: &Cache,
+    next: &mut Cache,
+) -> HashSet<(String, String)> {
+    let mut turns = HashSet::new();
+    for path in paths {
+        let key = path.to_string_lossy().into_owned();
+        let previous = loaded.captures.get(&key);
+        let Some(before) = fingerprint(path) else {
+            continue;
+        };
+        let entry = match previous.filter(|entry| entry.fingerprint == before) {
+            Some(entry) => entry.clone(),
+            // The parser reads an unopenable file as empty; that must not be
+            // cached as "no captured turns", or the store would count them again.
+            None if std::fs::File::open(path).is_err() => match previous {
+                Some(entry) => entry.clone(),
+                None => continue,
+            },
+            None => {
+                let parsed = CachedCapture {
+                    fingerprint: before,
+                    turns: crate::sessions::mcode::parse_mcode_file(path)
+                        .into_iter()
+                        .filter_map(|message| headless_turn(message.dedup_key.as_deref()?))
+                        .collect(),
+                };
+                if fingerprint(path) != Some(before) {
+                    // Written while being read: use it now, reread next scan.
+                    turns.extend(parsed.turns);
+                    continue;
+                }
+                parsed
+            }
+        };
+        turns.extend(entry.turns.iter().cloned());
+        next.captures.insert(key, entry);
+    }
+    turns
+}
+
+/// Upstream keys a headless row
+/// `mcode:<session>:<turn>:<index>:<input>:<output>:<cache_read>:<cache_write>`
+/// without escaping. Turn ids can contain `:` (`mavis-internal:<scope>:<id>`,
+/// `plan-review:…`) while minted session ids (`mvs_<hex>`) do not, so the turn
+/// is everything between the session and the five trailing numbers.
+fn headless_turn(key: &str) -> Option<(String, String)> {
+    let rest = key.strip_prefix("mcode:")?;
+    let mut fields = rest.rsplitn(6, ':');
+    for _ in 0..5 {
+        fields.next()?.parse::<i64>().ok()?;
+    }
+    let (session, turn) = fields.next()?.split_once(':')?;
+    Some((session.to_string(), turn.to_string()))
 }
 
 /// `<sessions>/<yyyy>/<mm>/<dd>/<dir>`, sorted so output order is stable.
@@ -291,36 +346,65 @@ fn history_files(session_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Rows of one history file: cached while its fingerprint holds. A failed
+/// read serves the last complete read instead, and a read that raced a write
+/// is used once without being cached, so neither can stick.
 fn cached_rows(path: &Path, loaded: &Cache, next: &mut Cache) -> Vec<Row> {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let key = path.to_string_lossy().into_owned();
+    let previous = loaded.files.get(&key);
+    let Some(before) = fingerprint(path) else {
         return Vec::new();
     };
-    let key = path.to_string_lossy().into_owned();
-    let (len, modified_ns) = (meta.len(), modified_ns(&meta));
-    let entry = match loaded.files.get(&key) {
-        Some(entry) if entry.len == len && entry.modified_ns == modified_ns => entry.clone(),
-        _ => CachedFile {
-            len,
-            modified_ns,
-            rows: read_rows(path),
+    if let Some(entry) = previous.filter(|entry| entry.fingerprint == before) {
+        next.files.insert(key, entry.clone());
+        return entry.rows.clone();
+    }
+    match read_rows(path) {
+        Ok(rows) if fingerprint(path) == Some(before) => {
+            next.files.insert(
+                key,
+                CachedFile {
+                    fingerprint: before,
+                    rows: rows.clone(),
+                },
+            );
+            rows
+        }
+        Ok(rows) => {
+            if let Some(entry) = previous {
+                next.files.insert(key, entry.clone());
+            }
+            rows
+        }
+        Err(_) => match previous {
+            Some(entry) => {
+                next.files.insert(key, entry.clone());
+                entry.rows.clone()
+            }
+            None => Vec::new(),
         },
-    };
-    let rows = entry.rows.clone();
-    next.files.insert(key, entry);
-    rows
+    }
 }
 
-fn read_rows(path: &Path) -> Vec<Row> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
+fn read_rows(path: &Path) -> std::io::Result<Vec<Row>> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut buf = Vec::new();
     let mut rows = Vec::new();
-    for line in lossy_lines(BufReader::new(file)) {
+    loop {
+        buf.clear();
+        // Unlike a `lines()` iterator, a read error here fails the whole read
+        // instead of looking like the end of the file.
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        // An invalid byte costs only its own line.
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_start_matches('\u{feff}');
         // Only assistant messages carry usage; skip parsing the rest.
         if !line.contains("\"assistant\"") {
             continue;
         }
-        let Ok(envelope) = serde_json::from_str::<Envelope>(&line) else {
+        let Ok(envelope) = serde_json::from_str::<Envelope>(line) else {
             continue;
         };
         let message = envelope.message;
@@ -330,12 +414,14 @@ fn read_rows(path: &Path) -> Vec<Row> {
         let Some(tokens) = message.usage.as_ref().map(tokens_from_usage) else {
             continue;
         };
-        let timestamp = message
-            .timestamp
-            .as_ref()
-            .and_then(number)
-            .map(|value| value as i64)
-            .unwrap_or(0);
+        let timestamp = normalize_timestamp(
+            message
+                .timestamp
+                .as_ref()
+                .and_then(number)
+                .map(|value| value as i64)
+                .unwrap_or(0),
+        );
         if tokens.total() == 0 || timestamp <= 0 {
             continue;
         }
@@ -349,9 +435,19 @@ fn read_rows(path: &Path) -> Vec<Row> {
             output: tokens.output,
             cache_read: tokens.cache_read,
             cache_write: tokens.cache_write,
+            reasoning: tokens.reasoning,
         });
     }
-    rows
+    Ok(rows)
+}
+
+/// Seconds to milliseconds, as upstream's headless parser does.
+fn normalize_timestamp(timestamp: i64) -> i64 {
+    if timestamp > 0 && timestamp < 10_000_000_000 {
+        timestamp.saturating_mul(1_000)
+    } else {
+        timestamp
+    }
 }
 
 fn session_messages(
@@ -380,7 +476,7 @@ fn session_messages(
             cache_read: row.cache_read,
             cache_write: row.cache_write,
             cache_write_1h: 0,
-            reasoning: 0,
+            reasoning: row.reasoning,
         };
         let mut message = UnifiedMessage::new_with_dedup(
             CLIENT_ID,
@@ -424,17 +520,28 @@ fn save_cache(path: &Path, cache: &Cache) {
     }
 }
 
-fn modified_ns(meta: &std::fs::Metadata) -> u128 {
-    meta.modified()
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified_ns = meta
+        .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    Some((meta.len(), modified_ns))
 }
 
 /// Pi usage as the runtime's own usage projection reads it
 /// (`normalizePiUsage` in local-runtime-v2): `input` excludes cache reads, and
 /// a usage with neither input nor output falls back to `total_tokens`.
+///
+/// Reasoning is the exception. Tokscale's `reasoning` bucket is added to the
+/// total and priced on top of `output`, but MiniMax Code's providers report
+/// reasoning inside `output`: in 0.6.2 none of them writes a `reasoning` field,
+/// and headless captures that carry `reasoningTokens` have a `totalTokens` of
+/// input plus output, which upstream's parser follows by leaving it out. So a
+/// reported `reasoning` is added only when it cannot be part of `output`:
+/// when it is larger, or when `totalTokens` counts it on top of the others.
 fn tokens_from_usage(usage: &serde_json::Value) -> TokenBreakdown {
     let field = |key: &str| usage.get(key).and_then(number).unwrap_or(0.0);
     let nested = |outer: &str, inner: &str| {
@@ -462,13 +569,17 @@ fn tokens_from_usage(usage: &serde_json::Value) -> TokenBreakdown {
         .or_else(|| nested("cache", "write"))
         .or_else(|| usage.get("cache_write").and_then(number))
         .unwrap_or(0.0);
+    let reasoning = field("reasoning");
+    let total = field("totalTokens");
+    let separate = reasoning > output
+        || (total > 0.0 && total == input + output + cache_read + cache_write + reasoning);
     TokenBreakdown {
         input: count(input),
         output: count(output),
         cache_read: count(cache_read),
         cache_write: count(cache_write),
         cache_write_1h: 0,
-        reasoning: 0,
+        reasoning: if separate { count(reasoning) } else { 0 },
     }
 }
 
@@ -531,17 +642,44 @@ mod tests {
     }
 
     fn scan(home: &Path, use_env_roots: bool) -> Vec<UnifiedMessage> {
-        parse_with(
-            home.to_str().unwrap(),
+        let home_dir = home.to_str().unwrap();
+        let result = crate::scanner::scan_all_clients_with_env_strategy(
+            home_dir,
+            &[CLIENT_ID.to_string()],
             use_env_roots,
-            &home.join("tm-cache/mcode.json"),
-        )
+        );
+        let scope = Scope {
+            home_dir,
+            use_env_roots,
+            scan: &result,
+        };
+        parse_with(&scope, &home.join("tm-cache/mcode.json"))
     }
 
-    const ENV_KEYS: [&str; 3] = [
+    fn write_capture(home: &Path, turn_id: &str) {
+        let headless = home.join(".config/tokscale/headless/mcode");
+        fs::create_dir_all(&headless).unwrap();
+        fs::write(
+            headless.join("capture.jsonl"),
+            serde_json::json!({
+                "schemaVersion": 1, "type": "exec.completed", "timestampMs": 1791050552292i64,
+                "sessionId": SESSION, "turnId": turn_id,
+                "result": {
+                    "type": "exec.result", "sessionId": SESSION, "turnId": turn_id, "status": "succeeded",
+                    "model": {"providerId": "minimax", "modelId": "MiniMax-M2.5"},
+                    "usage": {"inputTokens": 704, "outputTokens": 20, "cacheReadTokens": 300}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    const ENV_KEYS: [&str; 4] = [
         "MINIMAX_DATA_DIR",
         "MAVIS_DATA_DIR",
         "TOKSCALE_HEADLESS_DIR",
+        "TOKSCALE_EXTRA_DIRS",
     ];
 
     fn clear_env() -> EnvGuard {
@@ -614,15 +752,7 @@ mod tests {
             .join("\n"),
         )
         .unwrap();
-        let headless = home.path().join(".config/tokscale/headless/mcode");
-        fs::create_dir_all(&headless).unwrap();
-        fs::write(
-            headless.join("capture.jsonl"),
-            format!(
-                r#"{{"schemaVersion":1,"timestampMs":1791050552292,"sessionId":"{SESSION}","turnId":"turn-1","type":"exec.completed","result":{{"type":"exec.result","sessionId":"{SESSION}","turnId":"turn-1","status":"succeeded","model":{{"providerId":"minimax","modelId":"MiniMax-M2.5"}},"usage":{{"inputTokens":704,"outputTokens":20,"cacheReadTokens":300}}}}}}"#
-            ),
-        )
-        .unwrap();
+        write_capture(home.path(), "turn-1");
 
         let messages = scan(home.path(), true);
 
@@ -760,6 +890,113 @@ mod tests {
             .map(|m| m.tokens.input)
             .collect();
         assert_eq!(inputs, vec![704, 800, 900]);
+    }
+
+    #[test]
+    #[serial]
+    fn a_captured_turn_id_containing_colons_is_skipped_whole() {
+        let _env = clear_env();
+        let home = tempfile::tempdir().unwrap();
+        let dir = session_dir(&home.path().join(".minimax"));
+        let internal = "mavis-internal:scope:id";
+        fs::write(
+            dir.join("messages.jsonl"),
+            [
+                assistant("msg-a", internal, 1791050552292, 704),
+                assistant("msg-b", "mavis-internal", 1791050553292, 800),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        write_capture(home.path(), internal);
+
+        let inputs: Vec<i64> = scan(home.path(), true)
+            .iter()
+            .map(|m| m.tokens.input)
+            .collect();
+
+        // The captured turn is skipped, and its first segment is not mistaken
+        // for a different turn that happens to share it.
+        assert_eq!(inputs, vec![800]);
+    }
+
+    #[test]
+    #[serial]
+    fn a_failed_read_serves_the_last_complete_read() {
+        let _env = clear_env();
+        let home = tempfile::tempdir().unwrap();
+        let dir = session_dir(&home.path().join(".minimax"));
+        let active = dir.join("messages.jsonl");
+        fs::write(&active, assistant("msg-a", "turn-1", 1791050552292, 704)).unwrap();
+        assert_eq!(scan(home.path(), true).len(), 1);
+
+        // A changed fingerprint that cannot be read keeps the cached rows,
+        // and the failure is not cached under the new fingerprint.
+        fs::write(&active, assistant("msg-a", "turn-1", 1791050552292, 7040)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&active, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::File::open(&active).is_ok() {
+                // Running as root: permissions cannot make the read fail.
+                return;
+            }
+            let inputs: Vec<i64> = scan(home.path(), true)
+                .iter()
+                .map(|m| m.tokens.input)
+                .collect();
+            assert_eq!(inputs, vec![704]);
+            fs::set_permissions(&active, fs::Permissions::from_mode(0o644)).unwrap();
+            let inputs: Vec<i64> = scan(home.path(), true)
+                .iter()
+                .map(|m| m.tokens.input)
+                .collect();
+            assert_eq!(inputs, vec![7040]);
+        }
+    }
+
+    #[test]
+    fn reasoning_is_added_only_when_output_cannot_hold_it() {
+        // Inside output: what MiniMax Code's headless captures report.
+        let inside = tokens_from_usage(&serde_json::json!({
+            "input": 100, "output": 24, "reasoning": 9, "totalTokens": 124
+        }));
+        assert_eq!((inside.output, inside.reasoning), (24, 0));
+        // No total to tell: follow upstream and keep it in output.
+        let unknown =
+            tokens_from_usage(&serde_json::json!({"input": 7, "output": 2, "reasoning": 1}));
+        assert_eq!((unknown.output, unknown.reasoning), (2, 0));
+        // The total counts it on top of the other buckets.
+        let separate = tokens_from_usage(&serde_json::json!({
+            "input": 100, "output": 24, "cacheRead": 10, "reasoning": 9, "totalTokens": 143
+        }));
+        assert_eq!((separate.output, separate.reasoning), (24, 9));
+        // Larger than output, so it cannot be inside it.
+        let only =
+            tokens_from_usage(&serde_json::json!({"input": 0, "output": 0, "reasoning": 12}));
+        assert_eq!((only.output, only.reasoning), (0, 12));
+        assert_eq!(only.total(), 12);
+    }
+
+    #[test]
+    fn headless_keys_split_at_the_trailing_numbers() {
+        assert_eq!(
+            headless_turn("mcode:mvs_1:mavis-internal:scope:id:0:10:1:0:0"),
+            Some(("mvs_1".to_string(), "mavis-internal:scope:id".to_string()))
+        );
+        assert_eq!(
+            headless_turn("mcode:mvs_1:turn-1:2:10:1:0:0"),
+            Some(("mvs_1".to_string(), "turn-1".to_string()))
+        );
+        assert_eq!(headless_turn("mcode:store:mvs_1:msg"), None);
+        assert_eq!(headless_turn("codex:mvs_1:turn-1:0:1:1:0:0"), None);
+    }
+
+    #[test]
+    fn seconds_timestamps_become_milliseconds() {
+        assert_eq!(normalize_timestamp(1_791_050_552), 1_791_050_552_000);
+        assert_eq!(normalize_timestamp(1_791_050_552_292), 1_791_050_552_292);
+        assert_eq!(normalize_timestamp(0), 0);
     }
 
     #[test]
