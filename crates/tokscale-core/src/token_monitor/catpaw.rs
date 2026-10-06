@@ -354,6 +354,8 @@ fn model(edition: Edition, extra: &Value) -> (String, bool) {
 }
 
 // SQLite projects only numeric usage and model selection, never body/title.
+// The row limit is one past the read budget: an over-budget source must fail
+// the row-budget check instead of arriving truncated as a valid snapshot.
 const USAGE_SQL: &str = "
 SELECT m.conversation_id, m.message_id, m.created_at_ms, m.updated_at_ms,
        m.schema_version, json_extract(m.payload, '$.extra.contextInfo.usage'),
@@ -367,7 +369,9 @@ SELECT m.conversation_id, m.message_id, m.created_at_ms, m.updated_at_ms,
         FROM sessions s WHERE s.conversation_id = m.conversation_id LIMIT 1)
 FROM ui_sdk_messages m
 WHERE m.role = 'assistant' AND json_type(m.payload, '$.extra.contextInfo.usage') IS NOT NULL
-ORDER BY m.updated_at_ms, m.seq";
+ORDER BY m.updated_at_ms, m.seq LIMIT ?1";
+
+const USAGE_ROW_LIMIT: i64 = (MAX_ROWS + 1) as i64;
 
 fn read_db(path: &Path, edition: Edition, namespace: &str) -> Result<Vec<UnifiedMessage>, String> {
     let mut conn = open_readonly_sqlite(path).map_err(|_| "database open failed")?;
@@ -379,7 +383,9 @@ fn read_db(path: &Path, edition: Edition, namespace: &str) -> Result<Vec<Unified
     let mut statement = tx
         .prepare(USAGE_SQL)
         .map_err(|_| "unsupported database schema")?;
-    let mut rows = statement.query([]).map_err(|_| "usage query failed")?;
+    let mut rows = statement
+        .query(rusqlite::params![USAGE_ROW_LIMIT])
+        .map_err(|_| "usage query failed")?;
     let mut messages = BTreeMap::new();
     let mut bytes = 0usize;
     let mut count = 0usize;
@@ -526,6 +532,46 @@ mod tests {
             assert_eq!(unified.len(), 1);
             assert_eq!(unified[0].tokens.input, input);
         }
+    }
+
+    #[test]
+    fn row_budget_rejects_an_over_limit_source_and_keeps_the_boundary_read() {
+        let bulk = |scope: &str, rows: usize| {
+            let dir = tempfile::tempdir().unwrap();
+            let (path, conn) = database(dir.path(), Edition::Domestic, scope, 91);
+            let payload =
+                json!({"content":"x","extra":{"contextInfo":{"usage":usage(1,0,0,1)}}}).to_string();
+            let mut stmt = conn
+                .prepare(
+                    "INSERT OR REPLACE INTO ui_sdk_messages VALUES('c',?1,?2,'assistant',?3,?4,?5,1)",
+                )
+                .unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            for seq in 0..rows as i64 {
+                stmt.execute(rusqlite::params![
+                    seq,
+                    format!("m{seq}"),
+                    payload,
+                    TIME,
+                    TIME + seq
+                ])
+                .unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            (path, dir)
+        };
+        let (boundary, _keep) = bulk("boundary", MAX_ROWS);
+        assert_eq!(
+            read_db(&boundary, Edition::Domestic, "boundary")
+                .unwrap()
+                .len(),
+            MAX_ROWS
+        );
+        let (over, _keep) = bulk("over", MAX_ROWS + 1);
+        assert_eq!(
+            read_db(&over, Edition::Domestic, "over"),
+            Err("row budget exceeded".into())
+        );
     }
 
     #[test]
