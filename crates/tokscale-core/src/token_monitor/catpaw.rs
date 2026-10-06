@@ -8,7 +8,9 @@
 //! `sessions`; no message body, title or credential is read. The usage buckets
 //! are disjoint: `promptTokens` is uncached input, `cacheReadTokens` and
 //! `cacheWriteTokens` are separate additive buckets, and their checked sum
-//! must equal `totalTokens`. Reasoning and 1-hour cache-write tokens are not
+//! must match one of the recorded totals: `usage.totalTokens`, or the sibling
+//! `contextInfo.totalUsageTokens` on rows whose stored total predates
+//! cache-read accounting. Reasoning and 1-hour cache-write tokens are not
 //! independently persisted and stay zero instead of being inferred.
 //!
 //! Model ids are edition-specific. Auto, routing, unknown and conflicting ids
@@ -268,7 +270,7 @@ fn count(usage: &Value, key: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("invalid token field {key}"))
 }
 
-fn tokens(usage: &Value) -> Result<TokenBreakdown, String> {
+fn tokens(usage: &Value, recorded_total: Option<i64>) -> Result<TokenBreakdown, String> {
     let tokens = TokenBreakdown {
         input: count(usage, "promptTokens")?,
         output: count(usage, "completionTokens")?,
@@ -285,10 +287,23 @@ fn tokens(usage: &Value) -> Result<TokenBreakdown, String> {
     .into_iter()
     .try_fold(0i64, |sum, n| sum.checked_add(n))
     .ok_or("token sum overflow")?;
-    if total != count(usage, "totalTokens")? {
-        return Err("token sum differs from totalTokens".into());
+    if total != count(usage, "totalTokens")? && Some(total) != recorded_total {
+        return Err("token sum differs from the recorded totals".into());
     }
     Ok(tokens)
+}
+
+// Older builds stored usage.totalTokens without cache reads; the sibling
+// contextInfo.totalUsageTokens carries the all-bucket total. Anything that is
+// not a nonnegative integral JS-safe number leaves the anchor unavailable
+// rather than failing the row.
+fn recorded_total(value: Option<rusqlite::types::Value>) -> Option<i64> {
+    let (n, integral) = match value? {
+        rusqlite::types::Value::Integer(n) => (n as f64, true),
+        rusqlite::types::Value::Real(n) => (n, n.fract() == 0.0),
+        _ => return None,
+    };
+    (integral && n.is_finite() && (0.0..=js::MAX_SAFE_INTEGER).contains(&n)).then_some(n as i64)
 }
 
 fn model(edition: Edition, extra: &Value) -> (String, bool) {
@@ -353,12 +368,14 @@ fn model(edition: Edition, extra: &Value) -> (String, bool) {
     }
 }
 
-// SQLite projects only numeric usage and model selection, never body/title.
-// The row limit is one past the read budget: an over-budget source must fail
-// the row-budget check instead of arriving truncated as a valid snapshot.
+// SQLite projects only numeric usage, the recorded totals and model
+// selection, never body/title. The row limit is one past the read budget: an
+// over-budget source must fail the row-budget check instead of arriving
+// truncated as a valid snapshot.
 const USAGE_SQL: &str = "
 SELECT m.conversation_id, m.message_id, m.created_at_ms, m.updated_at_ms,
        m.schema_version, json_extract(m.payload, '$.extra.contextInfo.usage'),
+       json_extract(m.payload, '$.extra.contextInfo.totalUsageTokens'),
        (SELECT json_object(
           'persistedModelId', json_extract(s.extra, '$.persistedModelId'),
           'persistedModelMode', json_extract(s.extra, '$.persistedModelMode'),
@@ -401,7 +418,8 @@ fn read_db(path: &Path, edition: Edition, namespace: &str) -> Result<Vec<Unified
         let updated: i64 = row.get(3).map_err(decode)?;
         let schema: i64 = row.get(4).map_err(decode)?;
         let usage: String = row.get(5).map_err(decode)?;
-        let selection: Option<String> = row.get(6).map_err(decode)?;
+        let recorded: Option<rusqlite::types::Value> = row.get(6).map_err(decode)?;
+        let selection: Option<String> = row.get(7).map_err(decode)?;
         bytes +=
             conversation.len() + id.len() + usage.len() + selection.as_ref().map_or(0, String::len);
         if bytes > MAX_BYTES {
@@ -411,7 +429,7 @@ fn read_db(path: &Path, edition: Edition, namespace: &str) -> Result<Vec<Unified
             return Err("unsupported message schema or missing identity".into());
         }
         let usage: Value = serde_json::from_str(&usage).map_err(|_| "invalid usage JSON")?;
-        let tokens = tokens(&usage)?;
+        let tokens = tokens(&usage, recorded_total(recorded))?;
         let selection: Value = serde_json::from_str(selection.as_deref().unwrap_or("{}"))
             .map_err(|_| "invalid model selection JSON")?;
         let (model, known) = model(edition, &selection);
@@ -532,6 +550,53 @@ mod tests {
             assert_eq!(unified.len(), 1);
             assert_eq!(unified[0].tokens.input, input);
         }
+    }
+
+    #[test]
+    fn token_sums_anchor_to_either_recorded_total_across_writer_eras() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, conn) = database(dir.path(), Edition::Domestic, "eras", 91);
+        insert(&conn, 1, "era-b", usage(100, 20, 0, 30), Some(TIME));
+        // Older writers kept usage.totalTokens at prompt + completion, with
+        // the sibling totalUsageTokens carrying all four buckets.
+        let older = json!({"promptTokens":177,"cacheReadTokens":98944,"cacheWriteTokens":0,
+            "completionTokens":38,"totalTokens":215});
+        let payload = json!({"content":"x","extra":{"contextInfo":{
+            "usage":older,"totalUsageTokens":99159}}});
+        conn.execute(
+            "INSERT OR REPLACE INTO ui_sdk_messages VALUES('c',2,'era-a','assistant',?1,?2,?3,1)",
+            rusqlite::params![payload.to_string(), TIME, TIME + 2],
+        )
+        .unwrap();
+        let messages = read_db(&path, Edition::Domestic, "eras").unwrap();
+        assert_eq!(messages.len(), 2);
+        let older = &messages[0];
+        assert_eq!(older.dedup_key.as_deref(), Some("catpaw:eras:c:era-a"));
+        assert_eq!(
+            (
+                older.tokens.input,
+                older.tokens.output,
+                older.tokens.cache_read,
+                older.tokens.cache_write
+            ),
+            (177, 38, 98944, 0)
+        );
+    }
+
+    #[test]
+    fn a_sum_matching_neither_recorded_total_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, conn) = database(dir.path(), Edition::Domestic, "mismatch", 91);
+        let bad = json!({"promptTokens":177,"cacheReadTokens":98944,"cacheWriteTokens":0,
+            "completionTokens":38,"totalTokens":999});
+        let payload = json!({"content":"x","extra":{"contextInfo":{
+            "usage":bad,"totalUsageTokens":1.5}}});
+        conn.execute(
+            "INSERT OR REPLACE INTO ui_sdk_messages VALUES('c',1,'bad','assistant',?1,?2,?3,1)",
+            rusqlite::params![payload.to_string(), TIME, TIME + 1],
+        )
+        .unwrap();
+        assert!(read_db(&path, Edition::Domestic, "mismatch").is_err());
     }
 
     #[test]
@@ -700,7 +765,7 @@ mod tests {
             ("gpt-5.6-terra".to_string(), rates.clone()),
         ]);
         let pricing = PricingService::new(catalog.clone(), HashMap::new());
-        let usage = tokens(&usage(1200, 500, 80, 340)).unwrap();
+        let usage = tokens(&usage(1200, 500, 80, 340), None).unwrap();
         assert_eq!(
             pricing.calculate_cost_with_provider("auto", Some("unpriced:catpaw"), &usage),
             0.0
@@ -788,12 +853,12 @@ mod tests {
             json!(i64::MAX),
         ] {
             valid["promptTokens"] = invalid;
-            assert!(tokens(&valid).is_err());
+            assert!(tokens(&valid, None).is_err());
         }
-        assert!(tokens(&json!({})).is_err());
+        assert!(tokens(&json!({}), None).is_err());
         let mut bad = usage(1, 2, 3, 4);
         bad["totalTokens"] = json!(9);
-        assert!(tokens(&bad).is_err());
+        assert!(tokens(&bad, None).is_err());
         let dir = tempfile::tempdir().unwrap();
         let (path, conn) = database(dir.path(), Edition::Domestic, "account", 91);
         insert(&conn, 2, "good", usage(1, 0, 0, 1), Some(TIME));
