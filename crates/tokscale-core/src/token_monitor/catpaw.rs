@@ -7,7 +7,7 @@
 //! Usage is projected from `ui_sdk_messages` and model selection from
 //! `sessions`; no message body, title or credential is read. The usage buckets
 //! are disjoint: `promptTokens` is uncached input, `cacheReadTokens` and
-//! `cacheWriteTokens` are separate additive buckets, and their checked sum
+//! `cacheWriteTokens` are separate additive buckets, and their sum
 //! must match one of the recorded totals: `usage.totalTokens`, or the sibling
 //! `contextInfo.totalUsageTokens` on rows whose stored total predates
 //! cache-read accounting. Reasoning and 1-hour cache-write tokens are not
@@ -137,7 +137,6 @@ fn databases(root: &Path) -> io::Result<Vec<PathBuf>> {
             }
         }
     }
-    paths.sort();
     Ok(paths)
 }
 
@@ -278,15 +277,7 @@ fn tokens(usage: &Value, recorded_total: Option<i64>) -> Result<TokenBreakdown, 
         cache_write: count(usage, "cacheWriteTokens")?,
         ..Default::default()
     };
-    let total = [
-        tokens.input,
-        tokens.output,
-        tokens.cache_read,
-        tokens.cache_write,
-    ]
-    .into_iter()
-    .try_fold(0i64, |sum, n| sum.checked_add(n))
-    .ok_or("token sum overflow")?;
+    let total = tokens.total();
     if total != count(usage, "totalTokens")? && Some(total) != recorded_total {
         return Err("token sum differs from the recorded totals".into());
     }
@@ -612,40 +603,32 @@ mod tests {
 
     #[test]
     fn row_budget_rejects_an_over_limit_source_and_keeps_the_boundary_read() {
-        let bulk = |scope: &str, rows: usize| {
-            let dir = tempfile::tempdir().unwrap();
-            let (path, conn) = database(dir.path(), Edition::Domestic, scope, 91);
-            let payload =
-                json!({"content":"x","extra":{"contextInfo":{"usage":usage(1,0,0,1)}}}).to_string();
-            let mut stmt = conn
-                .prepare(
-                    "INSERT OR REPLACE INTO ui_sdk_messages VALUES('c',?1,?2,'assistant',?3,?4,?5,1)",
-                )
-                .unwrap();
-            conn.execute_batch("BEGIN").unwrap();
-            for seq in 0..rows as i64 {
-                stmt.execute(rusqlite::params![
-                    seq,
-                    format!("m{seq}"),
-                    payload,
-                    TIME,
-                    TIME + seq
-                ])
-                .unwrap();
-            }
-            conn.execute_batch("COMMIT").unwrap();
-            (path, dir)
-        };
-        let (boundary, _keep) = bulk("boundary", MAX_ROWS);
+        let dir = tempfile::tempdir().unwrap();
+        let (path, conn) = database(dir.path(), Edition::Domestic, "budget", 91);
+        conn.execute_batch("BEGIN").unwrap();
+        for seq in 0..MAX_ROWS as i64 {
+            insert(
+                &conn,
+                seq,
+                &format!("m{seq}"),
+                usage(1, 0, 0, 1),
+                Some(TIME),
+            );
+        }
+        conn.execute_batch("COMMIT").unwrap();
         assert_eq!(
-            read_db(&boundary, Edition::Domestic, "boundary")
-                .unwrap()
-                .len(),
+            read_db(&path, Edition::Domestic, "budget").unwrap().len(),
             MAX_ROWS
         );
-        let (over, _keep) = bulk("over", MAX_ROWS + 1);
+        insert(
+            &conn,
+            MAX_ROWS as i64,
+            "over-budget",
+            usage(1, 0, 0, 1),
+            Some(TIME),
+        );
         assert_eq!(
-            read_db(&over, Edition::Domestic, "over"),
+            read_db(&path, Edition::Domestic, "budget"),
             Err("row budget exceeded".into())
         );
     }
@@ -906,14 +889,16 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_scan_of_another_home_cannot_reuse_this_homes_cache() {
+    fn missing_roots_and_discovery_failures_keep_home_scoped_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("home-a");
         let second = dir.path().join("home-b");
         let cache = dir.path().join("shared-cache.json");
+        assert!(parse_support(&first, &cache).is_empty());
         let (_, conn) = database(&first, Edition::Domestic, "account", 91);
         insert(&conn, 2, "id", usage(1, 0, 0, 1), Some(TIME));
-        assert_eq!(parse_support(&first, &cache).len(), 1);
+        let good = parse_support(&first, &cache);
+        assert_eq!(good.len(), 1);
         drop(conn);
         std::fs::create_dir_all(&second).unwrap();
         std::fs::write(
@@ -926,23 +911,7 @@ mod tests {
         let root = first.join(Edition::Domestic.directory());
         std::fs::rename(&root, first.join("unavailable")).unwrap();
         std::fs::write(&root, b"not a directory").unwrap();
-        assert_eq!(parse_support(&first, &cache).len(), 1);
-    }
-
-    #[test]
-    fn missing_roots_are_empty_but_discovery_failures_keep_previous_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("cache.json");
-        assert!(parse_support(dir.path(), &cache).is_empty());
-        let (_, conn) = database(dir.path(), Edition::Domestic, "account", 91);
-        insert(&conn, 2, "id", usage(1, 0, 0, 1), Some(TIME));
-        drop(conn);
-        let good = parse_support(dir.path(), &cache);
-        let root = dir.path().join(Edition::Domestic.directory());
-        let moved = dir.path().join("unavailable");
-        std::fs::rename(&root, &moved).unwrap();
-        std::fs::write(&root, b"not a directory").unwrap();
-        assert_eq!(parse_support(dir.path(), &cache), good);
+        assert_eq!(parse_support(&first, &cache), good);
     }
 
     #[test]
