@@ -41,7 +41,7 @@ pub const CLIENT_ID: &str = "catpaw";
 const MAX_DBS: usize = 256;
 const MAX_ROWS: usize = 100_000;
 const MAX_BYTES: usize = 50 * 1024 * 1024;
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 
 #[derive(Clone, Copy)]
 enum Edition {
@@ -375,7 +375,8 @@ fn model(edition: Edition, extra: &Value) -> (String, bool) {
 const USAGE_SQL: &str = "
 SELECT m.conversation_id, m.message_id, m.created_at_ms, m.updated_at_ms,
        m.schema_version, json_extract(m.payload, '$.extra.contextInfo.usage'),
-       json_extract(m.payload, '$.extra.contextInfo.totalUsageTokens'),
+       CASE WHEN json_type(m.payload, '$.extra.contextInfo.totalUsageTokens') IN ('integer', 'real')
+            THEN json_extract(m.payload, '$.extra.contextInfo.totalUsageTokens') END,
        (SELECT json_object(
           'persistedModelId', json_extract(s.extra, '$.persistedModelId'),
           'persistedModelMode', json_extract(s.extra, '$.persistedModelMode'),
@@ -587,16 +588,26 @@ mod tests {
     fn a_sum_matching_neither_recorded_total_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let (path, conn) = database(dir.path(), Edition::Domestic, "mismatch", 91);
-        let bad = json!({"promptTokens":177,"cacheReadTokens":98944,"cacheWriteTokens":0,
-            "completionTokens":38,"totalTokens":999});
-        let payload = json!({"content":"x","extra":{"contextInfo":{
-            "usage":bad,"totalUsageTokens":1.5}}});
-        conn.execute(
-            "INSERT OR REPLACE INTO ui_sdk_messages VALUES('c',1,'bad','assistant',?1,?2,?3,1)",
-            rusqlite::params![payload.to_string(), TIME, TIME + 1],
-        )
-        .unwrap();
-        assert!(read_db(&path, Edition::Domestic, "mismatch").is_err());
+        let cache = dir.path().join("cache.json");
+        insert(&conn, 1, "good", usage(10, 0, 0, 0), Some(TIME));
+        let good = parse_support(dir.path(), &cache);
+        assert_eq!(good[0].tokens.total(), 10);
+        for (input, anchor) in [(177, json!(1.5)), (1, json!(true)), (0, json!(false))] {
+            let mut bad = usage(input, 0, 0, 0);
+            bad["totalTokens"] = json!(999);
+            let payload = json!({"content":"PRIVATE BODY","extra":{"contextInfo":{
+                "usage":bad,"totalUsageTokens":anchor}}});
+            conn.execute(
+                "INSERT OR REPLACE INTO ui_sdk_messages VALUES('c',1,'bad','assistant',?1,?2,?3,1)",
+                rusqlite::params![payload.to_string(), TIME, TIME + 1],
+            )
+            .unwrap();
+            assert!(
+                read_db(&path, Edition::Domestic, "mismatch").is_err(),
+                "anchor: {anchor}"
+            );
+            assert_eq!(parse_support(dir.path(), &cache), good);
+        }
     }
 
     #[test]
