@@ -23,6 +23,7 @@
 //! upstream lane runs as before, and the supplement runs wherever that lane
 //! does, filtered or not, so the id means the same data in every scan.
 
+mod codearts;
 mod js;
 mod mcode;
 mod proma;
@@ -41,6 +42,10 @@ struct Client {
 /// Every Token Monitor-owned client, in the order they are parsed. Adding a
 /// client is one entry here plus its module; no upstream file changes.
 const CLIENTS: &[Client] = &[
+    Client {
+        id: codearts::CLIENT_ID,
+        parse: codearts::parse,
+    },
     Client {
         id: proma::CLIENT_ID,
         parse: proma::parse,
