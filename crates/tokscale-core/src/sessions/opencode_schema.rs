@@ -336,6 +336,29 @@ impl OpenCodeSchemaConfig {
             ..Self::base("kilo")
         }
     }
+
+    /// CodeArts CLI (Huawei Cloud) stores its sessions in OpenCode's own
+    /// schema at `~/.codeartsdoer/codearts-data/opencode.db` — the same
+    /// `message` rows (`$.role`, `$.modelID`, `$.tokens`,
+    /// `$.time.created/completed` in milliseconds) and the same `session`
+    /// join (`directory`, `title`, `time_updated`). Both OpenCode query
+    /// groups are probed so a future CodeArts build that moves to v2
+    /// tables keeps working without a parser change. Two departures from
+    /// OpenCode's own policy: an assistant payload may omit `cache` (or
+    /// its read/write), which a strict requirement would drop; and epoch
+    /// seconds are scaled like MiMo's, because the store is young enough
+    /// that no build has committed to one unit. Zero embedded costs stay
+    /// unpriced (base), so tokscale keeps estimating.
+    pub(crate) const fn codearts() -> Self {
+        Self {
+            query_groups: OPENCODE_QUERY_GROUPS,
+            incremental_groups: Some(OPENCODE_INCREMENTAL_GROUPS),
+            dual_schema: true,
+            strict_cache: false,
+            normalize_epoch_seconds: true,
+            ..Self::base("codearts")
+        }
+    }
 }
 
 // =============================================================================
