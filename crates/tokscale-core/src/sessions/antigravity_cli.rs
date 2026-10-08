@@ -344,16 +344,18 @@ fn parse_gen_metadata(
         }
     }
 
-    // Root #2 names the exact steps.idx, independently of gen_metadata.idx.
+    // Preserve the explicit legacy generation clock when it is present: the
+    // linked step may start earlier, even on a different day. Modern records
+    // without it use root #2 -> steps.idx, independently of gen_metadata.idx.
     // Only an explicit generation/step clock can date a duration; inferred
     // clocks and session/mtime fallbacks remain available for untimed usage.
-    let generation_started_at = generation_step_idx(blob)
-        .and_then(|idx| ctx.step_timestamps.by_step_idx.get(&idx).copied())
+    let generation_started_at = message_field(chat_model, 9)
+        .and_then(|gen| message_field(gen, 4))
+        .and_then(proto_timestamp_ms)
+        .filter(|ms| *ms > 0)
         .or_else(|| {
-            message_field(chat_model, 9)
-                .and_then(|gen| message_field(gen, 4))
-                .and_then(proto_timestamp_ms)
-                .filter(|ms| *ms > 0)
+            generation_step_idx(blob)
+                .and_then(|idx| ctx.step_timestamps.by_step_idx.get(&idx).copied())
         })
         .or_else(|| {
             dedup_key
@@ -1332,7 +1334,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("step-index.db");
         let seconds = recent_epoch_seconds() as u64;
-        let mut scalar = timed_row(&enc_len(4, &enc_varint(1, seconds - 100)), "scalar");
+        let mut scalar = timed_row(&[], "scalar");
         scalar.extend(enc_varint(2, 0)); // Zero is a valid step index.
         let mut packed = timed_row(&[], "packed");
         packed.extend(enc_len(2, &encode_varint(37)));
@@ -1360,6 +1362,61 @@ mod tests {
             assert_eq!(messages[0].duration_ms, Some(2_000));
             assert_eq!(messages[1].duration_ms, Some(2_000));
             assert_eq!(messages[2].duration_ms, None);
+            assert!(messages.iter().all(|message| message.tokens.output == 300));
+        }
+    }
+
+    #[test]
+    fn legacy_generation_clock_keeps_its_day_when_step_clock_crosses_midnight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-step-clock.db");
+        let midnight = chrono::DateTime::parse_from_rfc3339("2026-09-18T00:00:00Z")
+            .unwrap()
+            .timestamp() as u64;
+        let mut next_day = timed_row(&enc_len(4, &enc_varint(1, midnight + 5)), "next-day");
+        next_day.extend(enc_varint(2, 37));
+        let mut previous_day = timed_row(&enc_len(4, &enc_varint(1, midnight - 5)), "previous-day");
+        previous_day.extend(enc_varint(2, 38));
+        let mut invalid_legacy = timed_row(
+            &enc_len(
+                4,
+                &[enc_varint(1, midnight), enc_varint(2, 1_000_000_000)].concat(),
+            ),
+            "invalid-legacy",
+        );
+        invalid_legacy.extend(enc_varint(2, 39));
+        write_conversation(&path, &[next_day, previous_day, invalid_legacy]);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
+            .unwrap();
+        for (idx, seconds) in [(37, midnight - 5), (38, midnight + 5), (39, midnight + 10)] {
+            conn.execute(
+                "INSERT INTO steps VALUES (?1, 15, ?2)",
+                params![idx, enc_len(1, &enc_varint(1, seconds))],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        for parse in [parse_antigravity_cli_file, parse_antigravity_extension_file] {
+            let messages = parse(&path);
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[0].timestamp, (midnight as i64 + 5) * 1_000);
+            assert_eq!(messages[1].timestamp, (midnight as i64 - 5) * 1_000);
+            assert_eq!(messages[2].timestamp, (midnight as i64 + 10) * 1_000);
+            let days: Vec<_> = messages
+                .iter()
+                .map(|message| {
+                    chrono::DateTime::from_timestamp_millis(message.timestamp)
+                        .unwrap()
+                        .date_naive()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(days, ["2026-09-18", "2026-09-17", "2026-09-18"]);
+            assert!(messages
+                .iter()
+                .all(|message| message.duration_ms == Some(2_000)));
             assert!(messages.iter().all(|message| message.tokens.output == 300));
         }
     }
