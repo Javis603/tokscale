@@ -65,10 +65,11 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::time::Duration;
 
 /// Bump when parsing behavior for Antigravity generation databases changes.
 /// The CLI and IDE extension clients share this parser and cache generation.
-pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 1;
+pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 2;
 
 /// Parse an Antigravity CLI conversation database.
 pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
@@ -84,6 +85,11 @@ fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMe
     let Some(conn) = open_readonly_sqlite_opt(path) else {
         return Vec::new();
     };
+    if conn.busy_timeout(Duration::from_millis(100)).is_err()
+        || conn.execute_batch("BEGIN").is_err()
+    {
+        return Vec::new();
+    }
 
     let session_id = path
         .file_stem()
@@ -101,7 +107,7 @@ fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMe
     // Quiet: a database without `gen_metadata` is not an Antigravity generation
     // database at all, so there is nothing to warn about.
     let mut rows: Vec<(Option<i64>, Vec<u8>)> = Vec::new();
-    sqlite_for_each_row_on(
+    let scan = sqlite_for_each_row_on(
         &conn,
         path,
         "SELECT idx, data FROM gen_metadata ORDER BY idx",
@@ -113,6 +119,9 @@ fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMe
             Ok(())
         },
     );
+    if !scan.completed() {
+        return Vec::new();
+    }
     let session_models = SessionModels::from_blobs(rows.iter().map(|(_, blob)| blob.as_slice()));
     let ctx = GenContext {
         client,
@@ -335,20 +344,30 @@ fn parse_gen_metadata(
         }
     }
 
-    // Per-generation wall-clock time for this turn:
-    // 1. In pre-1.1.18 databases, `chatModel.#9.#4` carried an explicit timestamp.
-    // 2. In modern agy versions (1.1.18+), `#9.#10` carries prompt cache metadata,
-    //    so `generation_timestamp_ms` returns None. Look up the matching turn in `steps.metadata`
-    //    by responseId (`dedup_key`) or generation index.
-    // 3. Falls back to `session_timestamp` when no candidate decodes.
-    let timestamp = message_field(chat_model, 9)
-        .and_then(|gen| generation_timestamp_ms(gen, ctx.session_anchor))
+    // Preserve the explicit legacy generation clock when it is present: the
+    // linked step may start earlier, even on a different day. Modern records
+    // without it use root #2 -> steps.idx, independently of gen_metadata.idx.
+    // Only an explicit generation/step clock can date a duration; inferred
+    // clocks and session/mtime fallbacks remain available for untimed usage.
+    let generation_started_at = message_field(chat_model, 9)
+        .and_then(|gen| message_field(gen, 4))
+        .and_then(proto_timestamp_ms)
+        .filter(|ms| *ms > 0)
+        .or_else(|| {
+            generation_step_idx(blob)
+                .and_then(|idx| ctx.step_timestamps.by_step_idx.get(&idx).copied())
+        })
         .or_else(|| {
             dedup_key
                 .as_deref()
                 .and_then(|id| ctx.step_timestamps.by_response_id.get(id).copied())
         })
-        .or_else(|| gen_idx.and_then(|idx| ctx.step_timestamps.by_gen_idx.get(&idx).copied()))
+        .or_else(|| gen_idx.and_then(|idx| ctx.step_timestamps.by_gen_idx.get(&idx).copied()));
+    let timestamp = generation_started_at
+        .or_else(|| {
+            message_field(chat_model, 9)
+                .and_then(|gen| generation_timestamp_ms(gen, ctx.session_anchor))
+        })
         .unwrap_or(ctx.session_timestamp);
 
     let response_model = non_empty_string_field(chat_model, 19);
@@ -371,7 +390,7 @@ fn parse_gen_metadata(
         .unwrap_or("antigravity")
         .to_string();
 
-    Some(UnifiedMessage::new_with_dedup(
+    let mut message = UnifiedMessage::new_with_dedup(
         ctx.client,
         model_id,
         provider_id,
@@ -387,7 +406,44 @@ fn parse_gen_metadata(
         },
         0.0,
         dedup_key,
-    ))
+    );
+    message.duration_ms = generation_started_at.and_then(|_| generation_duration_ms(chat_model));
+    Some(message)
+}
+
+fn generation_step_idx(blob: &[u8]) -> Option<i64> {
+    varint_field(blob, 2)
+        .or_else(|| {
+            message_field(blob, 2).and_then(|packed| ProtoReader::new(packed).read_varint())
+        })
+        .and_then(|idx| i64::try_from(idx).ok())
+}
+
+/// Full generation latency, including TTFT. Both duration components must be
+/// present; omitted zero-valued seconds/nanos within a component are valid.
+fn generation_duration_ms(chat_model: &[u8]) -> Option<i64> {
+    let nanos = proto_duration_ns(message_field(chat_model, 11)?)?
+        .checked_add(proto_duration_ns(message_field(chat_model, 12)?)?)?;
+    let ms = nanos / 1_000_000;
+    (ms > 0).then_some(ms)
+}
+
+fn proto_duration_ns(blob: &[u8]) -> Option<i64> {
+    let mut reader = ProtoReader::new(blob);
+    let mut seconds = 0_i64;
+    let mut nanos = 0_i64;
+    while reader.pos < blob.len() {
+        match reader.next_field()? {
+            (1, Wire::Varint(value)) => seconds = i64::try_from(value).ok()?,
+            (2, Wire::Varint(value)) => nanos = i64::try_from(value).ok()?,
+            (1 | 2, _) => return None,
+            _ => {}
+        }
+    }
+    if nanos >= 1_000_000_000 {
+        return None;
+    }
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
 /// Session-level facts read from the single `trajectory_metadata_blob` row.
@@ -457,6 +513,8 @@ fn session_created_ms(blob: &[u8]) -> Option<i64> {
 /// Per-turn timestamps recovered from the `steps` table.
 #[derive(Default)]
 struct StepTimestamps {
+    /// Root gen_metadata.#2 -> steps.idx -> epoch timestamp in milliseconds.
+    by_step_idx: HashMap<i64, i64>,
     /// `responseId` -> epoch timestamp in milliseconds.
     by_response_id: HashMap<String, i64>,
     /// 0-indexed generation index -> epoch timestamp in milliseconds.
@@ -465,7 +523,8 @@ struct StepTimestamps {
 
 /// Read per-step generation timestamps from the `steps` table.
 ///
-/// Antigravity CLI records generation turns in the `steps` table:
+/// Root `gen_metadata.#2` joins `steps.idx` for both native clients. Older
+/// Antigravity CLI databases also record generation turns in the `steps` table:
 /// - `step_type = 15` (PLANNER_RESPONSE / model turn)
 /// - `metadata.#1` is a protobuf Timestamp ({#1: seconds, #2: nanos})
 /// - `metadata.#9.#11` carries the exact same `responseId` string as `gen_metadata.chatModel.usage.#11`
@@ -476,15 +535,23 @@ struct StepTimestamps {
 /// (or generation index) restores the genuine per-turn execution time.
 fn read_step_timestamps(conn: &Connection, path: &Path) -> StepTimestamps {
     let mut timestamps = StepTimestamps::default();
-    sqlite_for_each_row_on(
+    let scan = sqlite_for_each_row_on(
         conn,
         path,
-        "SELECT metadata FROM steps WHERE step_type = 15 AND metadata IS NOT NULL",
+        "SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL",
         None,
         &mut |row| {
-            let blob: Vec<u8> = row.get(0)?;
+            let idx: Option<i64> = row.get(0)?;
+            let step_type: Option<i64> = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
             if let Some(ts_ms) = message_field(&blob, 1).and_then(proto_timestamp_ms) {
                 if ts_ms > 0 {
+                    if let Some(idx) = idx {
+                        timestamps.by_step_idx.insert(idx, ts_ms);
+                    }
+                    if step_type != Some(15) {
+                        return Ok(());
+                    }
                     if let Some(resp_id) = message_field(&blob, 9).and_then(|m| string_field(m, 11))
                     {
                         let resp_id = resp_id.trim();
@@ -504,7 +571,11 @@ fn read_step_timestamps(conn: &Connection, path: &Path) -> StepTimestamps {
             Ok(())
         },
     );
-    timestamps
+    if scan.completed() {
+        timestamps
+    } else {
+        StepTimestamps::default()
+    }
 }
 
 /// Per-generation wall-clock time from the `chatModel.#9` sub-message.
@@ -907,6 +978,9 @@ impl<'a> ProtoReader<'a> {
         loop {
             let byte = *self.buf.get(self.pos)?;
             self.pos += 1;
+            if shift == 63 && byte > 1 {
+                return None;
+            }
             result |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
                 return Some(result);
@@ -1174,6 +1248,225 @@ mod tests {
         blob.extend(enc_len(1, &workspace));
         blob.extend(enc_len(2, &created));
         blob
+    }
+
+    fn with_durations(blob: &[u8], first: &[u8], second: Option<&[u8]>) -> Vec<u8> {
+        let mut chat = message_field(blob, 1).unwrap().to_vec();
+        chat.extend(enc_len(11, first));
+        if let Some(second) = second {
+            chat.extend(enc_len(12, second));
+        }
+        enc_len(1, &chat)
+    }
+
+    fn timed_row(gen9: &[u8], response_id: &str) -> Vec<u8> {
+        let first = [enc_varint(1, 1), enc_varint(2, 250_000_000)].concat();
+        let second = enc_varint(2, 750_000_000);
+        with_durations(
+            &build_row_with_gen9(gen9, response_id),
+            &first,
+            Some(&second),
+        )
+    }
+
+    #[test]
+    fn generation_duration_includes_both_components_without_changing_tokens() {
+        let seconds = recent_epoch_seconds();
+        let timestamp = enc_varint(1, seconds as u64);
+        let gen9 = enc_len(4, &timestamp);
+        let row = with_durations(
+            &build_row(Some("gemini-3-flash-a"), None, "timed"),
+            &enc_varint(1, 1),
+            Some(&enc_varint(2, 500_000_000)),
+        );
+        let mut chat = message_field(&row, 1).unwrap().to_vec();
+        chat.extend(enc_len(9, &gen9));
+        let message = parse_isolated_row(&enc_len(1, &chat), "s", 1, &mut HashSet::new()).unwrap();
+        assert_eq!(message.duration_ms, Some(1_500));
+        assert_eq!(message.timestamp, seconds * 1_000);
+        assert_eq!(message.tokens.input, 1_632);
+        assert_eq!(message.tokens.cache_read, 16_000);
+        assert_eq!(message.tokens.output, 300);
+        assert_eq!(message.tokens.reasoning, 40);
+    }
+
+    #[test]
+    fn generation_duration_rejects_missing_invalid_and_overflowing_components() {
+        let zero = Vec::new();
+        let valid = enc_varint(1, 1);
+        let invalid = [
+            enc_varint(1, u64::MAX), // Negative protobuf int64.
+            enc_varint(2, u64::MAX), // Negative nanos.
+            enc_varint(2, 1_000_000_000),
+            enc_varint(1, i64::MAX as u64),
+            vec![0x08, 0x80],                                 // Truncated varint.
+            enc_len(1, &[]),                                  // Wrong wire type for seconds.
+            [vec![0x08], vec![0xff; 9], vec![0x02]].concat(), // u64 overflow.
+        ];
+        for component in &invalid {
+            let chat = [enc_len(11, component), enc_len(12, &valid)].concat();
+            assert_eq!(generation_duration_ms(&chat), None);
+        }
+        assert_eq!(generation_duration_ms(&enc_len(11, &valid)), None);
+        assert_eq!(generation_duration_ms(&enc_len(12, &valid)), None);
+        assert_eq!(
+            generation_duration_ms(&[enc_len(11, &zero), enc_len(12, &zero)].concat()),
+            None
+        );
+        let half_ms = enc_varint(2, 500_000);
+        assert_eq!(
+            generation_duration_ms(&[enc_len(11, &half_ms), enc_len(12, &half_ms)].concat()),
+            Some(1)
+        );
+        assert_eq!(
+            generation_duration_ms(&[enc_len(11, &half_ms), enc_len(12, &zero)].concat()),
+            None
+        );
+        let near_limit = [enc_varint(1, 9_223_372_036), enc_varint(2, 854_775_807)].concat();
+        assert_eq!(
+            generation_duration_ms(&[enc_len(11, &near_limit), enc_len(12, &valid)].concat()),
+            None
+        );
+    }
+
+    #[test]
+    fn modern_generation_joins_exact_step_index_for_both_native_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("step-index.db");
+        let seconds = recent_epoch_seconds() as u64;
+        let mut scalar = timed_row(&[], "scalar");
+        scalar.extend(enc_varint(2, 0)); // Zero is a valid step index.
+        let mut packed = timed_row(&[], "packed");
+        packed.extend(enc_len(2, &encode_varint(37)));
+        let mut missing = timed_row(&[], "missing");
+        missing.extend(enc_varint(2, 90));
+        write_conversation(&path, &[scalar, packed, missing]);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
+            .unwrap();
+        for (idx, step_type, timestamp) in [(0, 14, seconds), (37, 1, seconds + 10)] {
+            conn.execute(
+                "INSERT INTO steps VALUES (?1, ?2, ?3)",
+                params![idx, step_type, enc_len(1, &enc_varint(1, timestamp))],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO steps VALUES (90, 15, NULL)", [])
+            .unwrap();
+        drop(conn);
+        for parse in [parse_antigravity_cli_file, parse_antigravity_extension_file] {
+            let messages = parse(&path);
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[0].timestamp, seconds as i64 * 1_000);
+            assert_eq!(messages[1].timestamp, (seconds as i64 + 10) * 1_000);
+            assert_eq!(messages[0].duration_ms, Some(2_000));
+            assert_eq!(messages[1].duration_ms, Some(2_000));
+            assert_eq!(messages[2].duration_ms, None);
+            assert!(messages.iter().all(|message| message.tokens.output == 300));
+        }
+    }
+
+    #[test]
+    fn legacy_generation_clock_keeps_its_day_when_step_clock_crosses_midnight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-step-clock.db");
+        let midnight = chrono::DateTime::parse_from_rfc3339("2026-09-18T00:00:00Z")
+            .unwrap()
+            .timestamp() as u64;
+        let mut next_day = timed_row(&enc_len(4, &enc_varint(1, midnight + 5)), "next-day");
+        next_day.extend(enc_varint(2, 37));
+        let mut previous_day = timed_row(&enc_len(4, &enc_varint(1, midnight - 5)), "previous-day");
+        previous_day.extend(enc_varint(2, 38));
+        let mut invalid_legacy = timed_row(
+            &enc_len(
+                4,
+                &[enc_varint(1, midnight), enc_varint(2, 1_000_000_000)].concat(),
+            ),
+            "invalid-legacy",
+        );
+        invalid_legacy.extend(enc_varint(2, 39));
+        write_conversation(&path, &[next_day, previous_day, invalid_legacy]);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
+            .unwrap();
+        for (idx, seconds) in [(37, midnight - 5), (38, midnight + 5), (39, midnight + 10)] {
+            conn.execute(
+                "INSERT INTO steps VALUES (?1, 15, ?2)",
+                params![idx, enc_len(1, &enc_varint(1, seconds))],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        for parse in [parse_antigravity_cli_file, parse_antigravity_extension_file] {
+            let messages = parse(&path);
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[0].timestamp, (midnight as i64 + 5) * 1_000);
+            assert_eq!(messages[1].timestamp, (midnight as i64 - 5) * 1_000);
+            assert_eq!(messages[2].timestamp, (midnight as i64 + 10) * 1_000);
+            let days: Vec<_> = messages
+                .iter()
+                .map(|message| {
+                    chrono::DateTime::from_timestamp_millis(message.timestamp)
+                        .unwrap()
+                        .date_naive()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(days, ["2026-09-18", "2026-09-17", "2026-09-18"]);
+            assert!(messages
+                .iter()
+                .all(|message| message.duration_ms == Some(2_000)));
+            assert!(messages.iter().all(|message| message.tokens.output == 300));
+        }
+    }
+
+    #[test]
+    fn generation_duration_requires_a_generation_clock_not_session_or_mtime() {
+        let row = timed_row(&[], "no-clock");
+        let message = parse_isolated_row(
+            &row,
+            "s",
+            recent_epoch_seconds() * 1_000,
+            &mut HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(message.duration_ms, None);
+        assert_eq!(message.tokens.output, 300);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mtime-only.db");
+        write_conversation(&path, &[row]);
+        assert_eq!(parse_antigravity_extension_file(&path)[0].duration_ms, None);
+    }
+
+    #[test]
+    fn generation_reader_refreshes_wal_and_recovers_after_exclusive_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.db");
+        let gen9 = enc_len(4, &enc_varint(1, recent_epoch_seconds() as u64));
+        write_conversation(&path, &[timed_row(&gen9, "first")]);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        assert_eq!(parse_antigravity_extension_file(&path).len(), 1);
+        writer
+            .execute(
+                "INSERT INTO gen_metadata VALUES (1, ?1, 0)",
+                params![timed_row(&gen9, "second")],
+            )
+            .unwrap();
+        assert_eq!(parse_antigravity_extension_file(&path).len(), 2);
+        writer
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;",
+            )
+            .unwrap();
+        assert!(parse_antigravity_extension_file(&path).is_empty());
+        writer.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(parse_antigravity_extension_file(&path).len(), 2);
+        assert!(parse_antigravity_extension_file(&dir.path().join("absent.db")).is_empty());
+        assert!(!dir.path().join("absent.db").exists());
     }
 
     #[test]

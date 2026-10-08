@@ -7192,18 +7192,33 @@ fn parse_antigravity_family_messages(
 /// Deduplicate only response IDs within the Antigravity family. Missing IDs
 /// stay separate because identical token counts and timestamps are not proof
 /// that two independent generations are the same call.
+/// Native databases can supply timing missing from the earlier sync-cache
+/// copy, but only when the model and every token bucket agree.
 fn dedupe_antigravity_family_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
-    let mut seen_response_ids = HashSet::new();
-    messages
-        .into_iter()
-        .filter(|message| {
-            message
-                .dedup_key
-                .as_deref()
-                .filter(|key| !key.trim().is_empty())
-                .is_none_or(|key| seen_response_ids.insert(key.to_string()))
-        })
-        .collect()
+    let mut seen_response_ids: HashMap<String, usize> = HashMap::new();
+    let mut unique: Vec<UnifiedMessage> = Vec::new();
+    for message in messages {
+        if let Some(key) = message
+            .dedup_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            if let Some(&idx) = seen_response_ids.get(key) {
+                let existing = &mut unique[idx];
+                if existing.duration_ms.is_none_or(|duration| duration <= 0)
+                    && message.duration_ms.is_some_and(|duration| duration > 0)
+                    && existing.model_id == message.model_id
+                    && existing.tokens == message.tokens
+                {
+                    existing.duration_ms = message.duration_ms;
+                }
+                continue;
+            }
+            seen_response_ids.insert(key.to_string(), unique.len());
+        }
+        unique.push(message);
+    }
+    unique
 }
 
 fn summed_parsed_message_count(messages: &[ParsedMessage]) -> i32 {
@@ -7352,6 +7367,65 @@ mod tests {
         assert_eq!(daily[0].totals.tokens, 146);
         assert_eq!(daily[0].token_breakdown.input, 120);
         assert_eq!(daily[0].token_breakdown.output, 26);
+    }
+
+    #[test]
+    fn antigravity_dedup_enriches_matching_cache_copy_without_replacing_usage() {
+        let cached = UnifiedMessage::new_with_dedup(
+            "antigravity",
+            "gemini-3-flash",
+            "google",
+            "cache-session",
+            1_781_502_653_000,
+            TokenBreakdown {
+                input: 100,
+                output: 20,
+                reasoning: 10,
+                ..Default::default()
+            },
+            0.25,
+            Some("response".to_string()),
+        );
+        let mut native = cached.clone();
+        native.client = "antigravity-extension".to_string();
+        native.session_id = "native-session".to_string();
+        native.cost = 0.0;
+        native.duration_ms = Some(2_000);
+        let unique = dedupe_antigravity_family_messages(vec![cached.clone(), native.clone()]);
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0].client, cached.client);
+        assert_eq!(unique[0].session_id, cached.session_id);
+        assert_eq!(unique[0].cost, cached.cost);
+        assert_eq!(unique[0].tokens, cached.tokens);
+        assert_eq!(unique[0].duration_ms, Some(2_000));
+        let entries = aggregate_model_usage_entries(unique, &GroupBy::default());
+        assert_eq!(entries[0].performance.total_duration_ms, 2_000);
+        assert_eq!(entries[0].performance.timed_tokens, 130);
+        assert_eq!(entries[0].performance.token_coverage, 1.0);
+
+        let mut mismatch = native.clone();
+        mismatch.tokens.reasoning += 1;
+        assert_eq!(
+            dedupe_antigravity_family_messages(vec![cached.clone(), mismatch])[0].duration_ms,
+            None
+        );
+        let mut mismatch = native.clone();
+        mismatch.model_id = "another-model".to_string();
+        assert_eq!(
+            dedupe_antigravity_family_messages(vec![cached.clone(), mismatch])[0].duration_ms,
+            None
+        );
+        let mut already_timed = cached.clone();
+        already_timed.duration_ms = Some(1_000);
+        assert_eq!(
+            dedupe_antigravity_family_messages(vec![already_timed, native.clone()])[0].duration_ms,
+            Some(1_000)
+        );
+        let mut without_id = native;
+        without_id.dedup_key = None;
+        let unique = dedupe_antigravity_family_messages(vec![cached, without_id]);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0].duration_ms, None);
     }
 
     #[test]
