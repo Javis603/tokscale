@@ -377,7 +377,7 @@ SELECT m.conversation_id, m.message_id, m.created_at_ms, m.updated_at_ms,
           'initialModelSelection', json_extract(s.extra, '$.initialModelSelection'))
         FROM sessions s WHERE s.conversation_id = m.conversation_id LIMIT 1)
 FROM ui_sdk_messages m
-WHERE m.role = 'assistant' AND json_type(m.payload, '$.extra.contextInfo.usage') IS NOT NULL
+WHERE m.role = 'assistant' AND json_type(m.payload, '$.extra.contextInfo.usage') <> 'null'
 ORDER BY m.updated_at_ms, m.seq LIMIT ?1";
 
 const USAGE_ROW_LIMIT: i64 = (MAX_ROWS + 1) as i64;
@@ -727,6 +727,7 @@ mod tests {
             [TIME],
         )
         .unwrap();
+        insert(&cn, 22, "null-usage", Value::Null, Some(TIME));
         let messages = parse_support(dir.path(), &dir.path().join("cache.json"));
         assert_eq!(messages.len(), 7);
         assert_eq!(
@@ -870,6 +871,7 @@ mod tests {
         insert(&conn, 2, "id", usage(10, 0, 0, 5), Some(TIME));
         assert_eq!(parse_support(dir.path(), &cache)[0].tokens.total(), 15);
         insert(&conn, 7, "id", usage(20, 0, 0, 5), Some(TIME));
+        insert(&conn, 9, "null-usage", Value::Null, Some(TIME));
         let fresh = parse_support(dir.path(), &cache);
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].tokens.total(), 25);
@@ -877,7 +879,8 @@ mod tests {
         assert_eq!(parse_support(dir.path(), &cache), fresh);
         conn.execute("DELETE FROM ui_sdk_messages WHERE message_id='bad'", [])
             .unwrap();
-        conn.execute("DELETE FROM ui_sdk_messages", []).unwrap();
+        conn.execute("DELETE FROM ui_sdk_messages WHERE message_id='id'", [])
+            .unwrap();
         assert!(parse_support(dir.path(), &cache).is_empty());
         insert(&conn, 2, "id", usage(30, 0, 0, 5), Some(TIME));
         let good = parse_support(dir.path(), &cache);
