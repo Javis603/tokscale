@@ -23,6 +23,7 @@
 //! upstream lane runs as before, and the supplement runs wherever that lane
 //! does, filtered or not, so the id means the same data in every scan.
 
+mod catpaw;
 mod js;
 mod mcode;
 mod proma;
@@ -35,19 +36,23 @@ use std::collections::HashMap;
 /// A Token Monitor-owned client: its `--client` id and its parser.
 struct Client {
     id: &'static str,
-    parse: fn(&str) -> Vec<UnifiedMessage>,
+    parse: fn(&Scope) -> Vec<UnifiedMessage>,
 }
 
 /// Every Token Monitor-owned client, in the order they are parsed. Adding a
 /// client is one entry here plus its module; no upstream file changes.
 const CLIENTS: &[Client] = &[
     Client {
+        id: catpaw::CLIENT_ID,
+        parse: catpaw::parse,
+    },
+    Client {
         id: proma::CLIENT_ID,
-        parse: proma::parse,
+        parse: |scope| proma::parse(scope.home_dir),
     },
     Client {
         id: qodercn::CLIENT_ID,
-        parse: qodercn::parse,
+        parse: |scope| qodercn::parse(scope.home_dir),
     },
 ];
 
@@ -87,8 +92,8 @@ impl Counted {
     }
 }
 
-/// What a supplement sees of the scan it extends: the home, the env-root
-/// strategy, and what the upstream lane already counted.
+/// Scan scope for owned clients and supplements: the home and env-root strategy,
+/// plus upstream counts for supplements that must avoid counting a turn twice.
 pub struct Scope<'a> {
     pub home_dir: &'a str,
     pub use_env_roots: bool,
@@ -130,7 +135,7 @@ fn requested_supplements<'a>(
 
 fn parse_requested(clients: &[String], scope: &Scope) -> Vec<UnifiedMessage> {
     requested(clients)
-        .flat_map(|client| (client.parse)(scope.home_dir))
+        .flat_map(|client| (client.parse)(scope))
         .chain(requested_supplements(clients).flat_map(|supplement| (supplement.parse)(scope)))
         .collect()
 }
