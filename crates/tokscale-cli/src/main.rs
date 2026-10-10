@@ -4272,6 +4272,12 @@ fn aggregate_model_report_performance(
         performance.timed_tokens = performance
             .timed_tokens
             .saturating_add(entry.performance.timed_tokens);
+        performance.timed_output_tokens = performance
+            .timed_output_tokens
+            .saturating_add(entry.performance.timed_output_tokens);
+        performance.timed_reasoning_tokens = performance
+            .timed_reasoning_tokens
+            .saturating_add(entry.performance.timed_reasoning_tokens);
         performance.sample_count = performance
             .sample_count
             .saturating_add(entry.performance.sample_count);
@@ -7679,10 +7685,22 @@ mod tests {
             cost: 0.0,
             performance: tokscale_core::ModelPerformance::default(),
         };
-        let entries = vec![make(), make()];
+        let mut first = make();
+        first.performance.record_token_breakdown(
+            &tokscale_core::TokenBreakdown {
+                output: i64::MAX,
+                reasoning: 20,
+                ..Default::default()
+            },
+            Some(1000),
+        );
+        let entries = vec![first.clone(), first];
         // Must not panic (debug overflow) — the saturating fold caps at i64::MAX.
         let performance = aggregate_model_report_performance(&entries);
-        assert_eq!(performance.timed_tokens, 0);
+        assert_eq!(performance.timed_tokens, i64::MAX);
+        assert_eq!(performance.timed_output_tokens, i64::MAX);
+        assert_eq!(performance.timed_reasoning_tokens, 40);
+        assert_eq!(performance.total_duration_ms, 2000);
     }
 
     #[test]

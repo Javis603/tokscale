@@ -4090,6 +4090,62 @@ fn test_models_json_output() {
 }
 
 #[test]
+fn test_models_json_mixed_timing_keeps_exact_output_and_reasoning_subtotals() {
+    let tmp = TempDir::new().unwrap();
+    prime_pricing_cache(tmp.path());
+    let messages = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/mixed");
+    fs::create_dir_all(&messages).unwrap();
+    for (id, reasoning, completed) in [("timed", 20, Some(1718452801000i64)), ("untimed", 80, None)]
+    {
+        let mut time = serde_json::json!({"created": 1718452800000i64});
+        if let Some(completed) = completed {
+            time["completed"] = completed.into();
+        }
+        let message = serde_json::json!({
+            "id": id, "sessionID": "mixed", "role": "assistant",
+            "modelID": "gpt-4o", "providerID": "openai", "cost": 0.1,
+            "tokens": {"input": 0, "output": 100, "reasoning": reasoning, "cache": {"read": 0, "write": 0}},
+            "time": time
+        });
+        fs::write(
+            messages.join(format!("{id}.json")),
+            serde_json::to_vec(&message).unwrap(),
+        )
+        .unwrap();
+    }
+    // Both production grouping and the compatibility fallback, cold then warm cache.
+    for grouping in ["client,workspace,session,model", "client,session,model"] {
+        for _ in 0..2 {
+            let output = cmd_with_home(tmp.path())
+                .args([
+                    "--json",
+                    "--client",
+                    "opencode",
+                    "--no-spinner",
+                    "--group-by",
+                    grouping,
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let entries = report["entries"].as_array().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["output"], 200);
+            assert_eq!(entries[0]["reasoning"], 100);
+            let performance = &entries[0]["performance"];
+            assert_eq!(performance["timedOutputTokens"], 100);
+            assert_eq!(performance["timedReasoningTokens"], 20);
+            assert_eq!(performance["totalDurationMs"], 1000);
+            assert_eq!(performance["timedTokens"], 120);
+            assert_eq!(performance["sampleCount"], 1);
+        }
+    }
+}
+
+#[test]
 fn test_models_json_offline_without_pricing_cache_still_succeeds() {
     let tmp = create_temp_fixture_dir_without_pricing_cache();
     let output = offline_cmd_with_home(tmp.path())
