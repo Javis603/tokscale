@@ -2957,9 +2957,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             }
         }
         for mut message in rollout_messages {
-            if let Some(session_id) = mirrored_thread_sessions.get(&message.session_id).cloned() {
-                message.session_id = session_id;
-            }
+            adopt_openclaw_mirror_session(&mut message, &mirrored_thread_sessions);
             if should_keep_deduped_message(&mut openclaw_seen, &message) {
                 all_messages.push(message);
             }
@@ -4318,6 +4316,27 @@ fn workspace_metadata_for_entries(
 /// Rolls the already-filtered messages up into one [`SessionMeta`] per
 /// `(client, session_id)`.
 ///
+/// Key an OpenClaw-owned Codex rollout row by the OpenClaw session that
+/// mirrored its thread, when one did. The parent link of a subagent thread
+/// names a Codex thread id the same way the row's own session id does, so it
+/// moves through the same map; otherwise a child would point at a thread id
+/// that no longer keys its parent's rows.
+fn adopt_openclaw_mirror_session(
+    message: &mut UnifiedMessage,
+    mirrored_thread_sessions: &HashMap<String, String>,
+) {
+    if let Some(session_id) = mirrored_thread_sessions.get(&message.session_id) {
+        message.session_id = session_id.clone();
+    }
+    if let Some(parent) = message
+        .parent_session_id
+        .as_deref()
+        .and_then(|parent| mirrored_thread_sessions.get(parent))
+    {
+        message.parent_session_id = Some(parent.clone());
+    }
+}
+
 /// The thread id a Codex rollout session id belongs to, and whether the file is
 /// a paginated continuation (`rollout-<time>-<thread>_<segment>`) of that
 /// thread rather than its first file.
@@ -6352,9 +6371,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
             }
         }
         for mut message in rollout_messages {
-            if let Some(session_id) = mirrored_thread_sessions.get(&message.session_id).cloned() {
-                message.session_id = session_id;
-            }
+            adopt_openclaw_mirror_session(&mut message, &mirrored_thread_sessions);
             if should_keep_deduped_message(&mut seen, &message) {
                 kept.push(message);
             }

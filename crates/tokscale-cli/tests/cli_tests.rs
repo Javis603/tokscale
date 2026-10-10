@@ -3227,6 +3227,192 @@ fn test_codex_subagent_parent_link_follows_date_filter_cold_and_warm_cache() {
     }
 }
 
+const OPENCLAW_PARENT_THREAD: &str = "0192f3a4-5b6c-7d8e-9f01-23456789abcd";
+const OPENCLAW_CHILD_THREAD: &str = "0192f3a5-0000-7000-8000-00000000cccc";
+const OPENCLAW_VISIBLE_SESSION: &str = "openclaw-visible-session";
+
+/// OpenClaw driving a Codex thread that spawned a subagent. Codex stamps both
+/// rollouts with OpenClaw's originator (a spawned thread inherits it), and
+/// OpenClaw mirrors the parent's turn into its own session, keyed by the
+/// Codex thread through `codex-app-server:<thread>:<turn>`. `codex_home` is
+/// where Codex wrote the rollouts: the user's own `~/.codex` or the agent's
+/// `codex-home`. The parent turn is 100/30 input/output, the child's 41/13.
+fn write_openclaw_codex_parent_with_subagent(base: &Path, codex_home: &Path) {
+    let rollout = |thread: &str, source: &str, turn: &str, minute: u32, usage: (i64, i64)| {
+        format!(
+            concat!(
+                r#"{{"timestamp":"2026-10-10T10:{m:02}:00Z","type":"session_meta","payload":{{"id":"{thread}","originator":"openclaw","source":{source},"model_provider":"openai","cwd":"/repo"}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-10-10T10:{m:02}:01Z","type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn}"}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-10-10T10:{m:02}:01Z","type":"turn_context","payload":{{"turn_id":"{turn}","model":"gpt-5.2-codex"}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-10-10T10:{m:02}:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{i},"output_tokens":{o}}},"last_token_usage":{{"input_tokens":{i},"output_tokens":{o}}}}}}}}}"#,
+                "\n"
+            ),
+            m = minute,
+            thread = thread,
+            source = source,
+            turn = turn,
+            i = usage.0,
+            o = usage.1,
+        )
+    };
+    let sessions = codex_home.join("sessions/2026/10/10");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join(format!(
+            "rollout-2026-10-10T10-00-00-{OPENCLAW_PARENT_THREAD}.jsonl"
+        )),
+        rollout(OPENCLAW_PARENT_THREAD, r#""cli""#, "turn-1", 0, (100, 30)),
+    )
+    .unwrap();
+    fs::write(
+        sessions.join(format!(
+            "rollout-2026-10-10T10-05-00-{OPENCLAW_CHILD_THREAD}.jsonl"
+        )),
+        rollout(
+            OPENCLAW_CHILD_THREAD,
+            &format!(
+                r#"{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{OPENCLAW_PARENT_THREAD}","depth":1}}}}}}"#
+            ),
+            "turn-c1",
+            5,
+            (41, 13),
+        ),
+    )
+    .unwrap();
+
+    let db_path = base.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session_windows (
+          session_id TEXT NOT NULL PRIMARY KEY, session_key TEXT NOT NULL,
+          previous_session_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+          model_provider TEXT, model TEXT, agent_harness_id TEXT
+        ) STRICT;
+        CREATE TABLE transcript_events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq)
+        ) STRICT;
+        CREATE TABLE transcript_event_identities (
+          session_id TEXT NOT NULL, event_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          event_type TEXT, parent_id TEXT, message_idempotency_key TEXT,
+          created_at INTEGER NOT NULL, PRIMARY KEY (session_id, event_id)
+        ) STRICT;
+        "#,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_windows VALUES (?1, ?2, NULL, 1791626400000, 1791626400000, 'openai', 'gpt-5.2-codex', 'codex')",
+        rusqlite::params![OPENCLAW_VISIBLE_SESSION, format!("agent:main:{OPENCLAW_VISIBLE_SESSION}")],
+    )
+    .unwrap();
+    let header = format!(
+        r#"{{"type":"session","version":3,"id":"{OPENCLAW_VISIBLE_SESSION}","timestamp":"2026-10-10T10:00:00.000Z","cwd":"/repo"}}"#
+    );
+    let mirror = format!(
+        r#"{{"type":"message","id":"m1","parentId":"u1","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}],"api":"openai-chatgpt-responses","provider":"openai","model":"gpt-5.2-codex","usage":{{"input":100,"output":30,"cacheRead":0,"cacheWrite":0,"totalTokens":130,"cost":{{"total":0}}}},"idempotencyKey":"codex-app-server:{OPENCLAW_PARENT_THREAD}:turn-1:assistant","__openclaw":{{"mirrorOrigin":"codex-app-server","mirrorIdentity":"turn-1:assistant"}},"stopReason":"stop","timestamp":1791626402000}}}}"#
+    );
+    for (seq, event) in [header, mirror].iter().enumerate() {
+        conn.execute(
+            "INSERT INTO transcript_events VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                OPENCLAW_VISIBLE_SESSION,
+                seq as i64,
+                event,
+                1_791_626_400_000_i64 + seq as i64
+            ],
+        )
+        .unwrap();
+    }
+}
+
+/// An OpenClaw-owned Codex subagent must link to the OpenClaw session its
+/// parent's rows are keyed by, not to the parent's Codex thread id, whether
+/// Codex wrote the rollouts into the user's `~/.codex` or the agent's own
+/// `codex-home`. Cold and warm cache agree, and the mirror never counts beside
+/// the rollout it stands in for.
+#[test]
+fn test_openclaw_codex_subagent_links_to_the_mirroring_session_cold_and_warm_cache() {
+    for layout in ["user codex home", "agent codex-home"] {
+        let tmp = create_empty_fixture_dir();
+        let codex_home = if layout == "user codex home" {
+            tmp.path().join(".codex")
+        } else {
+            tmp.path().join(".openclaw/agents/main/agent/codex-home")
+        };
+        write_openclaw_codex_parent_with_subagent(tmp.path(), &codex_home);
+
+        for pass in ["cold", "warm"] {
+            let output = cmd_with_home(tmp.path())
+                .args([
+                    "models",
+                    "--json",
+                    "--client",
+                    "codex,openclaw",
+                    "--no-spinner",
+                ])
+                .args(["--group-by", "client,workspace,session,model"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{layout}, {pass}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let mut rows: Vec<(String, String, i64, i64)> = json["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["client"].as_str().unwrap().to_string(),
+                        entry["sessionId"].as_str().unwrap().to_string(),
+                        entry["input"].as_i64().unwrap(),
+                        entry["output"].as_i64().unwrap(),
+                    )
+                })
+                .collect();
+            rows.sort();
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        "openclaw".to_string(),
+                        OPENCLAW_CHILD_THREAD.to_string(),
+                        41,
+                        13
+                    ),
+                    (
+                        "openclaw".to_string(),
+                        OPENCLAW_VISIBLE_SESSION.to_string(),
+                        100,
+                        30
+                    ),
+                ],
+                "{layout}, {pass}"
+            );
+            let child = json["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|meta| meta["sessionId"] == OPENCLAW_CHILD_THREAD)
+                .unwrap();
+            assert_eq!(
+                child["parentSessionId"].as_str(),
+                Some(OPENCLAW_VISIBLE_SESSION),
+                "{layout}, {pass}: the link must name the session the parent's rows use"
+            );
+            assert_eq!(json["totalInput"].as_i64(), Some(141), "{layout}, {pass}");
+            assert_eq!(json["totalOutput"].as_i64(), Some(43), "{layout}, {pass}");
+        }
+    }
+}
+
 /// The lane's cross-file dedup pass, isolated from the seq boundary.
 ///
 /// Without `seedLength` in the header the parser cannot tell a seeded row from
