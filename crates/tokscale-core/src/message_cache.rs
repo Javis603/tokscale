@@ -1335,7 +1335,11 @@ fn parser_version(client: ClientId) -> u32 {
         // so it could land without another bump.
         // v10->v11: standalone `task_started` events reset duration anchors so
         // resumed turns cannot inherit the idle gap from a previous turn.
-        ClientId::Codex => 11,
+        // v11->v12 (Token Monitor fork): subagent and guardian threads carry
+        // their parent thread id in `parent_session_id`, and the cached parse
+        // state gained `session_parent_thread_id`. A v11 entry would keep
+        // replaying those threads without a parent.
+        ClientId::Codex => 12,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -4336,16 +4340,17 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_parser_version_invalidates_v10_entries() {
+    fn test_codex_parser_version_invalidates_v11_entries() {
         // v6->v7 splits `reasoning_output_tokens` out of the Codex output
         // bucket, v7->v8 retags rollouts OpenClaw originated as openclaw, and
         // v8->v9 buckets agent attribution into "Codex" / "Codex Subagent" /
         // "Codex Guardian" / "Codex Headless" instead of the per-thread random
-        // nickname; v9->v10 retains service_tier for Fast mode pricing, and
-        // v10->v11 resets duration anchors at standalone task_started events.
-        // Each bump is what stops an existing cache from replaying the old
-        // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 11);
+        // nickname; v9->v10 retains service_tier for Fast mode pricing,
+        // v10->v11 resets duration anchors at standalone task_started events,
+        // and v11->v12 records the parent thread of subagent and guardian
+        // threads. Each bump is what stops an existing cache from replaying
+        // the old rows, so it has to be asserted rather than assumed.
+        assert_eq!(parser_version(ClientId::Codex), 12);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 

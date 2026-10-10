@@ -53,6 +53,10 @@ pub struct CodexEntry {
 pub struct CodexPayload {
     pub id: Option<String>,
     pub forked_from_id: Option<String>,
+    /// `session_meta` only: the thread that started this one. Guardian review
+    /// threads carry it at the top level (seen from at least 0.144), because
+    /// their `source.subagent.other` shape has no parent of its own.
+    pub parent_thread_id: Option<String>,
     /// `session_meta` only: the client that created the thread. Codex
     /// app-server stamps it from the `initialize` request's `clientInfo.name`,
     /// so a thread OpenClaw drove carries `"openclaw"` here.
@@ -298,6 +302,12 @@ pub(crate) struct CodexParseState {
     pub session_is_guardian: bool,
     pub session_id_from_meta: Option<String>,
     pub session_forked_from_id: Option<String>,
+    /// Thread id of the session that started this one, set only for threads
+    /// Codex started itself (subagents and guardian reviews). A human fork is
+    /// the user's own conversation and keeps `None`. First wins, so a later
+    /// `session_meta` from replayed or resumed history cannot repoint it.
+    #[serde(default)]
+    pub session_parent_thread_id: Option<String>,
     pub forked_child_session_id: Option<String>,
     pub forked_child_replay_session_id: Option<String>,
     pub session_provider: Option<String>,
@@ -701,16 +711,27 @@ fn parse_codex_reader<R: BufRead>(
                     if let Some(ref provider) = payload.model_provider {
                         state.session_provider = Some(provider.clone());
                     }
-                    if codex_thread_is_guardian(
+                    let meta_is_guardian = codex_thread_is_guardian(
                         payload.thread_source.as_deref(),
                         payload.source.as_ref(),
-                    ) {
+                    );
+                    let meta_is_subagent = !meta_is_guardian
+                        && codex_thread_is_subagent(
+                            payload.thread_source.as_deref(),
+                            payload.source.as_ref(),
+                        );
+                    if meta_is_guardian {
                         state.session_is_guardian = true;
-                    } else if codex_thread_is_subagent(
-                        payload.thread_source.as_deref(),
-                        payload.source.as_ref(),
-                    ) {
+                    } else if meta_is_subagent {
                         state.session_is_subagent = true;
+                    }
+                    // Only a metadata record that itself describes a thread
+                    // Codex started may name the parent; a replayed parent
+                    // record would otherwise point at the grandparent.
+                    if (meta_is_guardian || meta_is_subagent)
+                        && state.session_parent_thread_id.is_none()
+                    {
+                        state.session_parent_thread_id = codex_parent_thread_id(&payload);
                     }
                     // Codex's per-thread `agent_nickname` is a random alias
                     // (Popper, Dirac, …), not a role; bucket by thread kind
@@ -937,6 +958,9 @@ fn parse_codex_reader<R: BufRead>(
                         .clone()
                         .or_else(|| state.thread_service_tier.clone());
                     message.duration_ms = duration_ms;
+                    // The raw parent thread id; the report resolves it to the
+                    // parent's rollout session id once every file is parsed.
+                    message.parent_session_id = state.session_parent_thread_id.clone();
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under
                     // way: a `turn_context` without an id that comes later
@@ -1092,6 +1116,18 @@ fn codex_thread_is_guardian(thread_source: Option<&str>, source: Option<&Value>)
 /// model still stays out of the interactive bucket.
 fn codex_thread_is_subagent(thread_source: Option<&str>, source: Option<&Value>) -> bool {
     thread_source == Some("subagent") || source.and_then(|source| source.get("subagent")).is_some()
+}
+
+/// The thread that started a subagent or guardian thread, in the order Codex
+/// records it: the `thread_spawn` source, the top-level `parent_thread_id`
+/// guardian reviews carry, then the fork origin a spawned thread replays.
+fn codex_parent_thread_id(payload: &CodexPayload) -> Option<String> {
+    forked_from_id_from_source(payload.source.as_ref())
+        .or(payload.parent_thread_id.as_deref())
+        .or(payload.forked_from_id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 fn forked_from_id_from_source(source: Option<&Value>) -> Option<&str> {
@@ -2968,6 +3004,93 @@ mod tests {
         assert_eq!(agent.as_deref(), Some(CODEX_GUARDIAN_AGENT));
     }
 
+    fn single_turn_parent(session_meta_lines: &str) -> Option<String> {
+        let file = create_test_file(&format!(
+            "{session_meta_lines}\n{}\n{}\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        messages[0].parent_session_id.clone()
+    }
+
+    #[test]
+    fn test_guardian_thread_records_top_level_parent_thread() {
+        let parent = single_turn_parent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","session_id":"parent-thread","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review","model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(parent.as_deref(), Some("parent-thread"));
+    }
+
+    #[test]
+    fn test_spawned_thread_records_thread_spawn_parent() {
+        let parent = single_turn_parent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"child-thread","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-thread","depth":1,"agent_role":"worker"}}},"model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(parent.as_deref(), Some("parent-thread"));
+    }
+
+    #[test]
+    fn test_guardian_thread_without_parent_stays_unlinked() {
+        let parent = single_turn_parent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent","model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn test_interactive_thread_has_no_parent() {
+        let parent = single_turn_parent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"main-thread","source":"vscode","model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn test_later_session_meta_does_not_repoint_parent() {
+        // A guardian rollout can be followed by another thread's metadata; the
+        // first record that names a parent is the thread's own.
+        let parent = single_turn_parent(concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review","model_provider":"openai","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:00.500Z","type":"session_meta","payload":{"id":"parent-thread","source":{"subagent":{"thread_spawn":{"parent_thread_id":"grandparent-thread","depth":1}}},"model_provider":"openai","cwd":"/repo"}}"#,
+        ));
+
+        assert_eq!(parent.as_deref(), Some("parent-thread"));
+    }
+
+    #[test]
+    fn test_user_fork_has_no_parent() {
+        // A human fork is the user's own conversation, not work the parent
+        // delegated, so it must stay its own top-level session.
+        let file = create_test_file(concat!(
+            r#"{"timestamp":"2026-01-02T03:10:00.000Z","type":"session_meta","payload":{"id":"22222222-2222-7222-8222-222222222222","forked_from_id":"11111111-1111-7111-8111-111111111111","source":"vscode","thread_source":"user","model_provider":"openai","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-02T03:10:00.001Z","type":"session_meta","payload":{"id":"11111111-1111-7111-8111-111111111111","source":"vscode","thread_source":"user","model_provider":"openai","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-02T03:10:00.100Z","type":"turn_context","payload":{"turn_id":"11111111-3333-7333-8333-333333333333","model":"gpt-5.5","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-02T03:10:00.200Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"total_tokens":1100}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-02T03:10:30.100Z","type":"turn_context","payload":{"turn_id":"22222222-4444-7444-8444-444444444444","model":"gpt-5.5","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-02T03:10:31.100Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1250,"cached_input_tokens":450,"output_tokens":120,"total_tokens":1370},"last_token_usage":{"input_tokens":250,"cached_input_tokens":50,"output_tokens":20,"total_tokens":270}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].parent_session_id, None);
+    }
+
     #[test]
     fn test_forked_child_ignores_inherited_records_before_turn_context() {
         let file = create_test_file(concat!(
@@ -2993,6 +3116,12 @@ mod tests {
         assert_eq!(messages[0].model_id, "gpt-5.5");
         assert_eq!(messages[0].provider_id, "openai");
         assert_eq!(messages[0].agent.as_deref(), Some(CODEX_SUBAGENT_AGENT));
+        // The replayed parent record names no parent of its own and must not
+        // clear the child's link.
+        assert_eq!(
+            messages[0].parent_session_id.as_deref(),
+            Some("parent-session")
+        );
         assert_eq!(messages[0].workspace_key.as_deref(), Some("/repo-child"));
         assert_eq!(messages[0].tokens.input, 500);
         assert_eq!(messages[0].tokens.cache_read, 1000);

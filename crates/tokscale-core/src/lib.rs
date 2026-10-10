@@ -668,6 +668,16 @@ pub struct SessionMeta {
     /// the last. `0` when every message in the session lacked a usable one.
     pub first_active_ms: i64,
     pub last_active_ms: i64,
+    /// The session that started this one, when the source records it: an OMP
+    /// subagent's parent, or the parent of a Codex subagent or guardian thread
+    /// (the parent's rollout session id once resolved, its bare thread id when
+    /// the parent was not parsed). `None` for top-level sessions and for
+    /// human forks, which are the user's own conversations.
+    pub parent_session_id: Option<String>,
+    /// The agent label every message in the session shares, e.g. "Codex
+    /// Subagent". `None` when the parser records none or the session mixes
+    /// agents, as Claude Code does by folding its subagents into the parent.
+    pub agent: Option<String>,
 }
 
 /// The real filesystem path behind a workspace key, resolved once per key.
@@ -1134,6 +1144,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         clients,
         timezone.is_pinned().then_some(&timezone),
     );
+    resolve_codex_parent_session_ids(&mut messages);
     // Reconcile recovery against source costs first, then apply current rates.
     // Overrides never enter source caches, so removing them restores the source.
     for message in &mut messages {
@@ -4308,6 +4319,68 @@ fn workspace_metadata_for_entries(
 /// Rolls the already-filtered messages up into one [`SessionMeta`] per
 /// `(client, session_id)`.
 ///
+/// The thread id a Codex rollout session id belongs to, and whether the file is
+/// a paginated continuation (`rollout-<time>-<thread>_<segment>`) of that
+/// thread rather than its first file.
+fn codex_rollout_thread_id(session_id: &str) -> Option<(&str, bool)> {
+    // `rollout-` plus a `YYYY-MM-DDTHH-MM-SS-` stamp precedes the thread id.
+    let rest = session_id.strip_prefix("rollout-")?.get(20..)?;
+    let (thread, continuation) = match rest.split_once('_') {
+        Some((thread, _)) => (thread, true),
+        None => (rest, false),
+    };
+    (!thread.is_empty()).then_some((thread, continuation))
+}
+
+/// Point Codex subagent and guardian rows at their parent's session id.
+///
+/// The parser can name a parent only by thread id, while Codex rows are keyed
+/// by rollout file stem. Once every file is parsed, a parent thread id that
+/// matches a parsed rollout becomes that rollout's session id, preferring the
+/// thread's first file over its continuations, so the link joins the same
+/// `(client, session_id)` key the parent's own rows use. A parent that was not
+/// parsed keeps its thread id. Usage is untouched: only the link moves.
+fn resolve_codex_parent_session_ids(messages: &mut [UnifiedMessage]) {
+    if !messages
+        .iter()
+        .any(|message| message.client == "codex" && message.parent_session_id.is_some())
+    {
+        return;
+    }
+    let mut by_thread: HashMap<String, (String, bool)> = HashMap::new();
+    for message in messages.iter().filter(|message| message.client == "codex") {
+        let Some((thread, continuation)) = codex_rollout_thread_id(&message.session_id) else {
+            continue;
+        };
+        let replace = match by_thread.get(thread) {
+            None => true,
+            Some((existing, existing_continuation)) => {
+                (*existing_continuation, existing.as_str())
+                    > (continuation, message.session_id.as_str())
+            }
+        };
+        if replace {
+            by_thread.insert(
+                thread.to_string(),
+                (message.session_id.clone(), continuation),
+            );
+        }
+    }
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.client == "codex")
+    {
+        let Some(parent) = message.parent_session_id.as_deref() else {
+            continue;
+        };
+        if let Some((session_id, _)) = by_thread.get(parent) {
+            if *session_id != message.session_id {
+                message.parent_session_id = Some(session_id.clone());
+            }
+        }
+    }
+}
+
 /// Mirrors the TUI's Sessions rollup: messages without a session id are skipped
 /// rather than lumped into one bogus row, `0` timestamps are treated as "no
 /// timestamp" instead of as the epoch, and the first non-empty title wins.
@@ -4315,23 +4388,47 @@ fn workspace_metadata_for_entries(
 fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     let mut sessions: Vec<SessionMeta> = Vec::new();
+    // Per session: whether two messages disagreed on the agent label.
+    let mut mixed_agents: Vec<bool> = Vec::new();
 
     for msg in messages {
         if msg.session_id.is_empty() {
             continue;
         }
+        let agent = msg
+            .agent
+            .as_deref()
+            .filter(|agent| !agent.trim().is_empty());
         let key = (msg.client.clone(), msg.session_id.clone());
+        let mut created = false;
         let position = *index.entry(key).or_insert_with(|| {
+            created = true;
             sessions.push(SessionMeta {
                 client: msg.client.clone(),
                 session_id: msg.session_id.clone(),
                 title: None,
                 first_active_ms: 0,
                 last_active_ms: 0,
+                parent_session_id: None,
+                agent: agent.map(str::to_string),
             });
+            mixed_agents.push(false);
             sessions.len() - 1
         });
         let entry = &mut sessions[position];
+
+        if !created && !mixed_agents[position] && entry.agent.as_deref() != agent {
+            mixed_agents[position] = true;
+            entry.agent = None;
+        }
+
+        if entry.parent_session_id.is_none() {
+            if let Some(parent) = msg.parent_session_id.as_deref() {
+                if !parent.trim().is_empty() && parent != msg.session_id {
+                    entry.parent_session_id = Some(parent.to_string());
+                }
+            }
+        }
 
         if entry.title.is_none() {
             if let Some(title) = msg.session_title.as_deref() {
@@ -7309,7 +7406,10 @@ mod tests {
     // is edited by nearly every PR that touches this file, and sharing it made
     // this branch conflict on every single upstream merge.
     use super::{aggregate_model_usage_entries_with_rollup, WorktreeRollup};
-    use super::{aggregate_session_metadata, workspace_metadata_for_entries, WorkspaceLabeler};
+    use super::{
+        aggregate_session_metadata, resolve_codex_parent_session_ids,
+        workspace_metadata_for_entries, WorkspaceLabeler,
+    };
     use super::{
         apply_custom_pricing_if_available, parse_all_messages_streaming_with_env_strategy,
         parse_all_messages_with_pricing_with_env_strategy_and_window, CostSource,
@@ -8193,6 +8293,88 @@ mod tests {
         assert_eq!(second.first_active_ms, 0, "no timestamp stays unknown");
         assert_eq!(second.last_active_ms, 0);
         assert_eq!(second.title, None);
+    }
+
+    #[test]
+    fn session_metadata_carries_the_parent_link_and_a_shared_agent() {
+        let with = |session_id: &str, agent: Option<&str>, parent: Option<&str>| {
+            let mut msg = make_session_meta_message("codex", session_id, 100, None);
+            msg.agent = agent.map(str::to_string);
+            msg.parent_session_id = parent.map(str::to_string);
+            msg
+        };
+        let messages = vec![
+            with("child", Some("Codex Subagent"), Some("parent")),
+            with("child", Some("Codex Subagent"), Some("parent")),
+            with("parent", Some("Codex"), None),
+            // Claude Code folds subagents into the parent session, so the
+            // session's messages disagree and no single agent describes it.
+            with("mixed", None, None),
+            with("mixed", Some("explore"), None),
+            // A link to itself is no parent.
+            with("self", None, Some("self")),
+        ];
+
+        let sessions = aggregate_session_metadata(&messages);
+        let find = |id: &str| sessions.iter().find(|s| s.session_id == id).unwrap();
+
+        assert_eq!(find("child").parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(find("child").agent.as_deref(), Some("Codex Subagent"));
+        assert_eq!(find("parent").parent_session_id, None);
+        assert_eq!(find("parent").agent.as_deref(), Some("Codex"));
+        assert_eq!(find("mixed").agent, None);
+        assert_eq!(find("self").parent_session_id, None);
+    }
+
+    #[test]
+    fn codex_parent_thread_ids_resolve_to_the_parent_rollout() {
+        let parent_thread = "01a12484-a122-7750-a32a-af42007c40a3";
+        let parent_rollout = format!("rollout-2026-10-10T14-33-54-{parent_thread}");
+        let continuation = format!(
+            "rollout-2026-10-10T16-07-56-{parent_thread}_01a124da-b978-7c03-8fb4-b589bdac49dd"
+        );
+        let child = "rollout-2026-10-10T15-00-00-01a12490-0000-7000-8000-000000000001";
+        let orphan = "rollout-2026-10-10T15-10-00-01a12491-0000-7000-8000-000000000002";
+        let row = |client: &str, session_id: &str, parent: Option<&str>| {
+            let mut msg = make_session_meta_message(client, session_id, 100, None);
+            msg.parent_session_id = parent.map(str::to_string);
+            msg
+        };
+        // The continuation is seen first: the thread's first file still wins.
+        let mut messages = vec![
+            row("codex", &continuation, None),
+            row("codex", &parent_rollout, None),
+            row("codex", child, Some(parent_thread)),
+            row(
+                "codex",
+                orphan,
+                Some("01a00000-0000-7000-8000-00000000dead"),
+            ),
+            // Only Codex rows are keyed by rollout file stem.
+            row("openclaw", parent_thread, Some(parent_thread)),
+        ];
+        let tokens_before: i64 = messages.iter().map(|m| m.tokens.total()).sum();
+
+        resolve_codex_parent_session_ids(&mut messages);
+
+        assert_eq!(
+            messages[2].parent_session_id.as_deref(),
+            Some(parent_rollout.as_str())
+        );
+        assert_eq!(
+            messages[3].parent_session_id.as_deref(),
+            Some("01a00000-0000-7000-8000-00000000dead"),
+            "an unparsed parent keeps its thread id"
+        );
+        assert_eq!(
+            messages[4].parent_session_id.as_deref(),
+            Some(parent_thread)
+        );
+        assert_eq!(
+            messages.iter().map(|m| m.tokens.total()).sum::<i64>(),
+            tokens_before,
+            "resolving links never moves usage"
+        );
     }
 
     #[test]
