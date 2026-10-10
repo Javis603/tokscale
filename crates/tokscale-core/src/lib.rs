@@ -674,6 +674,10 @@ pub struct SessionMeta {
     /// when none survived the report's filters). `None` for top-level sessions and for
     /// human forks, which are the user's own conversations.
     pub parent_session_id: Option<String>,
+    /// `"background-review"` for a Codex guardian review thread, which the
+    /// parser already tells apart from the subagents that share its parent
+    /// link. `None` for every other session.
+    pub session_kind: Option<String>,
 }
 
 /// The real filesystem path behind a workspace key, resolved once per key.
@@ -4401,6 +4405,9 @@ fn resolve_codex_parent_session_ids(messages: &mut [UnifiedMessage]) {
 /// rather than lumped into one bogus row, `0` timestamps are treated as "no
 /// timestamp" instead of as the epoch, and the first non-empty title wins.
 /// Ordering follows first appearance so the output is stable across runs.
+/// [`SessionMeta::session_kind`] of a Codex guardian review thread.
+const SESSION_KIND_BACKGROUND_REVIEW: &str = "background-review";
+
 fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     let mut sessions: Vec<SessionMeta> = Vec::new();
@@ -4418,10 +4425,17 @@ fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
                 first_active_ms: 0,
                 last_active_ms: 0,
                 parent_session_id: None,
+                session_kind: None,
             });
             sessions.len() - 1
         });
         let entry = &mut sessions[position];
+
+        if entry.session_kind.is_none()
+            && msg.agent.as_deref() == Some(sessions::codex::CODEX_GUARDIAN_AGENT)
+        {
+            entry.session_kind = Some(SESSION_KIND_BACKGROUND_REVIEW.to_string());
+        }
 
         if entry.parent_session_id.is_none() {
             if let Some(parent) = msg.parent_session_id.as_deref() {
@@ -8323,6 +8337,55 @@ mod tests {
         assert_eq!(find("review").parent_session_id.as_deref(), Some("parent"));
         assert_eq!(find("parent").parent_session_id, None);
         assert_eq!(find("self").parent_session_id, None);
+    }
+
+    #[test]
+    fn session_metadata_marks_guardian_reviews_apart_from_subagents() {
+        let with = |client: &str, session_id: &str, agent: Option<&str>| {
+            let mut msg = make_session_meta_message(client, session_id, 100, None);
+            msg.agent = agent.map(str::to_string);
+            msg.parent_session_id = Some("parent".to_string());
+            msg
+        };
+        let messages = vec![
+            with(
+                "codex",
+                "review",
+                Some(sessions::codex::CODEX_GUARDIAN_AGENT),
+            ),
+            with(
+                "codex",
+                "review",
+                Some(sessions::codex::CODEX_GUARDIAN_AGENT),
+            ),
+            with(
+                "codex",
+                "child",
+                Some(sessions::codex::CODEX_SUBAGENT_AGENT),
+            ),
+            with(
+                "codex",
+                "parent",
+                Some(sessions::codex::CODEX_DEFAULT_AGENT),
+            ),
+            with("pi", "omp-child", Some("explore")),
+            with("claude", "untagged", None),
+        ];
+
+        let sessions = aggregate_session_metadata(&messages);
+        let kind = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == id)
+                .unwrap()
+                .session_kind
+                .clone()
+        };
+
+        assert_eq!(kind("review").as_deref(), Some("background-review"));
+        for id in ["child", "parent", "omp-child", "untagged"] {
+            assert_eq!(kind(id), None, "{id} is not a background review");
+        }
     }
 
     #[test]

@@ -2358,6 +2358,8 @@ fn run_models_report(
             last_active_ms: i64,
             #[serde(skip_serializing_if = "Option::is_none")]
             parent_session_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session_kind: Option<String>,
         }
 
         #[derive(serde::Serialize)]
@@ -2405,6 +2407,7 @@ fn run_models_report(
                 first_active_ms: s.first_active_ms,
                 last_active_ms: s.last_active_ms,
                 parent_session_id: s.parent_session_id,
+                session_kind: s.session_kind,
             })
             .collect();
         let output = ModelReportJson {
