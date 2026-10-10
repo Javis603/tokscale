@@ -1540,7 +1540,14 @@ fn parser_version(client: ClientId) -> u32 {
         // v8->v9: gateway heartbeat responseModel values of `keepalive` now
         // fall back to the requested model. Reparse unchanged transcripts to
         // replace the placeholder attribution and its derived pricing.
-        ClientId::Dsh => 9,
+        // v9->v10: a settlement now measures its own call against the
+        // `step/start` clock of its `(turn, step)` and carries `duration_ms`.
+        // Transcripts are append-only, so every cached row predates that field
+        // and would keep the client reporting zero throughput until reparsed.
+        // The bump must stay strictly above every DSH version already released
+        // on any branch: the vendored `token-monitor-*` pins shipped a v9, so
+        // reusing that number would leave duration-less rows in place.
+        ClientId::Dsh => 10,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -5221,8 +5228,9 @@ mod tests {
     #[test]
     fn test_dsh_attempt_identity_parser_version_invalidates_v6_entries() {
         // DSH transcript files are append-only, so v6 cache entries keep the
-        // old cross-session attempt keys unless the source is reparsed.
-        assert_eq!(parser_version(ClientId::Dsh), 9);
+        // old cross-session attempt keys unless the source is reparsed. The
+        // v9->v10 bump retires rows parsed without generation durations.
+        assert_eq!(parser_version(ClientId::Dsh), 10);
     }
 
     /// Names the row that only a served cache can put in a report. No DSH
@@ -5490,7 +5498,7 @@ mod tests {
 "#,
         );
         let identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(identity.parser_version, 9);
+        assert_eq!(identity.parser_version, 10);
         let fingerprint = SourceFingerprint::from_path(&source).unwrap();
         let mut old_row = crate::sessions::dsh::parse_dsh_file(&source).remove(0);
         old_row.model_id = "keepalive".to_owned();
@@ -5519,7 +5527,7 @@ mod tests {
         let cached = persisted
             .get(identity, &source)
             .expect("rebuilt cache entry");
-        assert_eq!(cached.parser_version, 9);
+        assert_eq!(cached.parser_version, 10);
         assert_eq!(cached.messages[0].model_id, "requested-model");
         let warm = scan_dsh(source_home.path());
         assert_eq!(dsh_report_json(&warm), dsh_report_json(&rebuilt));
@@ -5540,7 +5548,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 9);
+        assert_eq!(current_identity.parser_version, 10);
         // Pinned at 3, the identity 4.14.0 cached under, rather than derived
         // from the running version: this is the row that release left on disk.
         let stale_identity = CacheIdentity {
@@ -5601,7 +5609,7 @@ mod tests {
         let cached = persisted
             .get(current_identity, &source)
             .expect("the scan must persist the entry it reparsed");
-        assert_eq!(cached.parser_version, 9);
+        assert_eq!(cached.parser_version, 10);
         assert_eq!(cached.messages.len(), 1);
         assert_eq!(cached.messages[0].model_id, "glm-5.3");
 
@@ -5628,7 +5636,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 9);
+        assert_eq!(current_identity.parser_version, 10);
         // Pinned at 4, the identity 4.15.0 cached under; see the v3 test.
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
@@ -5688,7 +5696,7 @@ mod tests {
         let cached = persisted
             .get(current_identity, &source)
             .expect("the scan must persist the entry it reparsed");
-        assert_eq!(cached.parser_version, 9);
+        assert_eq!(cached.parser_version, 10);
         assert_eq!(cached.messages, scanned);
 
         let warm = scan_dsh(source_home.path());
