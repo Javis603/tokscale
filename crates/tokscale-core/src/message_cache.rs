@@ -1060,6 +1060,7 @@ impl From<LegacyCodexStateV14> for CodexParseState {
             settled_usage_records: Default::default(),
             usage_event_ordinal: 0,
             request_timing: Default::default(),
+            session_parent_thread_id: None,
         }
     }
 }
@@ -1202,6 +1203,7 @@ impl From<LegacyCodexStateV15> for CodexParseState {
             usage_event_ordinal: state.usage_event_ordinal,
             turn_coverage: state.turn_coverage,
             request_timing: Default::default(),
+            session_parent_thread_id: None,
             pending_usage_record: None,
             settled_usage_records: Default::default(),
         }
@@ -1350,6 +1352,7 @@ impl From<LegacyCodexStateV19> for CodexParseState {
             has_entered_review_mode: false,
             has_own_turn_context: true,
             request_timing: Default::default(),
+            session_parent_thread_id: None,
         }
     }
 }
@@ -1951,8 +1954,8 @@ fn parser_version(client: ClientId) -> u32 {
         // The parse state gained `has_entered_review_mode` and
         // `has_own_turn_context`. A finished review never rewrites its parent,
         // so a warm v19 entry would keep reporting it without the parser running.
-        // v20->v21 (downstream): request completion timing state joins the
-        // upstream review-mode state; every older layout reparses.
+        // v20->v21 (downstream): request completion timing and parent-link
+        // state join the upstream review-mode state; every older layout reparses.
         ClientId::Codex => 21,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using

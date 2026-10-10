@@ -1009,6 +1009,12 @@ pub struct SessionMeta {
     /// the last. `0` when every message in the session lacked a usable one.
     pub first_active_ms: i64,
     pub last_active_ms: i64,
+    /// The session that started this one, when the source records it: an OMP
+    /// subagent's parent, or the parent of a Codex subagent or guardian thread
+    /// (the session id of a parent rollout the report kept, its bare thread id
+    /// when none survived the report's filters). `None` for top-level sessions and for
+    /// human forks, which are the user's own conversations.
+    pub parent_session_id: Option<String>,
 }
 
 /// The real filesystem path behind a workspace key, resolved once per key.
@@ -4271,9 +4277,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             }
         }
         for mut message in rollout_messages {
-            if let Some(session_id) = mirrored_thread_sessions.get(&message.session_id).cloned() {
-                message.session_id = session_id;
-            }
+            adopt_openclaw_mirror_session(&mut message, &mirrored_thread_sessions);
             if should_keep_deduped_message(&mut openclaw_seen, &message) {
                 all_messages.push(message);
             }
@@ -5843,6 +5847,91 @@ fn workspace_metadata_for_entries(
 /// Rolls the already-filtered messages up into one [`SessionMeta`] per
 /// `(client, session_id)`.
 ///
+/// Key an OpenClaw-owned Codex rollout row by the OpenClaw session that
+/// mirrored its thread, when one did. The parent link of a subagent thread
+/// names a Codex thread id the same way the row's own session id does, so it
+/// moves through the same map; otherwise a child would point at a thread id
+/// that no longer keys its parent's rows.
+fn adopt_openclaw_mirror_session(
+    message: &mut UnifiedMessage,
+    mirrored_thread_sessions: &HashMap<String, String>,
+) {
+    if let Some(session_id) = mirrored_thread_sessions.get(&message.session_id) {
+        message.session_id = session_id.clone();
+    }
+    if let Some(parent) = message
+        .parent_session_id
+        .as_deref()
+        .and_then(|parent| mirrored_thread_sessions.get(parent))
+    {
+        message.parent_session_id = Some(parent.clone());
+    }
+}
+
+/// The thread id a Codex rollout session id belongs to, and whether the file is
+/// a paginated continuation (`rollout-<time>-<thread>_<segment>`) of that
+/// thread rather than its first file.
+fn codex_rollout_thread_id(session_id: &str) -> Option<(&str, bool)> {
+    // `rollout-` plus a `YYYY-MM-DDTHH-MM-SS-` stamp precedes the thread id.
+    let rest = session_id.strip_prefix("rollout-")?.get(20..)?;
+    let (thread, continuation) = match rest.split_once('_') {
+        Some((thread, _)) => (thread, true),
+        None => (rest, false),
+    };
+    (!thread.is_empty()).then_some((thread, continuation))
+}
+
+/// Point Codex subagent and guardian rows at their parent's session id.
+///
+/// The parser can name a parent only by thread id, while Codex rows are keyed
+/// by rollout file stem. Run on the messages a report or the TUI kept after
+/// date and client filtering, so the link names a parent row that is actually
+/// present: the thread's first file when it survived the filter, otherwise its
+/// earliest surviving continuation. A thread with no surviving row keeps its
+/// thread id. Running it before filtering would point a child at a rollout the
+/// filter then drops, and a second pass could not repair that, because only
+/// thread ids are resolved. Usage is untouched: only the link moves.
+fn resolve_codex_parent_session_ids(messages: &mut [UnifiedMessage]) {
+    if !messages
+        .iter()
+        .any(|message| message.client == "codex" && message.parent_session_id.is_some())
+    {
+        return;
+    }
+    let mut by_thread: HashMap<String, (String, bool)> = HashMap::new();
+    for message in messages.iter().filter(|message| message.client == "codex") {
+        let Some((thread, continuation)) = codex_rollout_thread_id(&message.session_id) else {
+            continue;
+        };
+        let replace = match by_thread.get(thread) {
+            None => true,
+            Some((existing, existing_continuation)) => {
+                (*existing_continuation, existing.as_str())
+                    > (continuation, message.session_id.as_str())
+            }
+        };
+        if replace {
+            by_thread.insert(
+                thread.to_string(),
+                (message.session_id.clone(), continuation),
+            );
+        }
+    }
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.client == "codex")
+    {
+        let Some(parent) = message.parent_session_id.as_deref() else {
+            continue;
+        };
+        if let Some((session_id, _)) = by_thread.get(parent) {
+            if *session_id != message.session_id {
+                message.parent_session_id = Some(session_id.clone());
+            }
+        }
+    }
+}
+
 /// Mirrors the TUI's Sessions rollup: messages without a session id are skipped
 /// rather than lumped into one bogus row, `0` timestamps are treated as "no
 /// timestamp" instead of as the epoch, and the first non-empty title wins.
@@ -5863,10 +5952,19 @@ fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
                 title: None,
                 first_active_ms: 0,
                 last_active_ms: 0,
+                parent_session_id: None,
             });
             sessions.len() - 1
         });
         let entry = &mut sessions[position];
+
+        if entry.parent_session_id.is_none() {
+            if let Some(parent) = msg.parent_session_id.as_deref() {
+                if !parent.trim().is_empty() && parent != msg.session_id {
+                    entry.parent_session_id = Some(parent.to_string());
+                }
+            }
+        }
 
         if entry.title.is_none() {
             if let Some(title) = msg.session_title.as_deref() {
@@ -6145,13 +6243,14 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
         Some(&options),
     );
 
-    let filtered = filter_messages_for_report(all_messages, &options);
+    let mut filtered = filter_messages_for_report(all_messages, &options);
     let mut undated_tokens = TokenBreakdown::default();
     for message in &filtered {
         if claude_desktop::is_undated_balance(message) {
             undated_tokens.add_assign_saturating(&message.tokens);
         }
     }
+    resolve_codex_parent_session_ids(&mut filtered);
     // Borrowed before the aggregation consumes `filtered`, and only for the
     // groupings that carry a session id, so every other report path is unchanged.
     let sessions = if matches!(
@@ -7641,7 +7740,9 @@ fn parse_local_unified_messages_resolved(
         cache_policy,
         None,
     );
-    Ok(filter_unified_messages(messages, &options))
+    let mut messages = filter_unified_messages(messages, &options);
+    resolve_codex_parent_session_ids(&mut messages);
+    Ok(messages)
 }
 
 fn parse_local_unified_messages_deferred_resolved(
@@ -8168,9 +8269,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
             }
         }
         for mut message in rollout_messages {
-            if let Some(session_id) = mirrored_thread_sessions.get(&message.session_id).cloned() {
-                message.session_id = session_id;
-            }
+            adopt_openclaw_mirror_session(&mut message, &mirrored_thread_sessions);
             if should_keep_deduped_message(&mut seen, &message) {
                 kept.push(message);
             }
@@ -9310,8 +9409,7 @@ mod tests {
         message_cache, message_passes_report_filter, normalize_model_for_grouping,
         normalize_syntactic, opencode_json_superseded_by_sqlite,
         parse_all_messages_with_pricing_with_cache_policy,
-        parse_all_messages_with_pricing_with_env_strategy,
-        parse_all_messages_with_pricing_with_env_strategy_and_window, parse_local_clients,
+        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
         parse_local_unified_messages, parse_local_unified_messages_deferred, parsed_to_unified,
         paths, prepare_submission_pricing, pricing, retain_for_requested_clients, scanner,
         select_best_covered_hermes_groups, select_local_parse_pricing, sessions, unified_to_parsed,
@@ -9326,10 +9424,15 @@ mod tests {
     // is edited by nearly every PR that touches this file, and sharing it made
     // this branch conflict on every single upstream merge.
     use super::{aggregate_model_usage_entries_with_rollup, WorktreeRollup};
-    use super::{aggregate_session_metadata, workspace_metadata_for_entries, WorkspaceLabeler};
+    use super::{
+        aggregate_session_metadata, resolve_codex_parent_session_ids,
+        workspace_metadata_for_entries, WorkspaceLabeler,
+    };
     use super::{
         apply_custom_pricing_if_available, calculate_cost_with_service_tier,
-        parse_all_messages_streaming_with_env_strategy, CostSource, CustomPricingSink, ModelUsage,
+        parse_all_messages_streaming_with_env_strategy,
+        parse_all_messages_with_pricing_with_env_strategy_and_window, CostSource,
+        CustomPricingSink, ModelUsage,
     };
     use super::{flush_retained_lane, matches_flush_filter, FlushContext};
     use serial_test::serial;
@@ -11847,6 +11950,101 @@ mod tests {
         assert_eq!(second.first_active_ms, 0, "no timestamp stays unknown");
         assert_eq!(second.last_active_ms, 0);
         assert_eq!(second.title, None);
+    }
+
+    #[test]
+    fn session_metadata_carries_every_known_parent_link() {
+        let with = |session_id: &str, agent: Option<&str>, parent: Option<&str>| {
+            let mut msg = make_session_meta_message("codex", session_id, 100, None);
+            msg.agent = agent.map(str::to_string);
+            msg.parent_session_id = parent.map(str::to_string);
+            msg
+        };
+        let messages = vec![
+            with("child", Some("Codex Subagent"), Some("parent")),
+            with("child", Some("Codex Subagent"), Some("parent")),
+            // Guardian reviews keep their link too: how to group them is the
+            // consumer's choice, not the report's.
+            with("review", Some("Codex Guardian"), Some("parent")),
+            with("parent", Some("Codex"), None),
+            // A link to itself is no parent.
+            with("self", None, Some("self")),
+        ];
+
+        let sessions = aggregate_session_metadata(&messages);
+        let find = |id: &str| sessions.iter().find(|s| s.session_id == id).unwrap();
+
+        assert_eq!(find("child").parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(find("review").parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(find("parent").parent_session_id, None);
+        assert_eq!(find("self").parent_session_id, None);
+    }
+
+    #[test]
+    fn codex_parent_thread_ids_resolve_to_the_parent_rollout() {
+        let parent_thread = "01a12484-a122-7750-a32a-af42007c40a3";
+        let parent_rollout = format!("rollout-2026-10-10T14-33-54-{parent_thread}");
+        let continuation = format!(
+            "rollout-2026-10-10T16-07-56-{parent_thread}_01a124da-b978-7c03-8fb4-b589bdac49dd"
+        );
+        let child = "rollout-2026-10-10T15-00-00-01a12490-0000-7000-8000-000000000001";
+        let orphan = "rollout-2026-10-10T15-10-00-01a12491-0000-7000-8000-000000000002";
+        let row = |client: &str, session_id: &str, parent: Option<&str>| {
+            let mut msg = make_session_meta_message(client, session_id, 100, None);
+            msg.parent_session_id = parent.map(str::to_string);
+            msg
+        };
+        // The continuation is seen first: the thread's first file still wins.
+        let mut messages = vec![
+            row("codex", &continuation, None),
+            row("codex", &parent_rollout, None),
+            row("codex", child, Some(parent_thread)),
+            row(
+                "codex",
+                orphan,
+                Some("01a00000-0000-7000-8000-00000000dead"),
+            ),
+            // Only Codex rows are keyed by rollout file stem.
+            row("openclaw", parent_thread, Some(parent_thread)),
+        ];
+        let tokens_before: i64 = messages.iter().map(|m| m.tokens.total()).sum();
+
+        resolve_codex_parent_session_ids(&mut messages);
+
+        assert_eq!(
+            messages[2].parent_session_id.as_deref(),
+            Some(parent_rollout.as_str())
+        );
+        assert_eq!(
+            messages[3].parent_session_id.as_deref(),
+            Some("01a00000-0000-7000-8000-00000000dead"),
+            "an unparsed parent keeps its thread id"
+        );
+        assert_eq!(
+            messages[4].parent_session_id.as_deref(),
+            Some(parent_thread)
+        );
+        assert_eq!(
+            messages.iter().map(|m| m.tokens.total()).sum::<i64>(),
+            tokens_before,
+            "resolving links never moves usage"
+        );
+
+        // A date filter dropped the thread's first file: the link moves to the
+        // earliest continuation that survived, never to the dropped rollout.
+        let later = format!(
+            "rollout-2026-10-11T09-00-00-{parent_thread}_01a124ff-0000-7000-8000-000000000003"
+        );
+        let mut filtered = vec![
+            row("codex", &later, None),
+            row("codex", &continuation, None),
+            row("codex", child, Some(parent_thread)),
+        ];
+        resolve_codex_parent_session_ids(&mut filtered);
+        assert_eq!(
+            filtered[2].parent_session_id.as_deref(),
+            Some(continuation.as_str())
+        );
     }
 
     #[test]
@@ -21607,6 +21805,76 @@ mod tests {
             window.worktree_rollup,
         );
         assert_report_equivalence(&entries_sieved, &entries_full, "cursor window sieve");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_rotation_merge_preserves_window_scoped_warm_pricing() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_window_test_cache_home(cache_home.path());
+        let otel = source_home.path().join(".copilot/otel");
+        std::fs::create_dir_all(&otel).unwrap();
+        for (file, input, output) in [("a.jsonl", 100, 20), ("b.jsonl", 150, 30)] {
+            let mut rows = Vec::new();
+            for (index, date) in [(1, "2026-09-14T12:00:00Z"), (2, "2026-09-15T12:00:00Z")] {
+                let timestamp = chrono::DateTime::parse_from_rfc3339(date)
+                    .unwrap()
+                    .timestamp();
+                rows.push(serde_json::json!({
+                    "type": "span", "traceId": format!("{index:032x}"),
+                    "spanId": "1234567890abcdef", "name": "chat", "startTime": [timestamp, 0],
+                    "attributes": {"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o",
+                        "gen_ai.conversation.id": "window-session",
+                        "gen_ai.usage.input_tokens": input, "gen_ai.usage.output_tokens": output}
+                }).to_string());
+            }
+            std::fs::write(otel.join(file), rows.join("\n")).unwrap();
+        }
+        let mut rates = HashMap::new();
+        rates.insert(
+            "gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(rates, HashMap::new());
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+        let window = ReportOptions {
+            since: Some("2026-09-15".to_string()),
+            until: Some("2026-09-15".to_string()),
+            ..Default::default()
+        };
+        parse_window_test_messages_with_pricing(home, &clients, None);
+        for _ in 0..2 {
+            let sieved = parse_all_messages_with_pricing_with_env_strategy_and_window(
+                home,
+                &clients,
+                Some(&pricing),
+                false,
+                &window_test_scanner_settings(),
+                Some(&window),
+            );
+            assert_eq!(sieved.len(), 2, "rotation copies merge before pricing");
+            let outside = sieved.iter().find(|m| m.date == "2026-09-14").unwrap();
+            assert_eq!(
+                outside.cost, 0.0,
+                "merged history stays unpriced outside the window"
+            );
+            let filtered = filter_messages_for_report(sieved, &window);
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].tokens.input, 150);
+            assert_eq!(filtered[0].tokens.output, 30);
+            assert!((filtered[0].cost - 0.21).abs() < 1e-12);
+            let full = filter_messages_for_report(
+                parse_window_test_messages_with_pricing(home, &clients, Some(&pricing)),
+                &window,
+            );
+            assert_eq!(filtered, full);
+        }
     }
 
     #[test]
