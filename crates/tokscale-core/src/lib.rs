@@ -674,10 +674,6 @@ pub struct SessionMeta {
     /// when none survived the report's filters). `None` for top-level sessions and for
     /// human forks, which are the user's own conversations.
     pub parent_session_id: Option<String>,
-    /// The agent label every message in the session shares, e.g. "Codex
-    /// Subagent". `None` when the parser records none or the session mixes
-    /// agents, as Claude Code does by folding its subagents into the parent.
-    pub agent: Option<String>,
 }
 
 /// The real filesystem path behind a workspace key, resolved once per key.
@@ -4408,21 +4404,13 @@ fn resolve_codex_parent_session_ids(messages: &mut [UnifiedMessage]) {
 fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     let mut sessions: Vec<SessionMeta> = Vec::new();
-    // Per session: whether two messages disagreed on the agent label.
-    let mut mixed_agents: Vec<bool> = Vec::new();
 
     for msg in messages {
         if msg.session_id.is_empty() {
             continue;
         }
-        let agent = msg
-            .agent
-            .as_deref()
-            .filter(|agent| !agent.trim().is_empty());
         let key = (msg.client.clone(), msg.session_id.clone());
-        let mut created = false;
         let position = *index.entry(key).or_insert_with(|| {
-            created = true;
             sessions.push(SessionMeta {
                 client: msg.client.clone(),
                 session_id: msg.session_id.clone(),
@@ -4430,17 +4418,10 @@ fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
                 first_active_ms: 0,
                 last_active_ms: 0,
                 parent_session_id: None,
-                agent: agent.map(str::to_string),
             });
-            mixed_agents.push(false);
             sessions.len() - 1
         });
         let entry = &mut sessions[position];
-
-        if !created && !mixed_agents[position] && entry.agent.as_deref() != agent {
-            mixed_agents[position] = true;
-            entry.agent = None;
-        }
 
         if entry.parent_session_id.is_none() {
             if let Some(parent) = msg.parent_session_id.as_deref() {
@@ -8317,7 +8298,7 @@ mod tests {
     }
 
     #[test]
-    fn session_metadata_carries_the_parent_link_and_a_shared_agent() {
+    fn session_metadata_carries_every_known_parent_link() {
         let with = |session_id: &str, agent: Option<&str>, parent: Option<&str>| {
             let mut msg = make_session_meta_message("codex", session_id, 100, None);
             msg.agent = agent.map(str::to_string);
@@ -8327,11 +8308,10 @@ mod tests {
         let messages = vec![
             with("child", Some("Codex Subagent"), Some("parent")),
             with("child", Some("Codex Subagent"), Some("parent")),
+            // Guardian reviews keep their link too: how to group them is the
+            // consumer's choice, not the report's.
+            with("review", Some("Codex Guardian"), Some("parent")),
             with("parent", Some("Codex"), None),
-            // Claude Code folds subagents into the parent session, so the
-            // session's messages disagree and no single agent describes it.
-            with("mixed", None, None),
-            with("mixed", Some("explore"), None),
             // A link to itself is no parent.
             with("self", None, Some("self")),
         ];
@@ -8340,10 +8320,8 @@ mod tests {
         let find = |id: &str| sessions.iter().find(|s| s.session_id == id).unwrap();
 
         assert_eq!(find("child").parent_session_id.as_deref(), Some("parent"));
-        assert_eq!(find("child").agent.as_deref(), Some("Codex Subagent"));
+        assert_eq!(find("review").parent_session_id.as_deref(), Some("parent"));
         assert_eq!(find("parent").parent_session_id, None);
-        assert_eq!(find("parent").agent.as_deref(), Some("Codex"));
-        assert_eq!(find("mixed").agent, None);
         assert_eq!(find("self").parent_session_id, None);
     }
 
