@@ -3968,6 +3968,146 @@ after"#,
         }
     }
 
+    /// OpenClaw drives a Codex thread in the user's `~/.codex` that spawns a
+    /// subagent; both rollouts carry OpenClaw's originator, and OpenClaw
+    /// mirrors the parent's turn into its own session through
+    /// `codex-app-server:<thread>:<turn>`. The parent turn is 100/30
+    /// input/output, the child's 41/13.
+    fn write_openclaw_codex_parent_with_subagent(home: &std::path::Path) {
+        let parent = "0192f3a4-5b6c-7d8e-9f01-23456789abcd";
+        let child = "0192f3a5-0000-7000-8000-00000000cccc";
+        let rollout = |thread: &str, source: &str, turn: &str, minute: u32, usage: (i64, i64)| {
+            [
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:00Z","type":"session_meta","payload":{{"id":"{thread}","originator":"openclaw","source":{source},"model_provider":"openai","cwd":"/repo"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:01Z","type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn}"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:01Z","type":"turn_context","payload":{{"turn_id":"{turn}","model":"gpt-5.2-codex"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{i},"output_tokens":{o}}},"last_token_usage":{{"input_tokens":{i},"output_tokens":{o}}}}}}}}}"#,
+                    i = usage.0,
+                    o = usage.1
+                ),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let sessions = home.join(".codex/sessions/2026/10/10");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join(format!("rollout-2026-10-10T10-00-00-{parent}.jsonl")),
+            rollout(parent, r#""cli""#, "turn-1", 0, (100, 30)),
+        )
+        .unwrap();
+        fs::write(
+            sessions.join(format!("rollout-2026-10-10T10-05-00-{child}.jsonl")),
+            rollout(
+                child,
+                &format!(
+                    r#"{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}","depth":1}}}}}}"#
+                ),
+                "turn-c1",
+                5,
+                (41, 13),
+            ),
+        )
+        .unwrap();
+
+        let db_path = home.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session_windows (
+              session_id TEXT NOT NULL PRIMARY KEY, session_key TEXT NOT NULL,
+              previous_session_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+              model_provider TEXT, model TEXT, agent_harness_id TEXT
+            ) STRICT;
+            CREATE TABLE transcript_events (
+              session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL,
+              created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq)
+            ) STRICT;
+            CREATE TABLE transcript_event_identities (
+              session_id TEXT NOT NULL, event_id TEXT NOT NULL, seq INTEGER NOT NULL,
+              event_type TEXT, parent_id TEXT, message_idempotency_key TEXT,
+              created_at INTEGER NOT NULL, PRIMARY KEY (session_id, event_id)
+            ) STRICT;
+            INSERT INTO session_windows VALUES ('openclaw-visible-session', 'agent:main:openclaw-visible-session', NULL, 1791626400000, 1791626400000, 'openai', 'gpt-5.2-codex', 'codex');
+            "#,
+        )
+        .unwrap();
+        let events = [
+            r#"{"type":"session","version":3,"id":"openclaw-visible-session","timestamp":"2026-10-10T10:00:00.000Z","cwd":"/repo"}"#.to_string(),
+            format!(
+                r#"{{"type":"message","id":"m1","parentId":"u1","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}],"api":"openai-chatgpt-responses","provider":"openai","model":"gpt-5.2-codex","usage":{{"input":100,"output":30,"cacheRead":0,"cacheWrite":0,"totalTokens":130,"cost":{{"total":0}}}},"idempotencyKey":"codex-app-server:{parent}:turn-1:assistant","__openclaw":{{"mirrorOrigin":"codex-app-server","mirrorIdentity":"turn-1:assistant"}},"stopReason":"stop","timestamp":1791626402000}}}}"#
+            ),
+        ];
+        for (seq, event) in events.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO transcript_events VALUES ('openclaw-visible-session', ?1, ?2, ?3)",
+                rusqlite::params![seq as i64, event, 1_791_626_400_000_i64 + seq as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    /// The subagent roll-up joins a child to its parent by session id, so an
+    /// OpenClaw-owned Codex child must name the OpenClaw session its parent's
+    /// rows are keyed by. Cold and warm cache agree.
+    #[test]
+    #[serial]
+    fn test_data_loader_rolls_openclaw_codex_subagent_into_the_mirroring_session() {
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => unsafe { env::set_var(key, value) },
+                        None => unsafe { env::remove_var(key) },
+                    }
+                }
+            }
+        }
+        let temp_dir = TempDir::new().unwrap();
+        let _restore = RestoreEnv(
+            ["HOME", "TOKSCALE_CONFIG_DIR", "CODEX_HOME"]
+                .into_iter()
+                .map(|key| (key, env::var_os(key)))
+                .collect(),
+        );
+        write_openclaw_codex_parent_with_subagent(temp_dir.path());
+        unsafe {
+            env::set_var("HOME", temp_dir.path());
+            env::set_var(
+                "TOKSCALE_CONFIG_DIR",
+                temp_dir.path().join(".config/tokscale"),
+            );
+            env::remove_var("CODEX_HOME");
+        }
+
+        for pass in ["cold", "warm"] {
+            let usage = load_with_pricing(
+                &DataLoader::new(None),
+                &[ClientId::Codex, ClientId::OpenClaw],
+                &GroupBy::Model,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(usage.sessions.len(), 2, "{pass}: the flat view keeps both");
+            assert_eq!(usage.sessions_rolled.len(), 1, "{pass}: one rolled row");
+            let parent = &usage.sessions_rolled[0];
+            assert_eq!(parent.session_id, "openclaw-visible-session", "{pass}");
+            assert_eq!(parent.subagent_count, 1, "{pass}");
+            assert_eq!(parent.tokens.input, 141, "{pass}");
+            assert_eq!(parent.tokens.output, 43, "{pass}");
+        }
+    }
+
     #[test]
     #[serial]
     fn test_data_loader_keeps_synthetic_gateway_messages_under_original_client() {
