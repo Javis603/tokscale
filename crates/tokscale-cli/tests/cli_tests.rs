@@ -3139,6 +3139,112 @@ fn write_codex_continued_parent_with_subagent(base: &Path) -> (String, String, S
 /// the surviving continuation; without one, the first rollout wins. Both the
 /// cold parser path and the warm source cache must agree, and usage must not
 /// move between rows.
+/// A parent thread with one spawned subagent and one guardian review, using the
+/// `session_meta` shapes Codex writes for each.
+fn write_codex_parent_with_subagent_and_guardian(base: &Path) -> (String, String, String) {
+    let parent = "01a13000-0000-7000-8000-00000000aaaa";
+    let parent_rollout = format!("rollout-2026-10-10T12-00-00-{parent}");
+    let child_id = "01a13100-0000-7000-8000-00000000cccc";
+    let child = format!("rollout-2026-10-10T12-10-00-{child_id}");
+    let review_id = "01a13200-0000-7000-8000-00000000dddd";
+    let review = format!("rollout-2026-10-10T12-20-00-{review_id}");
+    let usage = |timestamp: &str, input: i64, output: i64| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"output_tokens":{output}}},"last_token_usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}}}"#
+        )
+    };
+    let files = [
+        (
+            parent_rollout.clone(),
+            format!(
+                r#"{{"timestamp":"2026-10-10T12:00:00Z","type":"session_meta","payload":{{"id":"{parent}","source":"vscode","originator":"Codex Desktop","model_provider":"openai","cwd":"/repo"}}}}"#
+            ),
+            usage("2026-10-10T12:00:02Z", 100, 10),
+        ),
+        (
+            child.clone(),
+            format!(
+                r#"{{"timestamp":"2026-10-10T12:10:00Z","type":"session_meta","payload":{{"id":"{child_id}","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}","depth":1}}}}}},"thread_source":"subagent","originator":"Codex Desktop","model_provider":"openai","cwd":"/repo"}}}}"#
+            ),
+            usage("2026-10-10T12:10:02Z", 20, 2),
+        ),
+        (
+            review.clone(),
+            format!(
+                r#"{{"timestamp":"2026-10-10T12:20:00Z","type":"session_meta","payload":{{"id":"{review_id}","parent_thread_id":"{parent}","source":{{"subagent":{{"other":"guardian"}}}},"thread_source":"guardian_review","originator":"Codex Desktop","model_provider":"openai","cwd":"/repo"}}}}"#
+            ),
+            usage("2026-10-10T12:20:02Z", 30, 3),
+        ),
+    ];
+    let dir = base.join(".codex/sessions/2026/10/10");
+    fs::create_dir_all(&dir).unwrap();
+    for (stem, meta, usage) in files {
+        let turn = r#"{"timestamp":"2026-10-10T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2","cwd":"/repo"}}"#;
+        fs::write(
+            dir.join(format!("{stem}.jsonl")),
+            format!("{meta}\n{turn}\n{usage}\n"),
+        )
+        .unwrap();
+    }
+    (parent_rollout, child, review)
+}
+
+#[test]
+fn test_codex_guardian_review_reports_its_session_kind_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    let (parent, child, review) = write_codex_parent_with_subagent_and_guardian(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "codex", "--no-spinner"])
+            .args(["--group-by", "client,workspace,session,model"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+        let meta = |session: &str| {
+            json["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|meta| meta["sessionId"] == session)
+                .unwrap_or_else(|| panic!("{pass} cache pass: missing metadata for {session}"))
+                .clone()
+        };
+
+        // Both children keep their parent link; only the review is marked, so a
+        // consumer can tell it from a subagent without any other catalog.
+        assert_eq!(
+            meta(&review)["sessionKind"],
+            "background-review",
+            "{pass} cache pass"
+        );
+        assert_eq!(
+            meta(&review)["parentSessionId"],
+            parent.as_str(),
+            "{pass} cache pass"
+        );
+        assert_eq!(
+            meta(&child)["parentSessionId"],
+            parent.as_str(),
+            "{pass} cache pass"
+        );
+        assert!(
+            meta(&child).get("sessionKind").is_none(),
+            "{pass} cache pass"
+        );
+        assert!(
+            meta(&parent).get("sessionKind").is_none(),
+            "{pass} cache pass"
+        );
+        assert_eq!(json["totalInput"].as_i64(), Some(150), "{pass} cache pass");
+    }
+}
+
 #[test]
 fn test_codex_subagent_parent_link_follows_date_filter_cold_and_warm_cache() {
     let tmp = create_empty_fixture_dir();
