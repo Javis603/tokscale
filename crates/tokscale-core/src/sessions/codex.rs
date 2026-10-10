@@ -958,8 +958,8 @@ fn parse_codex_reader<R: BufRead>(
                         .clone()
                         .or_else(|| state.thread_service_tier.clone());
                     message.duration_ms = duration_ms;
-                    // The raw parent thread id; the report resolves it to the
-                    // parent's rollout session id once every file is parsed.
+                    // The raw parent thread id; reports and the TUI resolve it
+                    // to a surviving parent rollout after their own filtering.
                     message.parent_session_id = state.session_parent_thread_id.clone();
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under

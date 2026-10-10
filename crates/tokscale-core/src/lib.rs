@@ -670,8 +670,8 @@ pub struct SessionMeta {
     pub last_active_ms: i64,
     /// The session that started this one, when the source records it: an OMP
     /// subagent's parent, or the parent of a Codex subagent or guardian thread
-    /// (the parent's rollout session id once resolved, its bare thread id when
-    /// the parent was not parsed). `None` for top-level sessions and for
+    /// (the session id of a parent rollout the report kept, its bare thread id
+    /// when none survived the report's filters). `None` for top-level sessions and for
     /// human forks, which are the user's own conversations.
     pub parent_session_id: Option<String>,
     /// The agent label every message in the session shares, e.g. "Codex
@@ -1144,7 +1144,6 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         clients,
         timezone.is_pinned().then_some(&timezone),
     );
-    resolve_codex_parent_session_ids(&mut messages);
     // Reconcile recovery against source costs first, then apply current rates.
     // Overrides never enter source caches, so removing them restores the source.
     for message in &mut messages {
@@ -4335,11 +4334,13 @@ fn codex_rollout_thread_id(session_id: &str) -> Option<(&str, bool)> {
 /// Point Codex subagent and guardian rows at their parent's session id.
 ///
 /// The parser can name a parent only by thread id, while Codex rows are keyed
-/// by rollout file stem. Once every file is parsed, a parent thread id that
-/// matches a parsed rollout becomes that rollout's session id, preferring the
-/// thread's first file over its continuations, so the link joins the same
-/// `(client, session_id)` key the parent's own rows use. A parent that was not
-/// parsed keeps its thread id. Usage is untouched: only the link moves.
+/// by rollout file stem. Run on the messages a report or the TUI kept after
+/// date and client filtering, so the link names a parent row that is actually
+/// present: the thread's first file when it survived the filter, otherwise its
+/// earliest surviving continuation. A thread with no surviving row keeps its
+/// thread id. Running it before filtering would point a child at a rollout the
+/// filter then drops, and a second pass could not repair that, because only
+/// thread ids are resolved. Usage is untouched: only the link moves.
 fn resolve_codex_parent_session_ids(messages: &mut [UnifiedMessage]) {
     if !messages
         .iter()
@@ -4680,7 +4681,8 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
         Some(&options),
     );
 
-    let filtered = filter_messages_for_report(all_messages, &options);
+    let mut filtered = filter_messages_for_report(all_messages, &options);
+    resolve_codex_parent_session_ids(&mut filtered);
     // Borrowed before the aggregation consumes `filtered`, and only for the
     // groupings that carry a session id, so every other report path is unchanged.
     let sessions = if matches!(
@@ -5883,7 +5885,9 @@ fn parse_local_unified_messages_resolved(
         cache_policy,
         None,
     );
-    Ok(filter_unified_messages(messages, &options))
+    let mut messages = filter_unified_messages(messages, &options);
+    resolve_codex_parent_session_ids(&mut messages);
+    Ok(messages)
 }
 pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages, String> {
     let start = Instant::now();
@@ -8374,6 +8378,22 @@ mod tests {
             messages.iter().map(|m| m.tokens.total()).sum::<i64>(),
             tokens_before,
             "resolving links never moves usage"
+        );
+
+        // A date filter dropped the thread's first file: the link moves to the
+        // earliest continuation that survived, never to the dropped rollout.
+        let later = format!(
+            "rollout-2026-10-11T09-00-00-{parent_thread}_01a124ff-0000-7000-8000-000000000003"
+        );
+        let mut filtered = vec![
+            row("codex", &later, None),
+            row("codex", &continuation, None),
+            row("codex", child, Some(parent_thread)),
+        ];
+        resolve_codex_parent_session_ids(&mut filtered);
+        assert_eq!(
+            filtered[2].parent_session_id.as_deref(),
+            Some(continuation.as_str())
         );
     }
 

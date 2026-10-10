@@ -3070,6 +3070,163 @@ fn test_dsh_v3_fork_attributes_usage_once_cold_and_warm_cache() {
     }
 }
 
+/// A Codex parent thread whose first rollout holds only January usage and whose
+/// paginated continuation holds October usage, plus a subagent the parent
+/// spawned in October. Each file carries one call: 10/4 tokens in January, 20/8
+/// in the continuation (whose cumulative totals carry on from January), and 7/3
+/// in the subagent. Distinct cumulative totals keep Codex's cross-file replay
+/// dedup, which is scoped to the parent thread, from merging the calls.
+fn write_codex_continued_parent_with_subagent(base: &Path) -> (String, String, String) {
+    let parent = "01a00000-0000-7000-8000-00000000aaaa";
+    let original = format!("rollout-2026-01-15T12-00-00-{parent}");
+    let continuation =
+        format!("rollout-2026-10-09T12-00-00-{parent}_01a12000-0000-7000-8000-00000000bbbb");
+    let child = "rollout-2026-10-10T12-00-00-01a12100-0000-7000-8000-00000000cccc".to_string();
+    let usage = |timestamp: &str, total: (i64, i64), last: (i64, i64)| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{},"output_tokens":{}}},"last_token_usage":{{"input_tokens":{},"output_tokens":{}}}}}}}}}"#,
+            total.0, total.1, last.0, last.1
+        )
+    };
+    let turn = |timestamp: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"turn_context","payload":{{"model":"gpt-5.2","cwd":"/repo"}}}}"#
+        )
+    };
+    let files = [
+        (
+            "2026/01/15",
+            original.clone(),
+            format!(
+                r#"{{"timestamp":"2026-01-15T12:00:00Z","type":"session_meta","payload":{{"id":"{parent}","source":"vscode","model_provider":"openai","cwd":"/repo"}}}}"#
+            ),
+            turn("2026-01-15T12:00:01Z"),
+            usage("2026-01-15T12:00:02Z", (10, 4), (10, 4)),
+        ),
+        (
+            "2026/10/09",
+            continuation.clone(),
+            format!(
+                r#"{{"timestamp":"2026-10-09T12:00:00Z","type":"session_meta","payload":{{"id":"{parent}","source":"vscode","model_provider":"openai","cwd":"/repo"}}}}"#
+            ),
+            turn("2026-10-09T12:00:01Z"),
+            usage("2026-10-09T12:00:02Z", (30, 12), (20, 8)),
+        ),
+        (
+            "2026/10/10",
+            child.clone(),
+            format!(
+                r#"{{"timestamp":"2026-10-10T12:00:00Z","type":"session_meta","payload":{{"id":"01a12100-0000-7000-8000-00000000cccc","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}","depth":1}}}}}},"model_provider":"openai","cwd":"/repo"}}}}"#
+            ),
+            turn("2026-10-10T12:00:01Z"),
+            usage("2026-10-10T12:00:02Z", (7, 3), (7, 3)),
+        ),
+    ];
+    for (day, stem, meta, turn, usage) in files {
+        let dir = base.join(".codex/sessions").join(day);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{stem}.jsonl")),
+            format!("{meta}\n{turn}\n{usage}\n"),
+        )
+        .unwrap();
+    }
+    (original, continuation, child)
+}
+
+/// A subagent's parent link must name a parent row the report actually kept.
+/// With a date filter that drops the parent's first rollout, the link moves to
+/// the surviving continuation; without one, the first rollout wins. Both the
+/// cold parser path and the warm source cache must agree, and usage must not
+/// move between rows.
+#[test]
+fn test_codex_subagent_parent_link_follows_date_filter_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    let (original, continuation, child) = write_codex_continued_parent_with_subagent(tmp.path());
+
+    let report = |since: Option<&str>| {
+        let mut cmd = cmd_with_home(tmp.path());
+        cmd.args(["models", "--json", "--client", "codex", "--no-spinner"])
+            .args(["--group-by", "client,workspace,session,model"]);
+        if let Some(since) = since {
+            cmd.args(["--since", since]);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "report failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let parent_of = |json: &serde_json::Value, session: &str| {
+        json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|meta| meta["sessionId"] == session)
+            .unwrap_or_else(|| panic!("missing session metadata for {session}"))
+            .get("parentSessionId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    let session_ids = |json: &serde_json::Value| {
+        let mut ids: Vec<String> = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["sessionId"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    for pass in ["cold", "warm"] {
+        let filtered = report(Some("2026-10-09"));
+        let mut expected = vec![continuation.clone(), child.clone()];
+        expected.sort();
+        assert_eq!(session_ids(&filtered), expected, "{pass} cache pass");
+        assert_eq!(
+            parent_of(&filtered, &child).as_deref(),
+            Some(continuation.as_str()),
+            "{pass} cache pass: the link must name the surviving continuation"
+        );
+        assert_eq!(
+            parent_of(&filtered, &continuation),
+            None,
+            "{pass} cache pass"
+        );
+        assert_eq!(
+            filtered["totalInput"].as_i64(),
+            Some(27),
+            "{pass} cache pass"
+        );
+        assert_eq!(
+            filtered["totalOutput"].as_i64(),
+            Some(11),
+            "{pass} cache pass"
+        );
+
+        let unfiltered = report(None);
+        assert_eq!(session_ids(&unfiltered).len(), 3, "{pass} cache pass");
+        assert_eq!(
+            parent_of(&unfiltered, &child).as_deref(),
+            Some(original.as_str()),
+            "{pass} cache pass: the thread's first rollout wins when it is kept"
+        );
+        assert_eq!(
+            unfiltered["totalInput"].as_i64(),
+            Some(37),
+            "{pass} cache pass"
+        );
+        assert_eq!(
+            unfiltered["totalOutput"].as_i64(),
+            Some(15),
+            "{pass} cache pass"
+        );
+    }
+}
+
 /// The lane's cross-file dedup pass, isolated from the seq boundary.
 ///
 /// Without `seedLength` in the header the parser cannot tell a seeded row from
