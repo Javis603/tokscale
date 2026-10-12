@@ -3057,6 +3057,88 @@ fn test_dsh_zstd_transcript_counts_identically_cold_and_warm_cache() {
 /// A forked DSH session copies the parent's completed prefix into the child
 /// transcript verbatim, so the pair must still bill the seeded call once.
 #[test]
+fn test_dsh_keepalive_attribution_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    let dir = dsh_sessions_root(tmp.path())
+        .join("-work")
+        .join("session-keepalive");
+    fs::create_dir_all(&dir).unwrap();
+    let lines = [
+        r#"{"type":"session","version":3,"id":"session-keepalive","createdAt":1,"cwd":"/work"}"#,
+        r#"{"type":"request/header","seq":1,"time":1790000001000,"data":{"header":{"config":{"provider":"cline-pass","model":"header-model"}}}}"#,
+        r#"{"type":"assistant/message","seq":2,"time":1790000001001,"data":{"turn":1,"message":{"id":"m-keepalive","source":{"provider":"cline-pass","model":"clinepass/cline-pass/deepseek-v4.1-flash","replayState":{"response":{"responseModel":"keepalive","responseId":"chatcmpl-keepalive"}}}},"usage":{"inputTokens":181,"outputTokens":1157,"cacheReadTokens":22400,"reasoningTokens":100}}}"#,
+        r#"{"type":"assistant/message","seq":3,"time":1790000001002,"data":{"turn":2,"message":{"id":"m-served","source":{"provider":"cline-pass","model":"glm-5.2","replayState":{"response":{"responseModel":"glm-5.3","responseId":"chatcmpl-keepalive"}}}},"usage":{"inputTokens":100,"outputTokens":20}}}"#,
+        r#"{"type":"compaction/summary","seq":4,"time":1790000001003,"data":{"compactionId":"cmp-keepalive","message":{"source":{"provider":"cline-pass","replayState":{"response":{"responseModel":"keepalive"}}}},"usage":{"inputTokens":10,"outputTokens":5}}}"#,
+    ];
+    fs::write(
+        dir.join("session.v3.jsonl.zstd"),
+        zstd::encode_all(lines.join("\n").as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+
+    let mut cold = None;
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args([
+                "--json",
+                "--client",
+                "dsh",
+                "--group-by",
+                "client,workspace,session,model",
+                "--no-spinner",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "{pass}");
+        for (model, input, output, cache_read, reasoning) in [
+            (
+                "clinepass/cline-pass/deepseek-v4.1-flash",
+                181,
+                1057,
+                22400,
+                100,
+            ),
+            ("glm-5.3", 100, 20, 0, 0),
+            ("header-model", 10, 5, 0, 0),
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry["model"] == model)
+                .expect(model);
+            assert_eq!(entry["client"], "dsh");
+            assert_eq!(entry["provider"], "cline-pass");
+            assert_eq!(entry["input"], input);
+            assert_eq!(entry["output"], output);
+            assert_eq!(entry["cacheRead"], cache_read);
+            assert_eq!(entry["reasoning"], reasoning);
+            assert_eq!(entry["messageCount"], 1);
+        }
+        assert_eq!(json["totalMessages"], 3);
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(json["workspaces"].as_array().unwrap().len(), 1);
+        // All fixture models are unpriced, so their equal-cost sort order
+        // is not stable across scans. Compare rows by model identity.
+        let mut ordered = entries.clone();
+        ordered.sort_by(|a, b| a["model"].as_str().cmp(&b["model"].as_str()));
+        if let Some(cold) = &cold {
+            assert_eq!(
+                ordered, *cold,
+                "warm cache preserves model attribution and totals"
+            );
+        } else {
+            cold = Some(ordered);
+        }
+    }
+}
+
+#[test]
 fn test_dsh_forked_session_counts_the_seeded_prefix_once_cold_and_warm_cache() {
     let tmp = create_empty_fixture_dir();
     write_dsh_fork_pair(tmp.path());
