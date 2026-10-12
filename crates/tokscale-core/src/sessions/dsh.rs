@@ -23,7 +23,8 @@
 //!   provider and model on `data.message.source`. `source.model` is the model
 //!   configured for the request; when the provider serves a different model,
 //!   the response records its concrete identity on
-//!   `source.replayState.response.responseModel`, which takes precedence.
+//!   `source.replayState.response.responseModel`, which takes precedence
+//!   unless it is the known transport placeholder `keepalive`.
 //! - `compaction/summary`: the same usage and routing shape for the summarize
 //!   call DSH makes when it compacts a range. Real spend on the same account,
 //!   and disjoint from the loop steps around it.
@@ -689,12 +690,16 @@ fn stream_settled_ms(value: &Value) -> Option<i64> {
 /// provider-side substitutions can resolve to another model, which pi-ai
 /// records as `replayState.response.responseModel` when it differs from the
 /// request. That response identity is authoritative for attribution, pricing,
-/// and the model slot in the dedup key. Rows without it keep the configured
+/// and the model slot in the dedup key. An early gateway heartbeat may leave
+/// `keepalive` there: it identifies no model, so discard only that known
+/// placeholder. The response ID alone is not sufficient evidence to discard
+/// a genuine model. Rows without a usable response identity keep the configured
 /// source model, then the caller falls back to the latest request header.
 fn served_model(source: Option<&Value>) -> Option<&str> {
     source
         .and_then(|value| value.pointer("/replayState/response/responseModel"))
         .and_then(non_empty_string)
+        .filter(|model| !model.eq_ignore_ascii_case("keepalive"))
         .or_else(|| {
             source
                 .and_then(|value| value.get("model"))
@@ -1099,6 +1104,61 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "x-ai/grok-4.6");
         assert_eq!(messages[0].provider_id, "openrouter");
+    }
+
+    #[test]
+    fn keepalive_response_model_falls_back_without_guessing_other_models() {
+        for response_model in ["keepalive", " keepalive ", "KEEPALIVE"] {
+            for response_id in [Some("chatcmpl-keepalive"), Some("other-id"), None] {
+                let source = serde_json::json!({
+                    "model": "requested-model",
+                    "replayState": { "response": {
+                        "responseModel": response_model,
+                        "responseId": response_id
+                    } }
+                });
+                assert_eq!(served_model(Some(&source)), Some("requested-model"));
+            }
+        }
+        // The ID alone must not override a genuine model substitution, nor
+        // should an unfamiliar or unpriced model be treated as a sentinel.
+        for response_model in ["glm-5.3", "unknown-to-pricing", "keepalive-model"] {
+            let source = serde_json::json!({
+                "model": "requested-model",
+                "replayState": { "response": {
+                    "responseModel": response_model,
+                    "responseId": "chatcmpl-keepalive"
+                } }
+            });
+            assert_eq!(served_model(Some(&source)), Some(response_model));
+        }
+        let source = serde_json::json!({
+            "replayState": { "response": { "responseModel": "keepalive" } }
+        });
+        assert_eq!(served_model(Some(&source)), None);
+    }
+
+    #[test]
+    fn keepalive_attribution_preserves_usage_and_compaction_calls() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","id":"session-keepalive","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"request/header","seq":1,"time":1790000001000,"data":{"header":{"config":{"provider":"cline-pass","model":"header-model"}}}}"#,
+            r#"{"type":"assistant/message","seq":2,"time":1790000001001,"data":{"turn":1,"message":{"id":"m-keepalive","source":{"provider":"cline-pass","model":"clinepass/cline-pass/deepseek-v4.1-flash","replayState":{"response":{"model":"requested-replay-model","responseModel":"keepalive","responseId":"chatcmpl-keepalive"}}}},"usage":{"inputTokens":181,"outputTokens":1157,"cacheReadTokens":22400,"reasoningTokens":100}}}"#,
+            r#"{"type":"compaction/summary","seq":3,"time":1790000001002,"data":{"compactionId":"summary-keepalive","message":{"source":{"provider":"cline-pass","replayState":{"response":{"responseModel":"keepalive"}}}},"usage":{"inputTokens":10,"outputTokens":20,"cacheWriteTokens":5}}}"#,
+        ]);
+        let messages = parse_dsh_file(file.path());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].model_id,
+            "clinepass/cline-pass/deepseek-v4.1-flash"
+        );
+        assert_eq!(messages[0].provider_id, "cline-pass");
+        assert_eq!(messages[0].tokens.total(), 23738);
+        assert_eq!(messages[0].tokens.output, 1057);
+        assert_eq!(messages[0].tokens.reasoning, 100);
+        assert_eq!(messages[0].dedup_key.as_deref(), Some("dsh:msg:m-keepalive:1790000001001:cline-pass:clinepass/cline-pass/deepseek-v4.1-flash:181:1057:22400:0:100"));
+        assert_eq!(messages[1].model_id, "header-model");
+        assert_eq!(messages[1].tokens.total(), 35);
     }
 
     #[test]
