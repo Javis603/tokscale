@@ -94,6 +94,7 @@ pub struct ScanResult {
     pub files: [Vec<PathBuf>; ClientId::COUNT],
     /// Known directory traversal failures, independent of discovered files.
     pub(crate) source_read_failures: HashSet<ClientId>,
+    pub(crate) acknowledged_scan_roots: BTreeMap<String, Vec<String>>,
     /// All OpenCode SQLite databases discovered under the data dir.
     ///
     /// Includes the default `opencode.db` (used by `latest`/`beta` channels
@@ -144,6 +145,7 @@ impl Default for ScanResult {
         Self {
             files: std::array::from_fn(|_| Vec::new()),
             source_read_failures: HashSet::new(),
+            acknowledged_scan_roots: BTreeMap::new(),
             opencode_dbs: Vec::new(),
             copilot_desktop_db: None,
             copilot_session_store_db: None,
@@ -719,6 +721,46 @@ fn scan_directory_with_health(root: &str, pattern: &str) -> (Vec<PathBuf>, bool)
 /// Only returns entries whose client is present in `enabled`.
 /// This is a pure function — the caller is responsible for reading the
 /// environment variable and passing its value here.
+/// Lossless roots: JSON object of public client IDs to arrays of absolute paths.
+/// Invalid declarations cannot certify any selected scope as complete.
+fn parse_scan_roots_json(
+    value: &str,
+    enabled: &HashSet<ClientId>,
+) -> (Vec<(ClientId, String)>, HashSet<ClientId>) {
+    let mut roots = Vec::new();
+    let mut failures = HashSet::new();
+    let Ok(Value::Object(clients)) = serde_json::from_str(value) else {
+        return (roots, enabled.clone());
+    };
+    for (name, paths) in clients {
+        let Some(client) = ClientId::from_str(&name) else {
+            failures.extend(enabled);
+            continue;
+        };
+        if !enabled.contains(&client) {
+            continue;
+        }
+        if !supports_extra_dir_scanning(client) {
+            failures.insert(client);
+            continue;
+        }
+        let Value::Array(paths) = paths else {
+            failures.insert(client);
+            continue;
+        };
+        for path in paths {
+            let Some(path) = path.as_str().filter(|path| {
+                !path.is_empty() && !path.contains('\0') && Path::new(path).is_absolute()
+            }) else {
+                failures.insert(client);
+                continue;
+            };
+            roots.push((client, path.to_string()));
+        }
+    }
+    (roots, failures)
+}
+
 pub fn parse_extra_dirs(value: &str, enabled: &HashSet<ClientId>) -> Vec<(ClientId, String)> {
     if value.is_empty() {
         return Vec::new();
@@ -2216,7 +2258,41 @@ fn scan_all_clients_with_env_strategy_inner(
     // intentionally ignored when an explicit --home override disables env roots.
     if use_env_roots {
         let extra_dirs_val = std::env::var("TOKSCALE_EXTRA_DIRS").unwrap_or_default();
-        for (client_id, path) in parse_extra_dirs(&extra_dirs_val, &enabled_with_lookups) {
+        let mut extra_roots = parse_extra_dirs(&extra_dirs_val, &enabled_with_lookups);
+        match std::env::var("TOKSCALE_SCAN_ROOTS_JSON") {
+            Ok(value) => {
+                let (roots, failures) = parse_scan_roots_json(&value, &enabled_with_lookups);
+                for (client, root) in roots {
+                    if client == ClientId::Claude {
+                        let acknowledged = result
+                            .acknowledged_scan_roots
+                            .entry("claude".into())
+                            .or_default();
+                        if !acknowledged.contains(&root) {
+                            acknowledged.push(root.clone());
+                        }
+                        // JSON Claude roots are config directories, not projects.
+                        // A missing/invalid explicit config root is a failed read,
+                        // even if neither child directory has been created yet.
+                        if !std::fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+                            result.source_read_failures.insert(client);
+                        }
+                        for child in ["projects", "transcripts"] {
+                            let path = Path::new(&root).join(child);
+                            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client, path);
+                        }
+                    } else {
+                        extra_roots.push((client, root));
+                    }
+                }
+                result.source_read_failures.extend(failures);
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                result.source_read_failures.extend(&enabled_with_lookups);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+        }
+        for (client_id, path) in extra_roots {
             if std::fs::metadata(&path).is_err() {
                 result.source_read_failures.insert(client_id);
             }

@@ -53,6 +53,8 @@ fn snapshot(
         partial_clients: Vec::new(),
         bucket_timezone: "Etc/UTC".into(),
         day_key: "2026-03-03".into(),
+        scan_roots: Default::default(),
+        root_usage: Vec::new(),
         sessions: Vec::new(),
         scopes: Vec::new(),
         rows_without_identity: Default::default(),
@@ -424,4 +426,239 @@ fn source_snapshots_are_absent_without_opt_in() {
         .unwrap();
         assert!(graph.source_usage.is_none());
     }
+}
+
+#[test]
+fn source_snapshots_performance_and_unpriced_are_additive_native_token_buckets() {
+    let mut row = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unpriced-model",
+        10,
+        Some("message:key"),
+    );
+    row.tokens.output = 5;
+    row.tokens.reasoning = 3;
+    row.tokens.cache_write = 4;
+    row.tokens.cache_write_1h = 2;
+    row.duration_ms = Some(1000);
+    let graph = snapshot(
+        &selected(&["claude"]),
+        vec![row.clone(), row],
+        Some(SourceReadEvidence::new("claude", true, true)),
+    );
+    let wire = serde_json::to_value(graph.source_usage.unwrap()).unwrap();
+    let c = &wire["sessions"][0]["events"][0]["contributions"][0];
+    assert_eq!(c["tokens"]["output"], 10);
+    assert_eq!(c["tokens"]["reasoning"], 6);
+    assert_eq!(c["tokens"]["cacheWrite"], 8);
+    assert_eq!(c["tokens"]["cacheWrite1h"], 4);
+    assert_eq!(c["pricing"]["unpricedTokens"], 44);
+    assert_eq!(c["pricing"]["unpricedMessages"], 2);
+    assert_eq!(c["performance"]["timedTokens"], 44);
+    assert_eq!(c["performance"]["timedOutputTokens"], 16);
+    assert_eq!(c["performance"]["totalDurationMs"], 2000);
+    assert_eq!(c["performance"]["sampleCount"], 2);
+}
+
+#[test]
+fn source_snapshots_claude_mirror_requires_project_session_relationship() {
+    use crate::sessions::claudecode::is_ssh_mirror;
+    use std::path::Path;
+    assert!(is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-session/session.jsonl"
+    )));
+    assert!(is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-session/session/subagents/agent-a.jsonl"
+    )));
+    assert!(!is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-session/unrelated.jsonl"
+    )));
+    assert!(!is_ssh_mirror(Path::new("/home/ssh-session/session.jsonl")));
+    assert!(!is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-/session.jsonl"
+    )));
+}
+
+#[test]
+fn source_snapshots_model_performance_matches_timed_output_and_reasoning() {
+    let mut timed = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "model",
+        10,
+        Some("message:timed"),
+    );
+    timed.tokens.output = 5;
+    timed.tokens.reasoning = 3;
+    timed.duration_ms = Some(1000);
+    let mut untimed = timed.clone();
+    untimed.dedup_key = Some("message:untimed".into());
+    untimed.tokens.output = 100;
+    untimed.tokens.reasoning = 50;
+    untimed.duration_ms = None;
+    let rows = vec![timed, untimed];
+    let entries = crate::aggregate_model_usage_entries_with_source_metadata(
+        rows.clone(),
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+        true,
+        None,
+    );
+    assert_eq!(entries[0].performance.timed_output_tokens, Some(8));
+    assert_eq!(entries[0].performance.timed_tokens, 18);
+    let ordinary = crate::aggregate_model_usage_entries_with_labeler(
+        rows,
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+    );
+    assert!(ordinary[0].performance.timed_output_tokens.is_none());
+}
+
+#[test]
+fn source_snapshots_unpriced_report_counters_preserve_nonzero_fallback_costs_and_authority() {
+    let options = ReportOptions::default();
+    let mut unknown = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unknown",
+        10,
+        Some("first"),
+    );
+    unknown.tokens.output = 5;
+    unknown.tokens.reasoning = 3;
+    unknown.tokens.cache_read = 7;
+    unknown.tokens.cache_write = 5;
+    unknown.tokens.cache_write_1h = 2; // Subset already counted in cache_write.
+    unknown.cost = 2.5;
+    unknown.mark_estimated_cost();
+    let mut second = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unknown",
+        50,
+        Some("second"),
+    );
+    second.cost = 1.5;
+    second.mark_estimated_cost();
+    let mut authoritative = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unknown",
+        20,
+        Some("reported"),
+    );
+    authoritative.cost = 0.0;
+    authoritative.mark_provider_reported_cost();
+    let rows = vec![unknown, second, authoritative];
+    let graph = snapshot(&options, rows.clone(), None);
+    assert_eq!(graph.contributions[0].clients[0].unpriced_tokens, Some(80));
+    assert_eq!(graph.summary.total_cost, 4.0);
+    let source_total: i64 = graph
+        .source_usage
+        .as_ref()
+        .unwrap()
+        .sessions
+        .iter()
+        .flat_map(|session| &session.events)
+        .flat_map(|event| &event.contributions)
+        .map(|row| row.pricing.as_ref().unwrap().unpriced_tokens)
+        .sum();
+    assert_eq!(source_total, 80);
+    let entries = crate::aggregate_model_usage_entries_with_source_metadata(
+        rows.clone(),
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+        true,
+        None,
+    );
+    assert_eq!(entries[0].unpriced_tokens, Some(80));
+    assert_eq!(entries[0].cost, 4.0);
+    let ordinary = crate::aggregate_model_usage_entries_with_labeler(
+        rows.clone(),
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+    );
+    assert!(ordinary[0].unpriced_tokens.is_none());
+    let legacy = serde_json::to_value(crate::aggregator::aggregate_by_date(rows)).unwrap();
+    assert!(legacy[0]["clients"][0].get("unpricedTokens").is_none());
+    let mut legacy_row = serde_json::to_value(&graph.contributions[0].clients[0]).unwrap();
+    legacy_row.as_object_mut().unwrap().remove("unpricedTokens");
+    let decoded: crate::ClientContribution = serde_json::from_value(legacy_row).unwrap();
+    assert!(decoded.unpriced_tokens.is_none());
+}
+
+#[test]
+fn source_snapshots_claude_declared_null_accounting_is_partial_but_missing_optional_is_supported() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("session.jsonl");
+    let legacy = serde_json::json!({
+        "type": "assistant", "timestamp": "2026-03-02T00:00:00Z", "requestId": "request",
+        "message": {"id": "same", "model": "unpriced-fixture-model", "usage": {
+            "input_tokens": 100, "output_tokens": 0,
+        }},
+    });
+    std::fs::write(&path, legacy.to_string()).unwrap();
+    let (rows, complete) =
+        crate::sessions::claudecode::parse_claude_file_for_source(&path, Some(home.path()));
+    assert!(complete);
+    let id = source_event_id(&rows[0]);
+    for pointer in [
+        "/message/usage/input_tokens",
+        "/message/usage/output_tokens",
+        "/message/usage/cache_read_input_tokens",
+        "/message/usage/cache_creation_input_tokens",
+        "/message/usage/cache_creation",
+        "/message/usage/cache_creation/ephemeral_1h_input_tokens",
+        "/message/usage/cache_creation/ephemeral_5m_input_tokens",
+        "/message/usage/cached_input_tokens",
+        "/message/usage/reasoning_output_tokens",
+        "/message/usage/inputTokens",
+        "/message/usage/outputTokens",
+        "/message/usage/total_tokens",
+        "/message/usage/output_tokens_details",
+        "/message/usage/performance",
+        "/message/performance",
+        "/performance",
+        "/duration_ms",
+        "/message/durationMs",
+    ] {
+        let mut row = legacy.clone();
+        let keys: Vec<_> = pointer.trim_start_matches('/').split('/').collect();
+        let mut value = &mut row;
+        for key in &keys[..keys.len() - 1] {
+            if !value[*key].is_object() {
+                value[*key] = serde_json::json!({});
+            }
+            value = &mut value[*key];
+        }
+        value[keys[keys.len() - 1]] = serde_json::Value::Null;
+        std::fs::write(&path, row.to_string()).unwrap();
+        let (rows, complete) =
+            crate::sessions::claudecode::parse_claude_file_for_source(&path, Some(home.path()));
+        assert!(!complete, "{pointer}");
+        if let Some(row) = rows.first() {
+            assert_eq!(source_event_id(row), id, "{pointer}");
+        }
+    }
+    // A null request-start timestamp must not certify a lost timed sample.
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}",
+            serde_json::json!({"type":"user", "timestamp":null}),
+            legacy
+        ),
+    )
+    .unwrap();
+    assert!(!crate::sessions::claudecode::parse_claude_file_for_source(&path, Some(home.path())).1);
 }

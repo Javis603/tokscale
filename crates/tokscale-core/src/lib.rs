@@ -313,6 +313,9 @@ pub struct ModelPerformance {
     pub ms_per_1k_tokens: Option<f64>,
     pub total_duration_ms: i64,
     pub timed_tokens: i64,
+    /// Exact generated tokens in timed messages, opt-in native source reports only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_output_tokens: Option<i64>,
     pub sample_count: i32,
     pub token_coverage: f64,
 }
@@ -485,6 +488,12 @@ pub struct ClientContribution {
     pub model_id: String,
     pub provider_id: String,
     pub tokens: TokenBreakdown,
+    #[serde(
+        default,
+        rename = "unpricedTokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unpriced_tokens: Option<i64>,
     pub cost: f64,
     pub messages: i32,
 }
@@ -553,7 +562,8 @@ use source_snapshot::{
     source_dedup_domain, source_event_id, source_scope_id, SourceReadEvidence, SourceScopeFold,
 };
 pub use source_snapshot::{
-    SourceContribution, SourceEventUsage, SourceScopeUsage, SourceSessionUsage, SourceUsage,
+    SourceContribution, SourceEventUsage, SourcePerformance, SourcePricing, SourceRootUsage,
+    SourceScopeUsage, SourceSessionUsage, SourceTokens, SourceUsage,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -623,6 +633,8 @@ pub struct ModelUsage {
     pub reasoning: i64,
     pub message_count: i32,
     pub cost: f64,
+    #[serde(rename = "unpricedTokens", skip_serializing_if = "Option::is_none")]
+    pub unpriced_tokens: Option<i64>,
     pub performance: ModelPerformance,
 }
 
@@ -703,6 +715,8 @@ pub struct WorkspaceMeta {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelReport {
+    #[serde(rename = "sourceUsage", skip_serializing_if = "Option::is_none")]
+    pub source_usage: Option<SourceUsage>,
     pub entries: Vec<ModelUsage>,
     /// Populated only for session-grouped reports, where a caller can join it
     /// back onto the rows. Empty otherwise, so no other report path pays for it.
@@ -2467,10 +2481,42 @@ fn parse_all_messages_streaming<S: MessageSink>(
     }
 
     let claude_home = PathBuf::from(home_dir);
-    let claude_outcomes: Vec<CachedParseOutcome> = scan_result
+    let claude_outcomes: Vec<(bool, CachedParseOutcome, Option<SourceReadEvidence>)> = scan_result
         .get(ClientId::Claude)
         .par_iter()
         .map(|path| {
+            let mirror = source_evidence && sessions::claudecode::is_ssh_mirror(path);
+            if source_evidence {
+                let before = message_cache::SourceFingerprint::from_claude_code_path_with_home(path, Some(&claude_home));
+                let (mut messages, complete) = sessions::claudecode::parse_claude_file_for_source(path, Some(&claude_home));
+                let after = message_cache::SourceFingerprint::from_claude_code_path_with_home(path, Some(&claude_home));
+                let mut evidence = SourceReadEvidence::new("claude", complete && before.is_some() && before == after, true);
+                let zone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+                let canonical_path = std::fs::canonicalize(path).ok();
+                let roots: Vec<_> = scan_result.acknowledged_scan_roots.get("claude").into_iter().flatten()
+                    .filter(|root| {
+                        ["projects", "transcripts"].iter().any(|child| {
+                            let child = Path::new(root).join(child);
+                            path.starts_with(&child) || std::fs::canonicalize(child).ok()
+                                .zip(canonical_path.as_ref()).is_some_and(|(root, path)| path.starts_with(root))
+                        })
+                    }).collect();
+                for message in &messages {
+                    evidence.identity_exact &= message.dedup_key.as_deref().is_none_or(sessions::claudecode::dedup_key_is_globally_stable);
+                    evidence.sessions.push((message.client.clone(), message.session_id.clone()));
+                    for root in &roots {
+                        let total = evidence.root_samples.entry(((*root).clone(), zone.day_key(message.timestamp))).or_default();
+                        *total = total.saturating_add(positive_token_total(&message.tokens));
+                    }
+                    if let Some(id) = source_event_id(message) {
+                        evidence.observation_kinds.push((id, if mirror { "mirror" } else { "native" }));
+                    } else {
+                        evidence.null_observation_kinds.push(((message.client.clone(), message.session_id.clone()), if mirror { "mirror" } else { "native" }));
+                    }
+                }
+                apply_pricing_to_messages(&mut messages, pricing);
+                return (mirror, CachedParseOutcome { messages, retained_message_keys: HashSet::new(), cache_entry: None, invalidate_cache: false }, Some(evidence));
+            }
             // Claude Code rewrites a transcript in place on resume/compact,
             // so a file can lose assistant turns it already published. The
             // retaining loader keeps those turns in the cache entry for as
@@ -2483,7 +2529,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             // collapses against the same turn replayed into a forked
             // transcript. Tool-result keys embed the transcript's file stem
             // and would not — see `dedup_key_is_globally_stable`.
-            load_or_parse_source_with_fingerprint_retaining_history(
+            (false, load_or_parse_source_with_fingerprint_retaining_history(
                 message_cache::CacheIdentity::for_client(ClientId::Claude),
                 path,
                 &source_cache,
@@ -2498,25 +2544,55 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     )
                 },
                 |path| sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home)),
-            )
+            ), None)
         })
         .collect();
-    let mut claude_messages: Vec<(bool, UnifiedMessage)> = Vec::new();
+    let mut claude_evidence = SourceReadEvidence::new(
+        "claude",
+        !scan_result.source_read_failures.contains(&ClientId::Claude),
+        true,
+    );
+    claude_evidence.scan_roots = scan_result.acknowledged_scan_roots.clone();
+    let mut claude_messages: Vec<(bool, bool, UnifiedMessage)> = Vec::new();
     let mut claude_keyed_indices: HashMap<String, usize> = HashMap::new();
-    for outcome in claude_outcomes {
+    for (mirror, outcome, evidence) in claude_outcomes {
+        if let Some(evidence) = evidence {
+            claude_evidence.complete &= evidence.complete;
+            claude_evidence.identity_exact &= evidence.identity_exact;
+            claude_evidence.sessions.extend(evidence.sessions);
+            for (key, tokens) in evidence.root_samples {
+                let total = claude_evidence.root_samples.entry(key).or_default();
+                *total = total.saturating_add(tokens);
+            }
+            claude_evidence
+                .null_observation_kinds
+                .extend(evidence.null_observation_kinds);
+            claude_evidence
+                .observation_kinds
+                .extend(evidence.observation_kinds);
+        }
         for message in outcome.messages {
             let Some(key) = message.dedup_key.clone().filter(|key| !key.is_empty()) else {
-                claude_messages.push((false, message));
+                claude_messages.push((false, mirror, message));
                 continue;
             };
             let is_retained = outcome.retained_message_keys.contains(&key);
             let Some(index) = claude_keyed_indices.get(&key).copied() else {
                 claude_keyed_indices.insert(key, claude_messages.len());
-                claude_messages.push((is_retained, message));
+                claude_messages.push((is_retained, mirror, message));
                 continue;
             };
 
-            let (existing_is_retained, existing) = &mut claude_messages[index];
+            let (existing_is_retained, existing_mirror, existing) = &mut claude_messages[index];
+            if source_evidence && *existing_mirror != mirror {
+                // Prefer the proven native observation, including a downward correction.
+                if !mirror {
+                    *existing = message;
+                    *existing_is_retained = is_retained;
+                    *existing_mirror = false;
+                }
+                continue;
+            }
             merge_claude_cross_file_duplicate(
                 existing,
                 existing_is_retained,
@@ -2529,7 +2605,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
             source_cache.insert(entry);
         }
     }
-    all_messages.extend(claude_messages.into_iter().map(|(_, message)| message));
+    if source_evidence {
+        sink.observe_source(claude_evidence);
+    }
+    all_messages.extend(claude_messages.into_iter().map(|(_, _, message)| message));
     flush_lane(&mut all_messages, &flush_context, sink);
 
     // Rollouts OpenClaw drove through Codex app-server leave the codex parser
@@ -4659,6 +4738,19 @@ fn aggregate_model_usage_entries_with_labeler(
     rollup: WorktreeRollup,
     labeler: &mut WorkspaceLabeler,
 ) -> Vec<ModelUsage> {
+    aggregate_model_usage_entries_with_source_metadata(
+        messages, group_by, rollup, labeler, false, None,
+    )
+}
+
+fn aggregate_model_usage_entries_with_source_metadata(
+    messages: Vec<UnifiedMessage>,
+    group_by: &GroupBy,
+    rollup: WorktreeRollup,
+    labeler: &mut WorkspaceLabeler,
+    include_source_metadata: bool,
+    pricing: Option<&pricing::PricingService>,
+) -> Vec<ModelUsage> {
     let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
 
     // Bucketing a workspace resolves its label, which reads the filesystem. Every
@@ -4737,7 +4829,11 @@ fn aggregate_model_usage_entries_with_labeler(
             reasoning: 0,
             message_count: 0,
             cost: 0.0,
-            performance: ModelPerformance::default(),
+            unpriced_tokens: include_source_metadata.then_some(0),
+            performance: ModelPerformance {
+                timed_output_tokens: include_source_metadata.then_some(0),
+                ..Default::default()
+            },
         });
 
         if merge_clients {
@@ -4767,9 +4863,25 @@ fn aggregate_model_usage_entries_with_labeler(
         entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
+        let token_total = positive_token_total(&msg.tokens);
+        if let Some(unpriced_tokens) = &mut entry.unpriced_tokens {
+            if message_has_unpriced_usage(&msg, pricing) {
+                *unpriced_tokens = unpriced_tokens.saturating_add(token_total);
+            }
+        }
         entry
             .performance
-            .record_message(positive_token_total(&msg.tokens), msg.duration_ms);
+            .record_message(token_total, msg.duration_ms);
+        if token_total > 0 && msg.duration_ms.is_some_and(|duration| duration > 0) {
+            if let Some(timed_output) = &mut entry.performance.timed_output_tokens {
+                *timed_output = timed_output.saturating_add(
+                    msg.tokens
+                        .output
+                        .max(0)
+                        .saturating_add(msg.tokens.reasoning.max(0)),
+                );
+            }
+        }
     }
 
     let mut entries: Vec<ModelUsage> = model_map
@@ -4814,6 +4926,23 @@ fn positive_token_total(tokens: &TokenBreakdown) -> i64 {
         .saturating_add(tokens.reasoning.max(0))
 }
 
+/// Coverage classification shared by event proof and opt-in report counters.
+/// A fallback cost (even nonzero) does not establish native pricing coverage.
+fn message_has_unpriced_usage(
+    message: &UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+) -> bool {
+    positive_token_total(&message.tokens) > 0
+        && !message.has_authoritative_cost()
+        && pricing.is_none_or(|pricing| {
+            !pricing.covers_usage_with_provider(
+                &message.model_id,
+                Some(&message.provider_id),
+                &message.tokens,
+            )
+        })
+}
+
 /// Sum the (input, output, cache_read, cache_write) token fields across model
 /// usage entries with saturating_add, so clamped (i64::MAX) entry buckets from a
 /// corrupt source can't overflow the report-level totals (the entries are
@@ -4833,6 +4962,21 @@ fn model_report_token_totals(entries: &[ModelUsage]) -> (i64, i64, i64, i64) {
 }
 
 pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, String> {
+    get_model_report_with_source_mode(options, false).await
+}
+
+/// Native period report and event proof from one priced, deduplicated scan.
+/// Excludes recovery overlays; read/identity status is independent of date coverage.
+pub async fn get_source_snapshot_model_report(
+    options: ReportOptions,
+) -> Result<ModelReport, String> {
+    get_model_report_with_source_mode(options, true).await
+}
+
+async fn get_model_report_with_source_mode(
+    mut options: ReportOptions,
+    source_snapshots: bool,
+) -> Result<ModelReport, String> {
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -4846,15 +4990,44 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
         clients
     });
 
+    let source_usage = if source_snapshots {
+        Some(capture_source_usage(&mut options)?)
+    } else {
+        None
+    };
     let pricing = load_pricing_for_local_parse().await;
-    let all_messages = parse_all_messages_with_pricing_with_env_strategy_and_window(
-        &home_dir,
-        &clients,
-        pricing.as_deref(),
-        options.use_env_roots,
-        &options.scanner_settings,
-        Some(&options),
-    );
+    let (all_messages, source_usage) = if let Some(source_usage) = source_usage {
+        let mut sink = NativeSourceSink {
+            messages: Vec::new(),
+            evidence: GraphSink::new(
+                Some(&options),
+                pricing.as_deref(),
+                GraphPricingRequirement::LenientSourceSnapshots,
+            ),
+        };
+        sink.evidence.enable_source_snapshots(source_usage);
+        parse_all_messages_streaming_with_env_strategy(
+            &home_dir,
+            &clients,
+            pricing.as_deref(),
+            options.use_env_roots,
+            &options.scanner_settings,
+            &mut sink,
+        );
+        (sink.messages, sink.evidence.finish_source_usage())
+    } else {
+        (
+            parse_all_messages_with_pricing_with_env_strategy_and_window(
+                &home_dir,
+                &clients,
+                pricing.as_deref(),
+                options.use_env_roots,
+                &options.scanner_settings,
+                Some(&options),
+            ),
+            None,
+        )
+    };
 
     let mut filtered = filter_messages_for_report(all_messages, &options);
     resolve_codex_parent_session_ids(&mut filtered);
@@ -4869,12 +5042,23 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
         Vec::new()
     };
     let mut labeler = WorkspaceLabeler::default();
-    let entries = aggregate_model_usage_entries_with_labeler(
-        filtered,
-        &options.group_by,
-        options.worktree_rollup,
-        &mut labeler,
-    );
+    let entries = if source_snapshots {
+        aggregate_model_usage_entries_with_source_metadata(
+            filtered,
+            &options.group_by,
+            options.worktree_rollup,
+            &mut labeler,
+            true,
+            pricing.as_deref(),
+        )
+    } else {
+        aggregate_model_usage_entries_with_labeler(
+            filtered,
+            &options.group_by,
+            options.worktree_rollup,
+            &mut labeler,
+        )
+    };
     let workspaces = workspace_metadata_for_entries(&entries, &mut labeler);
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
@@ -4886,6 +5070,7 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
     let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
 
     Ok(ModelReport {
+        source_usage,
         entries,
         sessions,
         workspaces,
@@ -5154,6 +5339,31 @@ enum GraphPricingRequirement {
     Submission,
 }
 
+fn capture_source_usage(options: &mut ReportOptions) -> Result<SourceUsage, String> {
+    let captured_at = chrono::Utc::now();
+    let configured = bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+    let zone_name = configured.pinned_name().map(str::to_string)
+            .or_else(bucket_tz::detect_local_iana_name)
+            .ok_or_else(|| "cannot resolve the local bucket timezone for source snapshots; configure a named timezone".to_string())?;
+    options.scanner_settings.bucket_timezone = Some(zone_name.clone());
+    let zone = bucket_tz::BucketTimezone::from_pinned_name(Some(&zone_name));
+    Ok(SourceUsage {
+        version: 2,
+        event_identity_version: 2,
+        captured_at: captured_at.to_rfc3339(),
+        full_history: options.since.is_none() && options.until.is_none() && options.year.is_none(),
+        replacement_clients: source_replacement_clients(options.clients.as_deref()),
+        partial_clients: Vec::new(),
+        bucket_timezone: zone_name,
+        day_key: zone.day_key(captured_at.timestamp_millis()),
+        scan_roots: BTreeMap::new(),
+        root_usage: Vec::new(),
+        sessions: Vec::new(),
+        scopes: Vec::new(),
+        rows_without_identity: std::collections::BTreeMap::new(),
+    })
+}
+
 async fn generate_graph_with_loaded_pricing(
     mut options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
@@ -5165,29 +5375,7 @@ async fn generate_graph_with_loaded_pricing(
         pricing_requirement,
         GraphPricingRequirement::LenientSourceSnapshots
     ) {
-        let captured_at = chrono::Utc::now();
-        let configured =
-            bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
-        let zone_name = configured.pinned_name().map(str::to_string)
-            .or_else(bucket_tz::detect_local_iana_name)
-            .ok_or_else(|| "cannot resolve the local bucket timezone for source snapshots; configure a named timezone".to_string())?;
-        options.scanner_settings.bucket_timezone = Some(zone_name.clone());
-        let zone = bucket_tz::BucketTimezone::from_pinned_name(Some(&zone_name));
-        Some(SourceUsage {
-            version: 2,
-            event_identity_version: 2,
-            captured_at: captured_at.to_rfc3339(),
-            full_history: options.since.is_none()
-                && options.until.is_none()
-                && options.year.is_none(),
-            replacement_clients: source_replacement_clients(options.clients.as_deref()),
-            partial_clients: Vec::new(),
-            bucket_timezone: zone_name,
-            day_key: zone.day_key(captured_at.timestamp_millis()),
-            sessions: Vec::new(),
-            scopes: Vec::new(),
-            rows_without_identity: std::collections::BTreeMap::new(),
-        })
+        Some(capture_source_usage(&mut options)?)
     } else {
         None
     };
@@ -5274,6 +5462,9 @@ struct GraphSink<'a> {
     source_usage: Option<SourceUsage>,
     source_daily: Option<BTreeMap<(String, String), SourceSessionFold>>,
     source_scopes: BTreeMap<String, SourceScopeFold>,
+    source_observations: BTreeMap<String, &'static str>,
+    source_root_totals: BTreeMap<String, i64>,
+    source_null_observations: BTreeMap<(String, String), &'static str>,
     interner: sessionize::SpanInterner,
     spans: Vec<sessionize::SessionSpan>,
     /// Merged across batches by (provider, model); counts and tokens add.
@@ -5370,6 +5561,9 @@ impl<'a> GraphSink<'a> {
             source_usage: None,
             source_daily: None,
             source_scopes: BTreeMap::new(),
+            source_observations: BTreeMap::new(),
+            source_root_totals: BTreeMap::new(),
+            source_null_observations: BTreeMap::new(),
             interner: sessionize::SpanInterner::default(),
             spans: Vec::new(),
             unpriced_usage: HashMap::new(),
@@ -5392,6 +5586,130 @@ impl<'a> GraphSink<'a> {
         }
         self.source_usage = Some(source_usage);
         self.source_daily = Some(std::collections::BTreeMap::new());
+    }
+
+    fn add_source_contribution(&mut self, message: &UnifiedMessage) {
+        if let Some(sessions) = &mut self.source_daily {
+            if has_source_session_identity(message) {
+                let session = sessions
+                    .entry((message.client.clone(), message.session_id.clone()))
+                    .or_default();
+                let contribution = session
+                    .events
+                    .entry(source_event_id(message))
+                    .or_default()
+                    .entry((
+                        message.timestamp,
+                        canonical_model_id(&message.model_id),
+                        message.provider_id.clone(),
+                    ))
+                    .or_insert_with(|| SourceContribution::from_message(message));
+                contribution.add(message, self.pricing);
+            }
+        }
+    }
+
+    fn finish_source_usage(&mut self) -> Option<SourceUsage> {
+        if let Some(mut source_usage) = self.source_usage.take() {
+            let mut sessions = self.source_daily.take().unwrap_or_default();
+            consolidate_codex_source_groups(&mut sessions);
+            source_usage.sessions = sessions
+                .into_iter()
+                .map(|((client, session_id), fold)| {
+                    let null_kind = self
+                        .source_null_observations
+                        .get(&(client.clone(), session_id.clone()))
+                        .copied()
+                        .unwrap_or("native");
+                    SourceSessionUsage {
+                        scope_id: source_scope_id(&client),
+                        client,
+                        session_id,
+                        events: fold
+                            .events
+                            .into_iter()
+                            .map(|(id, contributions)| SourceEventUsage {
+                                observation_kind: id
+                                    .as_ref()
+                                    .and_then(|id| self.source_observations.get(id))
+                                    .copied()
+                                    .unwrap_or(null_kind),
+                                id,
+                                contributions: contributions.into_values().collect(),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            source_usage.scopes = std::mem::take(&mut self.source_scopes)
+                .into_iter()
+                .map(|(domain, fold)| fold.finish(&domain, &source_usage.replacement_clients))
+                .collect();
+            for scope in &source_usage.scopes {
+                if !source_snapshot::scope_has_selection_coverage(
+                    scope,
+                    &source_usage.replacement_clients,
+                ) {
+                    source_usage.partial_clients.extend(scope.clients.clone());
+                }
+            }
+            let root_read_status = source_usage
+                .scopes
+                .iter()
+                .find(|scope| scope.id == source_scope_id("claude"))
+                .map_or("unknown", |scope| scope.read_status);
+            source_usage.root_usage = std::mem::take(&mut self.source_root_totals)
+                .into_iter()
+                .map(|(root, total_tokens)| SourceRootUsage {
+                    root,
+                    client: "claude".into(),
+                    tokens: total_tokens,
+                    read_status: root_read_status,
+                })
+                .collect();
+            source_usage.partial_clients.sort();
+            source_usage.partial_clients.dedup();
+            return Some(source_usage);
+        }
+        None
+    }
+
+    fn observe_source_message(&mut self, message: &UnifiedMessage) {
+        // Observe parsed identities even when every row falls outside the
+        // requested window. Never invent IDs for sources the parser omitted.
+        if self.source_usage.is_some() {
+            let scope = self
+                .source_scopes
+                .entry(source_dedup_domain(&message.client).into())
+                .or_default();
+            scope.clients.insert(message.client.clone());
+            scope.unresolved_rows |= source_event_id(message).is_none()
+                || !has_source_session_identity(message)
+                || message.timestamp <= 0;
+        }
+        if let (Some(source_usage), Some(sessions)) =
+            (&mut self.source_usage, &mut self.source_daily)
+        {
+            if !source_client_has_replacement_scope(
+                &message.client,
+                &source_usage.replacement_clients,
+            ) && !source_usage.partial_clients.contains(&message.client)
+            {
+                source_usage.partial_clients.push(message.client.clone());
+                source_usage.partial_clients.sort();
+            }
+            if !has_source_session_identity(message) {
+                let rows = source_usage
+                    .rows_without_identity
+                    .entry(message.client.clone())
+                    .or_default();
+                *rows = rows.saturating_add(1);
+            } else {
+                sessions
+                    .entry((message.client.clone(), message.session_id.clone()))
+                    .or_default();
+            }
+        }
     }
 
     fn drain_batch(&mut self) {
@@ -5434,25 +5752,12 @@ impl<'a> GraphSink<'a> {
         };
 
         for message in &batch {
-            self.daily.add(message);
-            if let Some(sessions) = &mut self.source_daily {
-                if has_source_session_identity(message) {
-                    let session = sessions
-                        .entry((message.client.clone(), message.session_id.clone()))
-                        .or_default();
-                    let contribution = session
-                        .events
-                        .entry(source_event_id(message))
-                        .or_default()
-                        .entry((
-                            message.timestamp,
-                            canonical_model_id(&message.model_id),
-                            message.provider_id.clone(),
-                        ))
-                        .or_insert_with(|| SourceContribution::from_message(message));
-                    contribution.add(message);
-                }
+            if self.source_usage.is_some() {
+                self.daily.add_with_source_pricing(message, self.pricing);
+            } else {
+                self.daily.add(message);
             }
+            self.add_source_contribution(message);
             if message.timestamp > 0 {
                 self.spans.push(sessionize::SessionSpan::from_message(
                     message,
@@ -5468,6 +5773,7 @@ impl<'a> GraphSink<'a> {
         bucket_timezone: &bucket_tz::BucketTimezone,
     ) -> Result<GraphResult, String> {
         self.drain_batch();
+        let source_usage = self.finish_source_usage();
 
         let mut unpriced_submission_usage: Vec<UnpricedSubmissionUsage> = self
             .unpriced_usage
@@ -5511,42 +5817,7 @@ impl<'a> GraphSink<'a> {
 
         let processing_time_ms = start.elapsed().as_millis() as u32;
         let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
-        if let Some(mut source_usage) = self.source_usage {
-            let mut sessions = self.source_daily.unwrap_or_default();
-            consolidate_codex_source_groups(&mut sessions);
-            source_usage.sessions = sessions
-                .into_iter()
-                .map(|((client, session_id), fold)| SourceSessionUsage {
-                    scope_id: source_scope_id(&client),
-                    client,
-                    session_id,
-                    events: fold
-                        .events
-                        .into_iter()
-                        .map(|(id, contributions)| SourceEventUsage {
-                            id,
-                            contributions: contributions.into_values().collect(),
-                        })
-                        .collect(),
-                })
-                .collect();
-            source_usage.scopes = self
-                .source_scopes
-                .into_iter()
-                .map(|(domain, fold)| fold.finish(&domain, &source_usage.replacement_clients))
-                .collect();
-            for scope in &source_usage.scopes {
-                if !source_snapshot::scope_has_selection_coverage(
-                    scope,
-                    &source_usage.replacement_clients,
-                ) {
-                    source_usage.partial_clients.extend(scope.clients.clone());
-                }
-            }
-            source_usage.partial_clients.sort();
-            source_usage.partial_clients.dedup();
-            result.source_usage = Some(source_usage);
-        }
+        result.source_usage = source_usage;
         result.time_metrics = Some(time_metrics);
         result.unpriced_submission_usage = unpriced_submission_usage;
         result.incomplete_cost_dates = self.incomplete_cost_dates;
@@ -5558,6 +5829,32 @@ impl<'a> GraphSink<'a> {
         }
 
         Ok(result)
+    }
+}
+
+/// Reuses only the source folds; never builds a second graph or scans again.
+struct NativeSourceSink<'a> {
+    messages: Vec<UnifiedMessage>,
+    evidence: GraphSink<'a>,
+}
+impl MessageSink for NativeSourceSink<'_> {
+    fn wants_source_evidence(&self) -> bool {
+        true
+    }
+    fn observe_source(&mut self, evidence: SourceReadEvidence) {
+        self.evidence.observe_source(evidence);
+    }
+    fn accept(&mut self, message: UnifiedMessage) {
+        self.evidence.observe_source_message(&message);
+        if self
+            .evidence
+            .filter
+            .is_some_and(|options| !message_passes_report_filter(&message, options))
+        {
+            return;
+        }
+        self.evidence.add_source_contribution(&message);
+        self.messages.push(message);
     }
 }
 
@@ -5574,7 +5871,7 @@ impl MessageSink for GraphSink<'_> {
         self.source_usage.is_some()
     }
     fn observe_source(&mut self, evidence: SourceReadEvidence) {
-        let Some(source) = &self.source_usage else {
+        let Some(source) = &mut self.source_usage else {
             return;
         };
         // Do not export inventories of unselected surfaces or synthetic-only
@@ -5591,6 +5888,48 @@ impl MessageSink for GraphSink<'_> {
             .entry(evidence.domain.clone())
             .or_default();
         scope.observe(&evidence);
+        for (client, roots) in evidence.scan_roots {
+            if client == "claude" {
+                for root in &roots {
+                    self.source_root_totals.entry(root.clone()).or_default();
+                }
+            }
+            source.scan_roots.insert(client, roots);
+        }
+        for ((root, date), tokens) in evidence.root_samples {
+            if self.filter.is_some_and(|options| {
+                !date_passes_report_filter(
+                    &date,
+                    options.year.as_deref(),
+                    options.since.as_deref(),
+                    options.until.as_deref(),
+                )
+            }) {
+                continue;
+            }
+            let total = self.source_root_totals.entry(root).or_default();
+            *total = total.saturating_add(tokens);
+        }
+        for (owner, kind) in evidence.null_observation_kinds {
+            self.source_null_observations
+                .entry(owner)
+                .and_modify(|existing| {
+                    if kind == "native" {
+                        *existing = kind;
+                    }
+                })
+                .or_insert(kind);
+        }
+        for (id, kind) in evidence.observation_kinds {
+            self.source_observations
+                .entry(id)
+                .and_modify(|existing| {
+                    if kind == "native" {
+                        *existing = kind;
+                    }
+                })
+                .or_insert(kind);
+        }
         if let Some(sessions) = &mut self.source_daily {
             for (client, id) in evidence.sessions {
                 if source_client_has_replacement_scope(&client, &source.replacement_clients)
@@ -5604,41 +5943,7 @@ impl MessageSink for GraphSink<'_> {
     }
 
     fn accept(&mut self, message: UnifiedMessage) {
-        // Observe parsed identities even when every row falls outside the
-        // requested window. Never invent IDs for sources the parser omitted.
-        if self.source_usage.is_some() {
-            let scope = self
-                .source_scopes
-                .entry(source_dedup_domain(&message.client).into())
-                .or_default();
-            scope.clients.insert(message.client.clone());
-            scope.unresolved_rows |= source_event_id(&message).is_none()
-                || !has_source_session_identity(&message)
-                || message.timestamp <= 0;
-        }
-        if let (Some(source_usage), Some(sessions)) =
-            (&mut self.source_usage, &mut self.source_daily)
-        {
-            if !source_client_has_replacement_scope(
-                &message.client,
-                &source_usage.replacement_clients,
-            ) && !source_usage.partial_clients.contains(&message.client)
-            {
-                source_usage.partial_clients.push(message.client.clone());
-                source_usage.partial_clients.sort();
-            }
-            if !has_source_session_identity(&message) {
-                let rows = source_usage
-                    .rows_without_identity
-                    .entry(message.client.clone())
-                    .or_default();
-                *rows = rows.saturating_add(1);
-            } else {
-                sessions
-                    .entry((message.client.clone(), message.session_id.clone()))
-                    .or_default();
-            }
-        }
+        self.observe_source_message(&message);
         if let Some(options) = self.filter {
             if !message_passes_report_filter(&message, options) {
                 return;

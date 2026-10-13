@@ -12,11 +12,26 @@ pub struct SourceUsage {
     pub full_history: bool,
     pub bucket_timezone: String,
     pub day_key: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scan_roots: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub root_usage: Vec<SourceRootUsage>,
     pub replacement_clients: Vec<String>,
     pub partial_clients: Vec<String>,
     pub scopes: Vec<SourceScopeUsage>,
     pub sessions: Vec<SourceSessionUsage>,
     pub rows_without_identity: std::collections::BTreeMap<String, u64>,
+}
+
+/// Local scanner diagnostics only: never include roots in retained event proof.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRootUsage {
+    pub root: String,
+    pub client: String,
+    pub tokens: i64,
+    /// Conservative whole-Claude read health; any Claude failure marks every root partial.
+    pub read_status: &'static str,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -40,8 +55,10 @@ pub struct SourceSessionUsage {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceEventUsage {
     pub id: Option<String>,
+    pub observation_kind: &'static str,
     pub contributions: Vec<SourceContribution>,
 }
 
@@ -54,6 +71,27 @@ pub struct SourceContribution {
     pub tokens: SourceTokens,
     pub cost: f64,
     pub messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<SourcePricing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance: Option<SourcePerformance>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePricing {
+    pub unpriced_tokens: i64,
+    pub unpriced_messages: i32,
+}
+
+/// Additive samples use the native total (output and reasoning are disjoint).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePerformance {
+    pub total_duration_ms: i64,
+    pub timed_tokens: i64,
+    pub timed_output_tokens: i64,
+    pub sample_count: i32,
 }
 
 /// cacheWrite includes the 1-hour subset, as in normal graph token totals.
@@ -64,6 +102,7 @@ pub struct SourceTokens {
     pub output: i64,
     pub cache_read: i64,
     pub cache_write: i64,
+    pub cache_write_1h: i64,
     pub reasoning: i64,
 }
 
@@ -76,6 +115,8 @@ impl SourceContribution {
             tokens: SourceTokens::default(),
             cost: 0.0,
             messages: 0,
+            pricing: Some(SourcePricing::default()),
+            performance: None,
         }
     }
     pub(crate) fn merge(&mut self, other: Self) {
@@ -90,10 +131,43 @@ impl SourceContribution {
             .cache_write
             .saturating_add(other.tokens.cache_write);
         self.tokens.reasoning = self.tokens.reasoning.saturating_add(other.tokens.reasoning);
+        self.tokens.cache_write_1h = self
+            .tokens
+            .cache_write_1h
+            .saturating_add(other.tokens.cache_write_1h);
+        if let Some(other) = other.pricing {
+            let pricing = self.pricing.get_or_insert_with(SourcePricing::default);
+            pricing.unpriced_tokens = pricing
+                .unpriced_tokens
+                .saturating_add(other.unpriced_tokens);
+            pricing.unpriced_messages = pricing
+                .unpriced_messages
+                .saturating_add(other.unpriced_messages);
+        }
+        if let Some(other) = other.performance {
+            self.add_performance(other);
+        }
         self.cost += other.cost;
         self.messages = self.messages.saturating_add(other.messages);
     }
-    pub(crate) fn add(&mut self, message: &UnifiedMessage) {
+    fn add_performance(&mut self, other: SourcePerformance) {
+        let performance = self
+            .performance
+            .get_or_insert_with(SourcePerformance::default);
+        performance.total_duration_ms = performance
+            .total_duration_ms
+            .saturating_add(other.total_duration_ms);
+        performance.timed_tokens = performance.timed_tokens.saturating_add(other.timed_tokens);
+        performance.timed_output_tokens = performance
+            .timed_output_tokens
+            .saturating_add(other.timed_output_tokens);
+        performance.sample_count = performance.sample_count.saturating_add(other.sample_count);
+    }
+    pub(crate) fn add(
+        &mut self,
+        message: &UnifiedMessage,
+        pricing: Option<&crate::pricing::PricingService>,
+    ) {
         let TokenBreakdown {
             input,
             output,
@@ -107,6 +181,33 @@ impl SourceContribution {
         self.tokens.cache_read = self.tokens.cache_read.saturating_add(cache_read);
         self.tokens.cache_write = self.tokens.cache_write.saturating_add(cache_write);
         self.tokens.reasoning = self.tokens.reasoning.saturating_add(reasoning);
+        self.tokens.cache_write_1h = self
+            .tokens
+            .cache_write_1h
+            .saturating_add(message.tokens.cache_write_1h);
+        let total = crate::positive_token_total(&message.tokens);
+        if crate::message_has_unpriced_usage(message, pricing) {
+            let pricing = self.pricing.get_or_insert_with(SourcePricing::default);
+            pricing.unpriced_tokens = pricing.unpriced_tokens.saturating_add(total);
+            pricing.unpriced_messages = pricing
+                .unpriced_messages
+                .saturating_add(message.message_count.max(0));
+        }
+        if let Some(duration) = message
+            .duration_ms
+            .filter(|duration| *duration > 0 && total > 0)
+        {
+            self.add_performance(SourcePerformance {
+                total_duration_ms: duration,
+                timed_tokens: total,
+                timed_output_tokens: message
+                    .tokens
+                    .output
+                    .max(0)
+                    .saturating_add(message.tokens.reasoning.max(0)),
+                sample_count: 1,
+            });
+        }
         self.cost += message.cost;
         self.messages = self.messages.saturating_add(message.message_count.max(0));
     }
@@ -168,6 +269,10 @@ pub(crate) struct SourceReadEvidence {
     pub complete: bool,
     pub identity_exact: bool,
     pub sessions: Vec<(String, String)>,
+    pub observation_kinds: Vec<(String, &'static str)>,
+    pub null_observation_kinds: Vec<((String, String), &'static str)>,
+    pub root_samples: std::collections::BTreeMap<(String, String), i64>,
+    pub scan_roots: std::collections::BTreeMap<String, Vec<String>>,
 }
 impl SourceReadEvidence {
     pub(crate) fn new(domain: &str, complete: bool, identity_exact: bool) -> Self {
@@ -176,6 +281,10 @@ impl SourceReadEvidence {
             complete,
             identity_exact,
             sessions: Vec::new(),
+            observation_kinds: Vec::new(),
+            null_observation_kinds: Vec::new(),
+            root_samples: Default::default(),
+            scan_roots: Default::default(),
         }
     }
 }

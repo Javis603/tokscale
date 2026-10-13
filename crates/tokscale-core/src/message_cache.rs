@@ -310,7 +310,6 @@ impl SourceFingerprint {
     /// Fingerprint for a Claude Code JSONL file that may have a sibling `.meta.json`
     /// sidecar. When the sidecar appears or changes (e.g. after a Claude Code upgrade),
     /// the fingerprint changes and the cache invalidates.
-    #[cfg(test)]
     pub(crate) fn from_claude_code_path_with_home(
         path: &Path,
         home_dir: Option<&Path>,

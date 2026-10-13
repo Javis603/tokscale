@@ -65,6 +65,22 @@ impl DailyFold {
             .add_message(message);
     }
 
+    pub(crate) fn add_with_source_pricing(
+        &mut self,
+        message: &UnifiedMessage,
+        pricing: Option<&crate::pricing::PricingService>,
+    ) {
+        let unpriced_tokens = if crate::message_has_unpriced_usage(message, pricing) {
+            crate::positive_token_total(&message.tokens)
+        } else {
+            0
+        };
+        self.days
+            .entry(message.date.clone())
+            .or_default()
+            .add_message_with_unpriced(message, Some(unpriced_tokens));
+    }
+
     pub fn finish(self) -> Vec<DailyContribution> {
         // Convert to sorted vector with pre-allocated capacity
         let mut contributions: Vec<DailyContribution> = Vec::with_capacity(self.days.len());
@@ -284,6 +300,10 @@ impl Default for DayAccumulator {
 
 impl DayAccumulator {
     fn add_message(&mut self, msg: &UnifiedMessage) {
+        self.add_message_with_unpriced(msg, None);
+    }
+
+    fn add_message_with_unpriced(&mut self, msg: &UnifiedMessage, unpriced_tokens: Option<i64>) {
         let total_tokens = msg.tokens.total();
 
         self.totals.tokens = self.totals.tokens.saturating_add(total_tokens);
@@ -308,6 +328,7 @@ impl DayAccumulator {
             .clients
             .entry(key)
             .or_insert_with(|| ClientContribution {
+                unpriced_tokens: None,
                 client: msg.client.clone(),
                 model_id: crate::canonical_model_id(&msg.model_id),
                 provider_id: msg.provider_id.clone(),
@@ -325,6 +346,10 @@ impl DayAccumulator {
             client_entry.provider_id = format!("{}, {}", client_entry.provider_id, msg.provider_id);
         }
 
+        if let Some(tokens) = unpriced_tokens {
+            let unpriced = client_entry.unpriced_tokens.get_or_insert(0);
+            *unpriced = unpriced.saturating_add(tokens);
+        }
         client_entry.tokens += &msg.tokens;
         client_entry.cost += msg.cost;
         client_entry.messages = client_entry
@@ -350,6 +375,7 @@ impl DayAccumulator {
                 .clients
                 .entry(key)
                 .or_insert_with(|| ClientContribution {
+                    unpriced_tokens: None,
                     client: client_contrib.client.clone(),
                     model_id: client_contrib.model_id.clone(),
                     provider_id: client_contrib.provider_id.clone(),
@@ -365,6 +391,10 @@ impl DayAccumulator {
                 }
             }
 
+            if let Some(tokens) = client_contrib.unpriced_tokens {
+                let unpriced = entry.unpriced_tokens.get_or_insert(0);
+                *unpriced = unpriced.saturating_add(tokens);
+            }
             entry.tokens += &client_contrib.tokens;
             entry.cost += client_contrib.cost;
             entry.messages = entry.messages.saturating_add(client_contrib.messages);
@@ -471,6 +501,7 @@ impl SessionAccumulator {
             .clients
             .entry(key)
             .or_insert_with(|| ClientContribution {
+                unpriced_tokens: None,
                 client: msg.client.clone(),
                 model_id: normalized_model.clone(),
                 provider_id: msg.provider_id.clone(),
@@ -518,6 +549,7 @@ impl SessionAccumulator {
                 .clients
                 .entry(key)
                 .or_insert_with(|| ClientContribution {
+                    unpriced_tokens: None,
                     client: contrib.client.clone(),
                     model_id: contrib.model_id.clone(),
                     provider_id: contrib.provider_id.clone(),
@@ -1571,6 +1603,7 @@ mod tests {
                 reasoning: 40,
             },
             clients: vec![ClientContribution {
+                unpriced_tokens: None,
                 client: "codex".to_string(),
                 model_id: "gpt-5".to_string(),
                 provider_id: "openai".to_string(),

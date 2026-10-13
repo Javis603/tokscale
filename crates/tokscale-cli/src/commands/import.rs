@@ -1045,6 +1045,7 @@ fn add_row(day: &mut DayBuilder, client: &str, model: &str, tokens: TokenBreakdo
         .clients
         .entry(format!("{client}\u{0}{model}"))
         .or_insert_with(|| ClientContribution {
+            unpriced_tokens: None,
             client: client.to_string(),
             model_id: model.to_string(),
             provider_id: String::new(),

@@ -427,6 +427,190 @@ pub fn parse_claude_file_with_cache_and_home(
     parent_cache: &mut ParentSubagentTypeCache,
     home_dir: Option<&Path>,
 ) -> Vec<UnifiedMessage> {
+    parse_claude_file_internal(path, parent_cache, home_dir, None)
+}
+
+/// Fresh rows and read health from the same transcript pass. Unsupported
+/// headless layouts remain displayable, but cannot grant complete source proof.
+pub(crate) fn parse_claude_file_for_source(
+    path: &Path,
+    home_dir: Option<&Path>,
+) -> (Vec<UnifiedMessage>, bool) {
+    let mut complete = path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
+    let mut messages = parse_claude_file_internal(
+        path,
+        &mut ParentSubagentTypeCache::new(),
+        home_dir,
+        Some(&mut complete),
+    );
+    for message in &mut messages {
+        if message.dedup_key.as_deref().is_some_and(|key| {
+            key.strip_prefix("message:")
+                .is_some_and(|id| id.trim().is_empty())
+                || key
+                    .split_once(':')
+                    .is_some_and(|(id, request)| id.trim().is_empty() || request.trim().is_empty())
+        }) {
+            message.dedup_key = None;
+        }
+    }
+    (messages, complete)
+}
+
+fn valid_source_line(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    let Ok(entry) = serde_json::from_str::<ClaudeEntry>(line) else {
+        return false;
+    };
+    if matches!(
+        entry.entry_type.as_str(),
+        "assistant" | "user" | "tool_result"
+    ) {
+        for container in [Some(&value), value.get("message")].into_iter().flatten() {
+            if [
+                "performance",
+                "duration",
+                "durationMs",
+                "duration_ms",
+                "totalDurationMs",
+                "total_duration_ms",
+                "timedTokens",
+                "timed_tokens",
+                "timedOutputTokens",
+                "timed_output_tokens",
+            ]
+            .iter()
+            .any(|key| container.get(key).is_some())
+            {
+                // These layouts are not consumed by the native Claude timing parser.
+                return false;
+            }
+        }
+        if value.get("timestamp").is_some()
+            && parse_claude_entry_timestamp(entry.timestamp.as_deref()).is_none()
+        {
+            return false;
+        }
+    }
+    if entry.entry_type != "assistant" {
+        // Ignore non-accounting metadata, but do not certify unknown usage layouts.
+        return value.get("usage").is_none()
+            && (matches!(entry.entry_type.as_str(), "user" | "tool_result")
+                || value.pointer("/message/usage").is_none());
+    }
+    let Some(message) = entry.message else {
+        return false;
+    };
+    if message
+        .model
+        .as_deref()
+        .is_some_and(is_claude_synthetic_placeholder_model)
+    {
+        return true;
+    }
+    let Some(_model) = message
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+    else {
+        return false;
+    };
+    if message.usage.is_none() || parse_claude_entry_timestamp(entry.timestamp.as_deref()).is_none()
+    {
+        return false;
+    }
+    if value.get("usage").is_some() {
+        return false;
+    }
+    let Some(usage) = value.pointer("/message/usage").and_then(Value::as_object) else {
+        return false;
+    };
+    for counter in ["input_tokens", "output_tokens"] {
+        if !usage
+            .get(counter)
+            .is_some_and(|value| value.as_i64().is_some_and(|value| value >= 0))
+        {
+            return false;
+        }
+    }
+    for (key, value) in usage {
+        if key == "cache_creation" {
+            let Some(cache) = value.as_object() else {
+                return false;
+            };
+            for (key, value) in cache {
+                if !matches!(
+                    key.as_str(),
+                    "ephemeral_1h_input_tokens" | "ephemeral_5m_input_tokens"
+                ) || !value.as_i64().is_some_and(|value| value >= 0)
+                {
+                    return false;
+                }
+            }
+            let one_hour = cache
+                .get("ephemeral_1h_input_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let five_minute = cache
+                .get("ephemeral_5m_input_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if one_hour.saturating_add(five_minute)
+                > usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            {
+                return false;
+            }
+        } else if matches!(
+            key.as_str(),
+            "input_tokens"
+                | "output_tokens"
+                | "cache_read_input_tokens"
+                | "cache_creation_input_tokens"
+        ) {
+            if !value.as_i64().is_some_and(|value| value >= 0) {
+                return false;
+            }
+        } else if !matches!(
+            key.as_str(),
+            "service_tier" | "server_tool_use" | "inference_geo"
+        ) {
+            // Unknown declared accounting may be discarded by tolerant parsing.
+            return false;
+        }
+    }
+    true
+}
+
+/// A Claude project directory named ssh-<session> proves mirror origin only
+/// when its transcript (or nested subagent parent) belongs to that session.
+pub(crate) fn is_ssh_mirror(path: &Path) -> bool {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    components.windows(2).enumerate().any(|(index, pair)| {
+        pair[0] == "projects"
+            && pair[1]
+                .strip_prefix("ssh-")
+                .filter(|id| !id.is_empty())
+                .is_some_and(|id| {
+                    path.file_stem().and_then(|stem| stem.to_str()) == Some(id)
+                        || components.get(index + 2).copied() == Some(id)
+                })
+    })
+}
+
+fn parse_claude_file_internal(
+    path: &Path,
+    parent_cache: &mut ParentSubagentTypeCache,
+    home_dir: Option<&Path>,
+    mut complete: Option<&mut bool>,
+) -> Vec<UnifiedMessage> {
     // Workflow orchestration journals are metadata, not transcripts — never ingest.
     if is_workflow_journal(path) {
         return Vec::new();
@@ -475,7 +659,12 @@ pub fn parse_claude_file_with_cache_and_home(
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            if let Some(complete) = complete.as_deref_mut() {
+                *complete = false;
+            }
+            return Vec::new();
+        }
     };
 
     let reader = BufReader::new(file);
@@ -511,7 +700,12 @@ pub fn parse_claude_file_with_cache_and_home(
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(complete) = complete.as_deref_mut() {
+                    *complete = false;
+                }
+                continue;
+            }
         };
 
         let trimmed = line.trim();
@@ -519,6 +713,9 @@ pub fn parse_claude_file_with_cache_and_home(
             continue;
         }
 
+        if let Some(complete) = complete.as_deref_mut() {
+            *complete &= valid_source_line(trimmed);
+        }
         let mut handled = false;
         buffer.clear();
         buffer.extend_from_slice(trimmed.as_bytes());

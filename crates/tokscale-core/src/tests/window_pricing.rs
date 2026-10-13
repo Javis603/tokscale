@@ -85,6 +85,7 @@ fn full_report(options: &ReportOptions, pricing: &pricing::PricingService) -> Mo
     );
     let workspaces = workspace_metadata_for_entries(&entries, &mut labeler);
     ModelReport {
+        source_usage: None,
         total_input: entries.iter().map(|entry| entry.input).sum(),
         total_output: entries.iter().map(|entry| entry.output).sum(),
         total_cache_read: entries.iter().map(|entry| entry.cache_read).sum(),
