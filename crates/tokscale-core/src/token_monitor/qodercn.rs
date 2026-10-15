@@ -39,7 +39,23 @@ const JSONL_MAX_FILES: usize = 5000;
 const JSONL_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const JSONL_MAX_ROWS: usize = 100_000;
 const JSONL_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
+// CN resource packs: CNY 40 / 1,000 credits (not global Qoder or Kiro).
+// https://docs.qoder.cn/product-overview/billing-description
+const DEFAULT_USD_PER_CREDIT: f64 = 0.04 / 6.8;
+const CREDIT_RATE_ENV: &str = "TOKEN_MONITOR_QODER_CN_USD_PER_CREDIT";
+
+fn credit_usd_rate() -> f64 {
+    if let Ok(raw) = std::env::var(CREDIT_RATE_ENV) {
+        if let Ok(rate) = raw.parse::<f64>() {
+            if rate.is_finite() && rate > 0.0 {
+                return rate;
+            }
+        }
+        warn!("Invalid {CREDIT_RATE_ENV}; using the CN resource-pack reference and default exchange rate");
+    }
+    DEFAULT_USD_PER_CREDIT
+}
 
 /// Qoder CN stores internal model codes; these are the app's own display
 /// names. Unmapped codes (custom models) pass through unchanged.
@@ -60,6 +76,7 @@ const MODEL_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("q35model", "Qwen3.5-Plus"),
     ("q35model_preview", "Qwen3.8-Max-Preview"),
     ("q36fmodel", "Qwen3.6-Flash"),
+    ("qfmodel", "Qwen3.8-Flash"),
     ("qmodel", "Qwen3.7-Plus"),
     ("qmodel_latest", "Qwen3.7-Max"),
     ("qmodel_preview", "Qwen3.8-Max-Preview"),
@@ -82,6 +99,8 @@ struct Row {
     output: i64,
     cache_read: i64,
     created_at: i64,
+    /// Raw credits are cached before FX, so exchange-rate changes reprice them.
+    credits: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,20 +191,28 @@ fn parse_with(paths: &Paths, cache_path: &Path) -> Vec<UnifiedMessage> {
         if !unique.contains_key(&row.message_id) {
             order.push(row.message_id.clone());
         }
-        unique.insert(row.message_id.clone(), row.clone());
+        // Copied/resumed transcripts contain the same request; retain its
+        // newest observation rather than adding its tokens and credits twice.
+        if unique
+            .get(&row.message_id)
+            .is_none_or(|old| row.created_at >= old.created_at)
+        {
+            unique.insert(row.message_id.clone(), row.clone());
+        }
     }
     // Token Monitor scans several times a minute; rewrite only on a change.
     if next != loaded {
         save_cache(cache_path, &next);
     }
+    let usd_per_credit = credit_usd_rate();
     order
         .into_iter()
         .filter_map(|id| unique.remove(&id))
-        .map(to_message)
+        .map(|row| to_message(row, usd_per_credit))
         .collect()
 }
 
-fn to_message(row: Row) -> UnifiedMessage {
+fn to_message(row: Row, usd_per_credit: f64) -> UnifiedMessage {
     // Routing tiers go through the `unpriced:` provider convention (as Unsloth
     // does) rather than a provider-reported $0: the row stays cost-unknown
     // instead of claiming an authoritative zero, and the lookup still refuses
@@ -209,9 +236,14 @@ fn to_message(row: Row) -> UnifiedMessage {
             cache_write_1h: 0,
             reasoning: 0,
         },
-        0.0,
+        row.credits.unwrap_or(0.0) * usd_per_credit,
         Some(row.message_id),
     );
+    if row.credits.is_some() {
+        // Credit-derived cost replaces token catalog estimation, including
+        // explicit zero. billable:false does not change the resource unit.
+        message.mark_provider_reported_cost();
+    }
     if let Some(key) = normalize_workspace_key(&row.workspace) {
         let label = workspace_label_from_key(&key);
         message.set_workspace(Some(key), label);
@@ -449,6 +481,7 @@ fn normalize_db_row(row: DbRow, source: &str) -> Option<Row> {
         output,
         cache_read: prompt.min(cached),
         created_at: time,
+        credits: None,
     })
 }
 
@@ -613,9 +646,13 @@ fn normalize_jsonl_row(obj: &Value, source: &str) -> Option<Row> {
     let prompt = numeric(usage.get("input_tokens"))?;
     let cached = numeric_or_zero(usage.get("cache_read_input_tokens"))?;
     let output = numeric(usage.get("output_tokens"))?;
-    // Plan-billed first-party rows record credits and a context ratio but no
-    // tokens; they are not measured zero usage, so they stay out.
-    if prompt + output == 0 {
+    let credits = (obj.get("entrypoint").and_then(Value::as_str) == Some("cli"))
+        .then(|| usage.get("credits").and_then(Value::as_f64))
+        .flatten()
+        .filter(|credits| credits.is_finite() && *credits >= 0.0);
+    // Masked token counters do not erase measured credit usage. Never
+    // manufacture tokens from credits or context occupancy.
+    if prompt + output == 0 && credits.is_none() {
         return None;
     }
     let session = js_text(obj.get("sessionId")).unwrap_or_else(|| "unknown".to_string());
@@ -638,13 +675,30 @@ fn normalize_jsonl_row(obj: &Value, source: &str) -> Option<Row> {
         .unwrap_or_default();
     Some(Row {
         session_id: format!("qodercn:jsonl:{source}:{session}"),
-        message_id: format!("qodercn:jsonl:{source}:{session}:{message_key}"),
+        message_id: if credits.is_some() {
+            let request = [
+                ("request", usage.get("request_id")),
+                ("message", message.and_then(|m| m.get("id"))),
+                ("entry", obj.get("uuid")),
+            ]
+            .into_iter()
+            .find_map(|(kind, value)| {
+                value
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(|id| format!("{kind}:{id}"))
+            })?;
+            format!("qodercn:cli:{request}")
+        } else {
+            format!("qodercn:jsonl:{source}:{session}:{message_key}")
+        },
         model,
         workspace,
         input: (prompt - cached).max(0),
         output,
         cache_read: prompt.min(cached),
         created_at: js::timestamp_ms(obj.get("timestamp")),
+        credits,
     })
 }
 
@@ -816,6 +870,99 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    fn cli_credits(id: &str, input: i64, output: i64, credits: Value) -> Value {
+        let mut row = assistant(id, "qfmodel", input, 0, output, "/workspace/app");
+        row["entrypoint"] = json!("cli");
+        row["message"]["usage"]["credits"] = credits;
+        row["message"]["usage"]["request_id"] = json!(format!("request-{id}"));
+        row["message"]["usage"]["billable"] = json!(false);
+        row
+    }
+
+    #[test]
+    fn cli_credits_use_cn_resource_value_without_fabricating_tokens() {
+        let row = normalize_jsonl_row(&cli_credits("masked", 0, 0, json!(0.25)), "source").unwrap();
+        let message = to_message(row, 0.04 / 6.8);
+        assert_eq!(message.model_id, "Qwen3.8-Flash");
+        assert_eq!(message.tokens.input + message.tokens.output, 0);
+        assert!((message.cost - 0.25 * 0.04 / 6.8).abs() < 1e-12);
+        assert_eq!(message.cost_source, CostSource::ProviderReported);
+    }
+
+    #[test]
+    fn exposed_tokens_and_credits_share_one_cost_and_zero_is_authoritative() {
+        for credits in [0.0, 0.003426324] {
+            let row =
+                normalize_jsonl_row(&cli_credits("exposed", 132, 18, json!(credits)), "source")
+                    .unwrap();
+            let mut message = to_message(row, 0.01);
+            assert_eq!((message.tokens.input, message.tokens.output), (132, 18));
+            let pricing = crate::pricing::PricingService::new(
+                HashMap::from([(
+                    "Qwen3.8-Flash".into(),
+                    crate::pricing::ModelPricing {
+                        input_cost_per_token: Some(0.001),
+                        output_cost_per_token: Some(0.002),
+                        ..Default::default()
+                    },
+                )]),
+                HashMap::new(),
+            );
+            assert!(
+                pricing.calculate_cost_with_provider(
+                    &message.model_id,
+                    Some(&message.provider_id),
+                    &message.tokens
+                ) > 0.0
+            );
+            crate::apply_pricing_if_available(&mut message, Some(&pricing));
+            assert_eq!(message.cost, credits * 0.01);
+            assert_eq!(message.cost_source, CostSource::ProviderReported);
+        }
+    }
+
+    #[test]
+    fn credits_require_cli_numeric_nonnegative_usage_and_a_stable_identity() {
+        for invalid in [Value::Null, json!(-1), json!("0.25"), json!(true)] {
+            assert!(normalize_jsonl_row(&cli_credits("m", 0, 0, invalid), "source").is_none());
+        }
+        let mut row = cli_credits("m", 0, 0, json!(0.25));
+        row["entrypoint"] = json!("desktop");
+        assert!(normalize_jsonl_row(&row, "source").is_none());
+        row["message"]["usage"]["input_tokens"] = json!(10);
+        let message = to_message(normalize_jsonl_row(&row, "source").unwrap(), 0.01);
+        assert_eq!(message.cost, 0.0);
+        assert_ne!(message.cost_source, CostSource::ProviderReported);
+        let mut no_id = cli_credits("m", 0, 0, json!(0.25));
+        no_id["message"]["usage"]["request_id"] = Value::Null;
+        no_id["message"]["id"] = Value::Null;
+        assert!(normalize_jsonl_row(&no_id, "source").is_none());
+    }
+
+    #[test]
+    fn copied_requests_dedup_with_warm_cache_and_fx_preserves_raw_credits() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        let row = cli_credits("same", 132, 18, json!(0.25));
+        write_jsonl(&p.projects.join("a.jsonl"), &[row.clone()]);
+        write_jsonl(&p.projects.join("subagents/copy.jsonl"), &[row]);
+        let first = parse_with(&p, &cache);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].tokens.input, 132);
+        assert_eq!(parse_with(&p, &cache), first);
+        let raw = load_cache(&cache)
+            .sources
+            .into_values()
+            .next()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert_eq!(raw.credits, Some(0.25));
+        assert_eq!(to_message(raw.clone(), 0.01).cost, 0.0025);
+        assert_eq!(to_message(raw, 0.02).cost, 0.005);
     }
 
     #[test]
