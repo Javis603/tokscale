@@ -1017,6 +1017,37 @@ fn sandbox_config_dir(tmp: &Path) -> std::path::PathBuf {
     tmp.join(".config").join("tokscale")
 }
 
+/// Keep submit fixtures from enumerating real desktop processes. `submit` now
+/// refreshes Antigravity before scanning; HOME alone cannot contain `ps` or
+/// PowerShell discovery. The child executes only this fixture-owned shim, which
+/// reports no candidate processes on every supported platform.
+fn discovery_shim_path(tmp: &Path) -> std::ffi::OsString {
+    let bin = tmp.join(".tokscale-test-bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let ps = bin.join("ps");
+        fs::write(&ps, "#!/bin/sh\nprintf 'PID PPID COMMAND\\n'\n").unwrap();
+        fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(windows)]
+    {
+        // `Command::new("powershell")` resolves this through PATHEXT before
+        // the host PowerShell. Its JSON is the empty process collection expected
+        // by `parse_windows_process_candidates`.
+        fs::write(bin.join("powershell.cmd"), "@echo []\r\n").unwrap();
+    }
+
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
+}
+
 fn cmd_with_home(tmp: &Path) -> Command {
     let mut cmd = cargo_bin_cmd!("tokscale");
     cmd.env("HOME", tmp)
@@ -1024,6 +1055,7 @@ fn cmd_with_home(tmp: &Path) -> Command {
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
         .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp))
+        .env("PATH", discovery_shim_path(tmp))
         // `pricing` intentionally bypasses TOKSCALE_PRICING_CACHE_ONLY; the
         // loopback proxies below are the offline guarantee for every command.
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
@@ -1662,7 +1694,11 @@ fn write_jcode_session(base: &Path) {
 fn write_cursor_usage_cache(base: &Path) {
     let cache_dir = base.join(".config/tokscale/cursor-cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    fs::write(cache_dir.join("usage.json"), r#"{"usageEventsDisplay":[]}"#).unwrap();
+    fs::write(
+        cache_dir.join("usage.json"),
+        r#"{"_tokscale":{"version":1,"accountId":"active-account"},"usageEventsDisplay":[]}"#,
+    )
+    .unwrap();
 }
 
 fn write_cursor_credentials(base: &Path) {
@@ -3309,6 +3345,154 @@ fn test_codex_subagent_parent_link_follows_date_filter_cold_and_warm_cache() {
     }
 }
 
+/// Newly settled usage records must carry the same parent as token_count
+/// rows, even when a report window keeps only those records for the child.
+#[test]
+fn test_codex_usage_record_parent_links_survive_date_filters_cold_and_warm_cache() {
+    use serde_json::json;
+
+    const PARENT: &str = "01a0f000-0000-7000-8000-0000000000aa";
+    const CHILD: &str = "01a0f000-0000-7000-8000-0000000000bb";
+    let parent_session = format!("rollout-2026-10-01T00-00-00-{PARENT}");
+    let child_session = format!("rollout-2026-10-01T00-00-10-{CHILD}");
+    let usage = |input, cached, output| {
+        json!({"input_tokens": input, "cached_input_tokens": cached,
+            "output_tokens": output, "reasoning_output_tokens": 0,
+            "total_tokens": input + output})
+    };
+    let line = |timestamp: &str, kind: &str, payload: serde_json::Value| json!({"timestamp": timestamp, "type": kind, "payload": payload});
+
+    for kind in ["subagent", "guardian"] {
+        for settlement in ["unconfirmed", "compaction", "turn_aborted", "task_complete"] {
+            let tmp = create_empty_fixture_dir();
+            let dir = tmp.path().join(".codex/sessions/2026/10/01");
+            fs::create_dir_all(&dir).unwrap();
+            for (thread, session, counters) in [
+                (PARENT, &parent_session, usage(100, 80, 10)),
+                (CHILD, &child_session, usage(60, 20, 7)),
+            ] {
+                let mut meta = json!({"id": thread, "source": "vscode",
+                    "model_provider": "openai", "cwd": "/workspace/p"});
+                if thread == CHILD {
+                    if kind == "subagent" {
+                        meta["source"] = json!({"subagent": {"thread_spawn": {
+                            "parent_thread_id": PARENT, "depth": 1}}});
+                    } else {
+                        meta["source"] = json!({"subagent": {"other": "guardian"}});
+                        meta["thread_source"] = json!("guardian_review");
+                        meta["parent_thread_id"] = json!(PARENT);
+                    }
+                }
+                let mut rows = vec![
+                    line("2026-10-01T00:00:00Z", "session_meta", meta),
+                    line(
+                        "2026-10-01T00:01:00Z",
+                        "turn_context",
+                        json!({"turn_id": "turn-1", "model": "gpt-5.5"}),
+                    ),
+                    line(
+                        "2026-10-01T00:01:05Z",
+                        "event_msg",
+                        json!({
+                        "type": "token_count", "info": {
+                            "total_token_usage": counters, "last_token_usage": counters}}),
+                    ),
+                ];
+                if thread == CHILD {
+                    rows.extend([
+                        line(
+                            "2026-10-02T00:02:00Z",
+                            "turn_context",
+                            json!({"turn_id": "turn-2", "model": "gpt-5.5"}),
+                        ),
+                        line(
+                            "2026-10-02T00:02:00.005Z",
+                            "token_usage_record",
+                            json!({
+                            "thread_id": CHILD, "turn_id": "turn-2", "response_id": "response-2",
+                            "usage": usage(500, 200, 40)}),
+                        ),
+                    ]);
+                    match settlement {
+                        "unconfirmed" => rows.push(line("2026-10-02T00:02:01Z", "turn_context",
+                            json!({"turn_id": "turn-3", "model": "gpt-5.5"}))),
+                        "compaction" => rows.extend([
+                            line("2026-10-02T00:02:00.010Z", "compacted",
+                                json!({"message": "", "replacement_history": []})),
+                            line("2026-10-02T00:02:00.020Z", "event_msg", json!({
+                                "type": "token_count", "info": {
+                                    "total_token_usage": counters, "last_token_usage": usage(0, 0, 0)}})),
+                        ]),
+                        terminal => rows.push(line("2026-10-02T00:02:01Z", "event_msg",
+                            json!({"type": terminal, "turn_id": "turn-2"}))),
+                    }
+                }
+                fs::write(
+                    dir.join(format!("{session}.jsonl")),
+                    rows.iter()
+                        .map(serde_json::Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n",
+                )
+                .unwrap();
+            }
+
+            for pass in ["cold", "warm"] {
+                for filtered in [true, false] {
+                    let mut cmd = cmd_with_home(tmp.path());
+                    cmd.args([
+                        "models",
+                        "--json",
+                        "--client",
+                        "codex",
+                        "--no-spinner",
+                        "--group-by",
+                        "client,workspace,session,model",
+                    ]);
+                    if filtered {
+                        cmd.args(["--since", "2026-10-02", "--until", "2026-10-02"]);
+                    }
+                    let output = cmd.output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{kind}, {settlement}, {pass}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                    let sessions = report["sessions"].as_array().unwrap();
+                    let child = sessions
+                        .iter()
+                        .find(|s| s["sessionId"] == child_session)
+                        .unwrap();
+                    assert_eq!(
+                        child["parentSessionId"].as_str(),
+                        Some(if filtered {
+                            PARENT
+                        } else {
+                            parent_session.as_str()
+                        }),
+                        "{kind}, {settlement}, {pass}, filtered={filtered}"
+                    );
+                    assert_eq!(sessions.len(), if filtered { 1 } else { 2 });
+                    assert_eq!(
+                        report["totalInput"].as_i64(),
+                        Some(if filtered { 300 } else { 360 })
+                    );
+                    assert_eq!(
+                        report["totalOutput"].as_i64(),
+                        Some(if filtered { 40 } else { 57 })
+                    );
+                    assert_eq!(
+                        report["totalCacheRead"].as_i64(),
+                        Some(if filtered { 200 } else { 300 })
+                    );
+                }
+            }
+        }
+    }
+}
+
 const OPENCLAW_PARENT_THREAD: &str = "0192f3a4-5b6c-7d8e-9f01-23456789abcd";
 const OPENCLAW_CHILD_THREAD: &str = "0192f3a5-0000-7000-8000-00000000cccc";
 const OPENCLAW_VISIBLE_SESSION: &str = "openclaw-visible-session";
@@ -3882,6 +4066,61 @@ fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
 }
 
 #[test]
+fn test_cursor_logout_all_purge_removes_cache_without_credentials() {
+    let tmp = create_empty_fixture_dir();
+    let current = tmp.path().join(".config/tokscale/cursor-cache");
+    let legacy = tmp.path().join(".tokscale/cursor-cache");
+    fs::create_dir_all(current.join("archive/old")).unwrap();
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(current.join("archive/old/usage.json"), b"archived usage").unwrap();
+    fs::write(legacy.join("usage.csv"), b"legacy usage").unwrap();
+
+    let output = cmd_with_home(tmp.path())
+        .args(["cursor", "logout", "--all", "--purge-cache"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!current.exists());
+    assert!(!legacy.exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Purged all Cursor cache data"));
+}
+
+#[test]
+fn test_graph_preserves_unowned_cursor_cache_when_refetch_fails() {
+    let tmp = create_empty_fixture_dir();
+    write_cursor_credentials(tmp.path());
+    let cache_dir = tmp.path().join(".config/tokscale/cursor-cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let legacy = r#"{"usageEventsDisplay":[]}"#;
+    fs::write(cache_dir.join("usage.json"), legacy).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .args(["graph", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("preserved 1 cache file(s)"), "{stderr}");
+    assert!(stderr.contains("Cursor sync failed"), "{stderr}");
+    assert!(!cache_dir.join("usage.json").exists());
+    let archives: Vec<_> = fs::read_dir(cache_dir.join("archive")).unwrap().collect();
+    assert_eq!(archives.len(), 1);
+    let original = archives[0].as_ref().unwrap().path().join("usage.json");
+    assert_eq!(fs::read_to_string(original).unwrap(), legacy);
+}
+
+#[test]
 fn test_submit_cursor_explicit_missing_cache_reports_setup_warning_text() {
     let tmp = create_empty_fixture_dir();
     cmd_with_home(tmp.path())
@@ -3994,6 +4233,7 @@ fn test_submit_tip_recommends_only_the_client_filter() {
         .stdout(predicate::str::contains(
             "Tip: narrow the scan with `--client <id>` for a faster submit.",
         ))
+        .stdout(predicate::str::contains("Syncing Antigravity usage data...").not())
         .stdout(predicate::str::is_match(r"Tip:.*--since").unwrap().not());
 }
 
@@ -4128,6 +4368,14 @@ fn test_models_json_output() {
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
+    assert_eq!(
+        json["undatedTokens"],
+        serde_json::json!({
+            "input":0, "output":0, "cacheRead":0, "cacheWrite":0,
+            "cacheWrite1h":0, "reasoning":0,
+        })
+    );
+
     assert!(json.get("groupBy").is_some(), "Missing groupBy field");
     assert!(json.get("entries").is_some(), "Missing entries field");
     assert!(json.get("totalInput").is_some(), "Missing totalInput");
@@ -4169,6 +4417,62 @@ fn test_models_json_output() {
     assert!(performance.contains_key("sampleCount"));
     assert!(performance.contains_key("tokenCoverage"));
     assert!(performance["msPer1KTokens"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn test_models_json_mixed_timing_keeps_exact_output_and_reasoning_subtotals() {
+    let tmp = TempDir::new().unwrap();
+    prime_pricing_cache(tmp.path());
+    let messages = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/mixed");
+    fs::create_dir_all(&messages).unwrap();
+    for (id, reasoning, completed) in [("timed", 20, Some(1718452801000i64)), ("untimed", 80, None)]
+    {
+        let mut time = serde_json::json!({"created": 1718452800000i64});
+        if let Some(completed) = completed {
+            time["completed"] = completed.into();
+        }
+        let message = serde_json::json!({
+            "id": id, "sessionID": "mixed", "role": "assistant",
+            "modelID": "gpt-4o", "providerID": "openai", "cost": 0.1,
+            "tokens": {"input": 0, "output": 100, "reasoning": reasoning, "cache": {"read": 0, "write": 0}},
+            "time": time
+        });
+        fs::write(
+            messages.join(format!("{id}.json")),
+            serde_json::to_vec(&message).unwrap(),
+        )
+        .unwrap();
+    }
+    // Both production grouping and the compatibility fallback, cold then warm cache.
+    for grouping in ["client,workspace,session,model", "client,session,model"] {
+        for _ in 0..2 {
+            let output = cmd_with_home(tmp.path())
+                .args([
+                    "--json",
+                    "--client",
+                    "opencode",
+                    "--no-spinner",
+                    "--group-by",
+                    grouping,
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let entries = report["entries"].as_array().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["output"], 200);
+            assert_eq!(entries[0]["reasoning"], 100);
+            let performance = &entries[0]["performance"];
+            assert_eq!(performance["timedOutputTokens"], 100);
+            assert_eq!(performance["timedReasoningTokens"], 20);
+            assert_eq!(performance["totalDurationMs"], 1000);
+            assert_eq!(performance["timedTokens"], 120);
+            assert_eq!(performance["sampleCount"], 1);
+        }
+    }
 }
 
 #[test]
@@ -5712,7 +6016,7 @@ fn test_clients_json_includes_claude_desktop_diagnostic() {
     let diagnostics = claude["diagnostics"].as_array().unwrap();
 
     assert!(diagnostics.iter().any(|item| {
-        item["code"] == "claude_desktop_not_scanned"
+        item["code"] == "claude_desktop_partial_history"
             && item["severity"] == "warning"
             && item["message"]
                 .as_str()
@@ -5846,8 +6150,8 @@ fn test_clients_home_override_ignores_conflicting_claude_config_dir_env() {
     let diagnostics = claude["diagnostics"].as_array().unwrap();
     let desktop_diagnostic = diagnostics
         .iter()
-        .find(|item| item["code"] == "claude_desktop_not_scanned")
-        .expect("claude_desktop_not_scanned diagnostic should be present");
+        .find(|item| item["code"] == "claude_desktop_partial_history")
+        .expect("claude_desktop_partial_history diagnostic should be present");
     let paths = desktop_diagnostic["paths"].as_array().unwrap();
 
     for label in ["claudeCodeProjects", "claudeCodeTranscripts"] {
@@ -5881,7 +6185,7 @@ fn test_clients_command_includes_claude_desktop_diagnostic_text() {
             "Claude Desktop app data was detected",
         ))
         .stdout(predicate::str::contains(
-            "Claude Code JSONL transcripts only",
+            "Local transcripts and available conversation-cache counters",
         ));
 }
 
@@ -5900,11 +6204,11 @@ fn test_models_json_includes_claude_desktop_diagnostic_for_empty_explicit_claude
     let diagnostics = json["diagnostics"].as_array().unwrap();
 
     assert!(diagnostics.iter().any(|item| {
-        item["code"] == "claude_desktop_not_scanned"
+        item["code"] == "claude_desktop_partial_history"
             && item["message"]
                 .as_str()
                 .unwrap()
-                .contains("Tokscale counts Claude Code JSONL transcripts")
+                .contains("Local transcripts and available conversation-cache counters")
     }));
 }
 
@@ -7743,20 +8047,27 @@ fn test_codex_compressed_session_reports_usage() {
     )
     .unwrap();
 
-    let output = cmd_with_home(tmp.path())
-        .args(["--client", "codex", "--json", "--no-spinner"])
-        .output()
-        .unwrap();
+    // Check a cold archive scan, an uncompressed duplicate, and the warm cache.
+    for scan in 0..3 {
+        if scan == 1 {
+            fs::write(sessions.join("fixture.jsonl"), content).unwrap();
+        }
+        let output = cmd_with_home(tmp.path())
+            .args(["--client", "codex", "--json", "--no-spinner"])
+            .output()
+            .unwrap();
 
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["totalInput"].as_i64().unwrap(), 110);
-    assert_eq!(json["totalCacheRead"].as_i64().unwrap(), 30);
-    assert_eq!(json["totalOutput"].as_i64().unwrap(), 10);
-    assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalInput"].as_i64().unwrap(), 110);
+        assert_eq!(json["totalCacheRead"].as_i64().unwrap(), 30);
+        assert_eq!(json["totalOutput"].as_i64().unwrap(), 10);
+        assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
+        assert_eq!(json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
+    }
 }

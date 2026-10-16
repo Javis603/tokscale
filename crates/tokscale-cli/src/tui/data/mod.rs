@@ -7,8 +7,9 @@ use tokio::runtime::{Handle, Runtime};
 
 use tokscale_core::sessions::UnifiedMessage;
 use tokscale_core::{
-    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages, sessions,
-    ClientId, GroupBy, LocalParseOptions, ModelPerformance, WorktreeRollup,
+    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages,
+    parse_local_unified_messages_deferred, sessions, ClientId, GroupBy, LocalParseOptions,
+    ModelPerformance, PendingSourceCacheSave, WorktreeRollup,
 };
 
 /// Returns the scanner settings that `DataLoader` should use when building
@@ -444,6 +445,7 @@ pub struct UsageData {
     pub sessions_rolled: Vec<SessionUsage>,
     pub graph: Option<GraphData>,
     pub total_tokens: u64,
+    pub undated_tokens: u64,
     pub total_cost: f64,
     pub loading: bool,
     pub error: Option<String>,
@@ -492,19 +494,6 @@ fn is_codex_chat_workspace(key: &str) -> bool {
 
     // A chat directory can become a real repository or a git worktree.
     !Path::new(key).join(".git").exists()
-}
-
-fn positive_unified_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
-    // saturating_add (mirrors tokscale_core::TokenBreakdown::total) so a
-    // clamped (i64::MAX) bucket from a corrupt source can't overflow the
-    // per-message sum.
-    tokens
-        .input
-        .max(0)
-        .saturating_add(tokens.output.max(0))
-        .saturating_add(tokens.cache_read.max(0))
-        .saturating_add(tokens.cache_write.max(0))
-        .saturating_add(tokens.reasoning.max(0))
 }
 
 fn workspace_model_display_label(workspace_label: &str, model: &str) -> String {
@@ -677,6 +666,63 @@ impl DataLoader {
         .map_err(anyhow::Error::msg)?;
 
         self.aggregate_messages(messages, group_by)
+    }
+
+    /// Build complete TUI data while leaving only the durable source-cache
+    /// write pending. The caller owns that write and must persist it on the
+    /// same background loader thread after publishing the aggregate data.
+    pub fn load_deferred(
+        &self,
+        enabled_clients: &[ClientId],
+        group_by: &GroupBy,
+        include_synthetic: bool,
+    ) -> Result<(UsageData, PendingSourceCacheSave)> {
+        let home = crate::paths::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+            .to_string_lossy()
+            .to_string();
+
+        let mut sources: Vec<String> = enabled_clients
+            .iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        if include_synthetic {
+            sources.push("synthetic".to_string());
+        }
+
+        let opts = LocalParseOptions {
+            home_dir: Some(home),
+            use_env_roots: true,
+            clients: Some(sources),
+            since: self.since.clone(),
+            until: self.until.clone(),
+            year: self.year.clone(),
+            scanner_settings: data_loader_scanner_settings(),
+        };
+
+        let (messages, pending_save) = if Handle::try_current().is_ok() {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = Runtime::new().map_err(|e| e.to_string())?;
+                    rt.block_on(parse_local_unified_messages_deferred(opts))
+                })
+                .join()
+                .unwrap_or_else(|_| Err("data loader thread panicked".to_string()))
+            })
+        } else {
+            Runtime::new()?.block_on(parse_local_unified_messages_deferred(opts))
+        }
+        .map_err(anyhow::Error::msg)?;
+
+        match self.aggregate_messages(messages, group_by) {
+            Ok(data) => Ok((data, pending_save)),
+            Err(error) => {
+                // Parsing has already mutated the owned source cache. Do not
+                // throw that work away merely because TUI aggregation failed.
+                pending_save.persist();
+                Err(error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -958,7 +1004,7 @@ impl DataLoader {
             model_entry.cost += msg_cost;
             model_entry
                 .performance
-                .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
 
             if let Some(date) = parse_date(&msg.date) {
                 let model_day = model_days
@@ -998,7 +1044,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_day
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // A recovered daily floor has a synthetic session id; it adds usage
@@ -1186,7 +1232,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_info
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // Hourly aggregation: derive hour from timestamp (Unix ms),
@@ -1679,6 +1725,12 @@ impl DataLoader {
             sessions_rolled,
             graph: Some(graph),
             total_tokens,
+            undated_tokens: messages
+                .iter()
+                .filter(|m| tokscale_core::claude_desktop::is_undated_balance(m))
+                .fold(0u64, |total, m| {
+                    total.saturating_add(m.tokens.total().max(0) as u64)
+                }),
             total_cost,
             loading: false,
             error: None,
@@ -2057,6 +2109,7 @@ mod tests {
             cost_source: tokscale_core::sessions::CostSource::default(),
             service_tier: None,
             duration_ms: None,
+            performance_timing: None,
             message_count: 1,
             agent: Some("hephaestus".to_string()),
             dedup_key: None,
@@ -2102,6 +2155,35 @@ mod tests {
     }
 
     #[test]
+    fn desktop_undated_balances_appear_in_models_but_not_calendar() {
+        let mut message = UnifiedMessage::new(
+            "claude",
+            "claude-future",
+            "anthropic",
+            "s",
+            0,
+            CoreTokenBreakdown {
+                input: 100,
+                ..Default::default()
+            },
+            0.0,
+        );
+        message.date = tokscale_core::claude_desktop::UNKNOWN_DATE.into();
+        message.message_count = 0;
+        let loader = DataLoader::new(None).with_minutely_enabled(true);
+        let data = loader
+            .aggregate_messages(vec![message], &GroupBy::Model)
+            .unwrap();
+        assert_eq!(data.total_tokens, 100);
+        assert_eq!(data.undated_tokens, 100);
+        assert_eq!(data.models.len(), 1);
+        assert!(data.daily.is_empty());
+        assert!(data.hourly.is_empty());
+        assert!(data.minutely.is_empty());
+        assert!(data.monthly.is_empty());
+    }
+
+    #[test]
     fn positive_unified_token_total_saturates_instead_of_overflowing() {
         // tokscale-core clamps corrupt per-field token buckets to i64::MAX; a
         // plain `+` fold over two clamped buckets would panic in debug builds.
@@ -2113,7 +2195,9 @@ mod tests {
             cache_write_1h: 0,
             reasoning: 0,
         };
-        assert_eq!(positive_unified_token_total(&tokens), i64::MAX);
+        let mut performance = ModelPerformance::default();
+        performance.record_token_breakdown(&tokens, Some(100));
+        assert_eq!(performance.timed_tokens, i64::MAX);
     }
 
     fn test_pricing_service() -> PricingService {

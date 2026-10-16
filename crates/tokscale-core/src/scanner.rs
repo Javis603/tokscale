@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::clients::ClientId;
+use crate::clients::{ClientId, PathRoot};
 use crate::sessions::{normalize_workspace_key, workspace_label_from_key};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -796,6 +796,23 @@ pub fn built_in_extra_scan_paths_for(
                 .into_iter()
                 .map(|path| (ClientId::Claude, path)),
         );
+        paths.extend(
+            crate::claude_desktop::transcript_roots(Path::new(home_dir))
+                .into_iter()
+                .map(|path| (ClientId::Claude, path)),
+        );
+    }
+
+    if enabled.contains(&ClientId::Amp) {
+        // Amp moved threads server-side; the primary root is now the
+        // `tokscale amp sync` cache. Older Amp builds wrote thread files here,
+        // so keep reading them. `prefer_amp_cache_over_legacy` drops a legacy
+        // file when the cache holds the same thread.
+        let xdg_data = PathRoot::XdgData.resolve_with_env_strategy(home_dir, use_env_roots);
+        paths.push((
+            ClientId::Amp,
+            PathBuf::from(join_native(&xdg_data, "amp/threads")),
+        ));
     }
 
     if enabled.contains(&ClientId::Senpi) {
@@ -804,14 +821,14 @@ pub fn built_in_extra_scan_paths_for(
         // Only a usable user-level `state_dir` propagates; a user `task` block
         // without one leaves each project on its own default layout.
         let user_state_dir = senpi_user_state_dir(home_dir);
-        let omo_sessions = if use_env_roots {
-            std::env::var_os("OMO_CODING_AGENT_DIR")
-                .filter(|dir| !dir.to_string_lossy().trim().is_empty())
-                .map(|dir| PathBuf::from(join_native(&dir.to_string_lossy(), "sessions")))
-                .unwrap_or_else(|| join_native_path(Path::new(home_dir), ".omo/agent/sessions"))
-        } else {
-            join_native_path(Path::new(home_dir), ".omo/agent/sessions")
-        };
+        // OmO Native has exactly one built-in location. A relocated OmO agent
+        // or sessions directory is configured persistently through
+        // `scanner.extraScanPaths.senpi` in settings.json, which accepts either
+        // the agent dir or its `sessions/` dir and also discovers the task
+        // children those transcripts point at (see `extra_scan_paths_for`
+        // below). Tokscale deliberately reads no OmO-specific environment
+        // variable for this.
+        let omo_sessions = join_native_path(Path::new(home_dir), ".omo/agent/sessions");
 
         if use_env_roots {
             let env_session_dir = std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR")
@@ -846,13 +863,6 @@ pub fn built_in_extra_scan_paths_for(
             ];
             if let Some(path) = &env_session_dir {
                 sessions_roots.push(PathBuf::from(path));
-            }
-            if let Some(env_omo_session_dir) = std::env::var_os("OMO_CODING_AGENT_SESSION_DIR")
-                .filter(|path| !path.to_string_lossy().trim().is_empty())
-            {
-                let path = PathBuf::from(env_omo_session_dir);
-                paths.push((ClientId::Senpi, path.clone()));
-                sessions_roots.push(path);
             }
             for sessions_root in sessions_roots {
                 paths.extend(
@@ -3021,7 +3031,57 @@ fn scan_all_clients_with_env_strategy_inner(
     // twice.
     prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
 
+    if enabled.contains(&ClientId::Amp) {
+        let amp_cache_root = ClientId::Amp
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        prefer_amp_cache_over_legacy(result.get_mut(ClientId::Amp), Path::new(&amp_cache_root));
+    }
+
     result
+}
+
+/// Drop each legacy Amp thread file whose `T-*.json` name also exists under
+/// the synced cache root, so a thread is parsed from exactly one file. The
+/// cached copy always wins: it is exported from the server, which holds a
+/// superset of what the legacy local file recorded.
+fn amp_file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    path.metadata().ok()?.modified().ok()
+}
+
+fn amp_cache_is_at_least_as_fresh(
+    cache_mtime: Option<std::time::SystemTime>,
+    legacy_mtime: Option<std::time::SystemTime>,
+) -> bool {
+    match (cache_mtime, legacy_mtime) {
+        (Some(cache_mtime), Some(legacy_mtime)) => cache_mtime >= legacy_mtime,
+        _ => true,
+    }
+}
+
+fn prefer_amp_cache_over_legacy(files: &mut Vec<PathBuf>, cache_root: &Path) {
+    let cached: std::collections::HashMap<std::ffi::OsString, PathBuf> = files
+        .iter()
+        .filter(|path| path.starts_with(cache_root))
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| (name.to_os_string(), path.clone()))
+        })
+        .collect();
+    files.retain(|path| {
+        if path.starts_with(cache_root) {
+            return true;
+        }
+        let Some(name) = path.file_name() else {
+            return true;
+        };
+        let Some(cache) = cached.get(name) else {
+            return true;
+        };
+        // Prefer the server projection only when it is at least as fresh. A
+        // local thread written after the last sync may contain newer messages.
+        !amp_cache_is_at_least_as_fresh(amp_file_mtime(cache), amp_file_mtime(path))
+    });
 }
 
 /// Drop each Cursor `usage[.account].csv` whose `usage[.account].json` sibling
@@ -3703,6 +3763,54 @@ mod tests {
                 "usage.json".to_string(),
                 "usage.team-a.json".to_string(),
                 "usage.team-b.csv".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_amp_scan_prefers_cache_over_legacy_thread_with_same_name() {
+        let home = TempDir::new().unwrap();
+        let config = home.path().join("config");
+        let mut env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR", "XDG_DATA_HOME"]);
+        env.set("TOKSCALE_CONFIG_DIR", &config);
+        env.remove("XDG_DATA_HOME");
+
+        let cache_dir = config.join("amp-cache/threads");
+        let legacy_dir = home.path().join(".local/share/amp/threads");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&legacy_dir).unwrap();
+        // Same thread in both roots, one only in the cache, one only legacy.
+        for (dir, name) in [
+            (&legacy_dir, "T-shared.json"),
+            (&cache_dir, "T-shared.json"),
+            (&cache_dir, "T-cache-only.json"),
+            (&legacy_dir, "T-legacy-only.json"),
+        ] {
+            File::create(dir.join(name)).unwrap();
+        }
+
+        let result = scan_without_extra_dirs(home.path().to_str().unwrap(), &["amp".to_string()]);
+        let mut files: Vec<_> = result
+            .get(ClientId::Amp)
+            .iter()
+            .map(|path| {
+                let root = if path.starts_with(&cache_dir) {
+                    "cache"
+                } else {
+                    "legacy"
+                };
+                format!("{root}/{}", path.file_name().unwrap().to_string_lossy())
+            })
+            .collect();
+        files.sort();
+
+        assert_eq!(
+            files,
+            vec![
+                "cache/T-cache-only.json",
+                "cache/T-shared.json",
+                "legacy/T-legacy-only.json",
             ]
         );
     }
@@ -8730,16 +8838,34 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_senpi_honors_omo_coding_agent_session_dir() {
+    fn test_senpi_ignores_omo_environment_overrides() {
+        // Relocated OmO directories are a persisted setting
+        // (`scanner.extraScanPaths.senpi`), not an environment variable, so
+        // these variables must not add or move any scan root.
         let home_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
         let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let omo_session = write_omo_agent_session(
+            home_dir.path(),
+            "--project--",
+            "2026-08-31T00-00-00-000Z_omo.jsonl",
+            project_dir.path(),
+        );
         let redirected_sessions = TempDir::new().unwrap();
-        let redirected_session = redirected_sessions.path().join("redirected.jsonl");
-        File::create(&redirected_session).unwrap();
+        File::create(redirected_sessions.path().join("redirected.jsonl")).unwrap();
+        let redirected_agent = TempDir::new().unwrap();
+        let redirected_agent_session = redirected_agent
+            .path()
+            .join("sessions")
+            .join("--elsewhere--")
+            .join("redirected.jsonl");
+        fs::create_dir_all(redirected_agent_session.parent().unwrap()).unwrap();
+        File::create(&redirected_agent_session).unwrap();
         let mut env = senpi_test_env_guard();
         env.set("OMO_CODING_AGENT_SESSION_DIR", redirected_sessions.path());
-        let _current_dir = CurrentDirGuard::set(project_dir.path());
+        env.set("OMO_CODING_AGENT_DIR", redirected_agent.path());
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
         let result =
             scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
@@ -8749,14 +8875,19 @@ mod tests {
             .iter()
             .map(|path| path.canonicalize().unwrap())
             .collect();
-        assert_eq!(canonical_files.len(), 2);
-        assert!(canonical_files.contains(&child_session));
-        assert!(canonical_files.contains(&redirected_session.canonicalize().unwrap()));
+        assert_eq!(
+            canonical_files,
+            HashSet::from([child_session, omo_session.canonicalize().unwrap()]),
+            "only the built-in ~/.omo/agent/sessions tree and its task children are scanned"
+        );
     }
 
     #[test]
     #[serial]
-    fn test_senpi_honors_omo_coding_agent_dir() {
+    fn test_senpi_extra_scan_paths_accepts_an_omo_agent_dir() {
+        // `scanner.extraScanPaths.senpi` replaces the removed OmO environment
+        // overrides: pointing it at a relocated agent dir (the parent of
+        // `sessions/`) must find the main transcripts and their task children.
         let home_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
         let custom_agent = TempDir::new().unwrap();
@@ -8777,12 +8908,20 @@ mod tests {
         )
         .unwrap();
 
-        let mut env = senpi_test_env_guard();
-        env.set("OMO_CODING_AGENT_DIR", custom_agent.path());
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
-        let result =
-            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+        let mut settings = ScannerSettings::default();
+        settings
+            .extra_scan_paths
+            .insert("senpi".to_string(), vec![custom_agent.path().to_path_buf()]);
+
+        let result = scan_all_clients_with_scanner_settings(
+            home_dir.path().to_str().unwrap(),
+            &["senpi".to_string()],
+            true,
+            &settings,
+        );
 
         let canonical_files: HashSet<PathBuf> = result
             .get(ClientId::Senpi)
@@ -9321,5 +9460,18 @@ mod tests {
             discover_senpi_omo_children_roots(&temp.path().join("no-such-root"), None).is_empty(),
             "a missing sessions root must discover nothing"
         );
+    }
+
+    #[test]
+    fn amp_scan_keeps_newer_legacy_duplicate() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        assert!(!amp_cache_is_at_least_as_fresh(
+            Some(epoch),
+            Some(epoch + std::time::Duration::from_secs(1)),
+        ));
+        assert!(amp_cache_is_at_least_as_fresh(
+            Some(epoch + std::time::Duration::from_secs(1)),
+            Some(epoch),
+        ));
     }
 }

@@ -12,6 +12,7 @@ pub mod cline;
 pub mod codebuddy;
 pub mod codebuff;
 pub mod codex;
+pub(crate) mod codex_timing;
 pub mod commandcode;
 pub mod copilot;
 pub mod copilot_desktop;
@@ -77,6 +78,14 @@ pub enum CostSource {
     Estimated,
 }
 
+/// An explicit performance sample may be unavailable even when the message
+/// has an activity span. Absence preserves legacy timing for other parsers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PerformanceTiming {
+    Unavailable,
+    Duration(i64),
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnifiedMessage {
     pub client: String,
@@ -97,6 +106,8 @@ pub struct UnifiedMessage {
     pub service_tier: Option<String>,
     #[serde(default)]
     pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub performance_timing: Option<PerformanceTiming>,
     #[serde(default = "default_message_count")]
     pub message_count: i32,
     pub agent: Option<String>,
@@ -298,6 +309,14 @@ fn titlecase_agent(name: &str) -> String {
 }
 
 impl UnifiedMessage {
+    pub fn performance_duration_ms(&self) -> Option<i64> {
+        match self.performance_timing {
+            Some(PerformanceTiming::Duration(duration)) => Some(duration),
+            Some(PerformanceTiming::Unavailable) => None,
+            None => self.duration_ms,
+        }
+    }
+
     pub fn new(
         client: impl Into<String>,
         model_id: impl Into<String>,
@@ -395,6 +414,7 @@ impl UnifiedMessage {
             cost_source: CostSource::Unknown,
             service_tier: None,
             duration_ms: None,
+            performance_timing: None,
             message_count: default_message_count(),
             agent,
             dedup_key,
