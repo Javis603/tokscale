@@ -527,6 +527,7 @@ mod tests {
             claude_entry_uuid: Default::default(),
             machine_label: None,
             duration_ms: None,
+            performance_timing: None,
         }
     }
 
