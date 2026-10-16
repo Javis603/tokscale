@@ -501,19 +501,6 @@ fn is_codex_chat_workspace(key: &str) -> bool {
     !Path::new(key).join(".git").exists()
 }
 
-fn positive_unified_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
-    // saturating_add (mirrors tokscale_core::TokenBreakdown::total) so a
-    // clamped (i64::MAX) bucket from a corrupt source can't overflow the
-    // per-message sum.
-    tokens
-        .input
-        .max(0)
-        .saturating_add(tokens.output.max(0))
-        .saturating_add(tokens.cache_read.max(0))
-        .saturating_add(tokens.cache_write.max(0))
-        .saturating_add(tokens.reasoning.max(0))
-}
-
 fn workspace_model_display_label(workspace_label: &str, model: &str) -> String {
     format!("{workspace_label} / {model}")
 }
@@ -1039,7 +1026,7 @@ impl DataLoader {
             model_entry.cost += msg_cost;
             model_entry
                 .performance
-                .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
 
             if let Some(date) = parse_date(&msg.date) {
                 let model_day = model_days
@@ -1079,7 +1066,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_day
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // A recovered daily floor has a synthetic session id; it adds usage
@@ -1267,7 +1254,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_info
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // Hourly aggregation: derive hour from timestamp (Unix ms),
@@ -2146,6 +2133,7 @@ mod tests {
             cost_source: tokscale_core::sessions::CostSource::default(),
             service_tier: None,
             duration_ms: None,
+            performance_timing: None,
             message_count: 1,
             agent: Some("hephaestus".to_string().into()),
             dedup_key: None,
@@ -2237,7 +2225,9 @@ mod tests {
             cache_write_1h: 0,
             reasoning: 0,
         };
-        assert_eq!(positive_unified_token_total(&tokens), i64::MAX);
+        let mut performance = ModelPerformance::default();
+        performance.record_token_breakdown(&tokens, Some(100));
+        assert_eq!(performance.timed_tokens, i64::MAX);
     }
 
     fn test_pricing_service() -> PricingService {
