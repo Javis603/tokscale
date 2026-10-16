@@ -525,6 +525,7 @@ mod tests {
             copilot_context: None,
             machine_label: None,
             duration_ms: None,
+            performance_timing: None,
         }
     }
 

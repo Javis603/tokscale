@@ -982,6 +982,7 @@ mod tests {
             cost_source: Default::default(),
             service_tier: None,
             duration_ms: None,
+            performance_timing: None,
             message_count: 1,
             agent: None,
             dedup_key: None,
@@ -1670,6 +1671,7 @@ mod tests {
             copilot_context: None,
             machine_label: None,
             duration_ms: None,
+            performance_timing: None,
         }
     }
 
