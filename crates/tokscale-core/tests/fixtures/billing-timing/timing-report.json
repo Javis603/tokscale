@@ -1,0 +1,108 @@
+{
+  "groupBy": "client,model",
+  "entries": [
+    {
+      "client": "hermes",
+      "mergedClients": null,
+      "model": "claude-sonnet-4-5",
+      "provider": "anthropic",
+      "input": 1000,
+      "output": 250,
+      "cacheRead": 200,
+      "cacheWrite": 50,
+      "reasoning": 150,
+      "messageCount": 1,
+      "cost": 1.25,
+      "performance": {
+        "msPer1KTokens": null,
+        "totalDurationMs": 0,
+        "timedTokens": 0,
+        "timedOutputTokens": 0,
+        "timedReasoningTokens": 0,
+        "sampleCount": 0,
+        "tokenCoverage": 0.0
+      }
+    },
+    {
+      "client": "micode",
+      "mergedClients": null,
+      "model": "mimo-v2.5-pro",
+      "provider": "mimo",
+      "input": 100,
+      "output": 20,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "reasoning": 0,
+      "messageCount": 1,
+      "cost": 0.75,
+      "performance": {
+        "msPer1KTokens": null,
+        "totalDurationMs": 0,
+        "timedTokens": 0,
+        "timedOutputTokens": 0,
+        "timedReasoningTokens": 0,
+        "sampleCount": 0,
+        "tokenCoverage": 0.0
+      }
+    },
+    {
+      "client": "amp",
+      "mergedClients": null,
+      "model": "claude-sonnet-4-0",
+      "provider": "anthropic",
+      "input": 100,
+      "output": 20,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "reasoning": 0,
+      "messageCount": 1,
+      "cost": 0.75,
+      "performance": {
+        "msPer1KTokens": null,
+        "totalDurationMs": 0,
+        "timedTokens": 0,
+        "timedOutputTokens": 0,
+        "timedReasoningTokens": 0,
+        "sampleCount": 0,
+        "tokenCoverage": 0.0
+      }
+    },
+    {
+      "client": "claude",
+      "mergedClients": null,
+      "model": "claude-sonnet-4-5",
+      "provider": "anthropic",
+      "input": 100,
+      "output": 20,
+      "cacheRead": 30,
+      "cacheWrite": 10,
+      "reasoning": 0,
+      "messageCount": 1,
+      "cost": 0.0006465,
+      "performance": {
+        "msPer1KTokens": null,
+        "totalDurationMs": 0,
+        "timedTokens": 0,
+        "timedOutputTokens": 0,
+        "timedReasoningTokens": 0,
+        "sampleCount": 0,
+        "tokenCoverage": 0.0
+      }
+    }
+  ],
+  "totalInput": 1300,
+  "totalOutput": 310,
+  "totalCacheRead": 230,
+  "totalCacheWrite": 60,
+  "totalMessages": 4,
+  "totalCost": 2.7506465,
+  "processingTimeMs": 35,
+  "undatedTokens": {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cacheWrite1h": 0,
+    "reasoning": 0
+  }
+}
