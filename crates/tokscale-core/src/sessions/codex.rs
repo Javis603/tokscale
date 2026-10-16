@@ -64,6 +64,7 @@ pub struct CodexPayload {
     pub originator: Option<String>,
     #[serde(rename = "type")]
     pub payload_type: Option<String>,
+    pub role: Option<Value>,
     pub model: Option<String>,
     pub model_name: Option<String>,
     pub model_info: Option<CodexModelInfo>,
@@ -189,7 +190,7 @@ pub(crate) struct CodexTotals {
 }
 
 impl CodexTotals {
-    fn from_usage(usage: &CodexTokenUsage) -> Self {
+    pub(super) fn from_usage(usage: &CodexTokenUsage) -> Self {
         Self {
             input: usage.input_tokens.unwrap_or(0).max(0),
             output: usage.output_tokens.unwrap_or(0).max(0),
@@ -322,6 +323,8 @@ pub(crate) struct CodexParseState {
     pub current_turn_start_ms: Option<i64>,
     #[serde(default)]
     pub last_accepted_token_timestamp_ms: Option<i64>,
+    #[serde(default)]
+    pub request_timing: super::codex_timing::CodexRequestTiming,
     pub previous_totals: Option<CodexTotals>,
     pub session_is_headless: bool,
     /// Set when session_meta marks a thread Codex started itself (any
@@ -1129,6 +1132,11 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         .zip(state.session_id_from_meta.as_deref())
                         .is_some_and(|(thread, own)| thread != own);
                     if !state.forked_child_waiting_for_turn_context && !from_other_thread {
+                        state.request_timing.observe(
+                            &entry.entry_type,
+                            entry.timestamp.as_deref(),
+                            &payload,
+                        );
                         let service_tier = extract_request_service_tier(&payload);
                         // A record still pending here never got its
                         // token_count, so its usage is counted from it now,
@@ -1342,6 +1350,12 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         continue;
                     }
                 }
+
+                state.request_timing.observe(
+                    &entry.entry_type,
+                    entry.timestamp.as_deref(),
+                    &payload,
+                );
 
                 // A `turn_context` starts a new turn, which ends only the
                 // request-scoped tier. The thread tier lives in its own slot,
@@ -1729,6 +1743,8 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         .clone()
                         .or_else(|| state.thread_service_tier.clone());
                     message.duration_ms = duration_ms;
+                    message.performance_timing =
+                        Some(state.request_timing.finish(parsed_timestamp, last_usage));
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under
                     // way: a `turn_context` without an id that comes later
@@ -2175,7 +2191,7 @@ fn codex_uuid_v7_order_key(id: &str) -> Option<String> {
     Some(key)
 }
 
-fn parse_codex_entry_timestamp(timestamp: Option<&str>) -> Option<i64> {
+pub(super) fn parse_codex_entry_timestamp(timestamp: Option<&str>) -> Option<i64> {
     timestamp
         .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
         .map(|dt| dt.timestamp_millis())
@@ -2703,7 +2719,7 @@ const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
 /// `<div>`, pasting an XML snippet, etc.). The `kind` field can't be used to
 /// distinguish them: both human and injected bodies appear as `kind:"plain"` or
 /// with no `kind` at all.
-fn codex_message_is_human_turn(message: Option<&str>) -> bool {
+pub(super) fn codex_message_is_human_turn(message: Option<&str>) -> bool {
     match message {
         Some(text) => {
             let trimmed = text.trim_start();

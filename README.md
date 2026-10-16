@@ -267,6 +267,8 @@ bun run build:core
 
 Use `tokscale --offline` for local reports without network requests. Prepare portable pricing caches with `tokscale pricing refresh --no-spinner` while connected. See [offline reporting](docs/offline.md) for supported commands and cache behavior.
 
+Model performance uses observed client-log timing. See [request performance timing](docs/request-performance.md) for timed token buckets, Codex request boundaries and the distinction from session activity time.
+
 ### Basic Commands
 
 ```bash
