@@ -1,3 +1,5 @@
+mod legacy_billing_timing;
+
 use crate::clients::ClientId;
 use crate::sessions::codex::CodexParseState;
 use crate::UnifiedMessage;
@@ -49,29 +51,32 @@ use std::time::UNIX_EPOCH;
 // message type and migrate with the field empty. Only the Pi-format driver
 // populates it, and every client that driver serves reads Stale through the
 // parser version, so those entries re-parse rather than migrate.
-// 11: Billing identity, raw pricing model and estimate state are retained on
+// 14: combines downstream performance timing with upstream billing identity.
+// Released upstream 11/12/13 and downstream 11/12/13 are distinct positional
+// layouts; explicit frozen decoders below preserve retained history from both.
+// 11 (upstream): Billing identity, raw pricing model and estimate state are retained on
 // messages. Entries record a one-time identity backfill generation; released
 // v10/v11 MiCode wire migrations preserve all messages and row provenance.
-const CACHE_FORMAT_VERSION: u32 = 11;
+const CACHE_FORMAT_VERSION: u32 = 14;
 // MiMo stores exact per-row provenance beside each cached entry. Its envelope
 // version moves too because those entries also serialize UnifiedMessage, so
 // it stays one ahead of CACHE_FORMAT_VERSION as both move together.
-const MICODE_CACHE_FORMAT_VERSION: u32 = 12;
+const MICODE_CACHE_FORMAT_VERSION: u32 = 15;
 const LEGACY_CACHE_FORMAT_VERSION_V10: u32 = 10;
 const LEGACY_MICODE_CACHE_FORMAT_VERSION_V11: u32 = 11;
 // Claude checkpoints are a namespace-specific sidecar. Billing changes the
 // entry layout and persisted parser state, so retain a decoder for main's v12.
-// v14 adds each message's transcript entry uuid beside the entry. A v13 shard
+// v17 adds each message's transcript entry uuid beside the entry. A v16 shard
 // still loads as current (not migrated): its rows may be the only record of
 // turns Claude Code rewrote out of their transcripts, so they must never be
 // rebuilt for this; they load with `ClaudeEntryUuid::Unknown`.
-const CLAUDE_CACHE_FORMAT_VERSION: u32 = 14;
-const LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13: u32 = 13;
+const CLAUDE_CACHE_FORMAT_VERSION: u32 = 17;
+const LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V16: u32 = 16;
 const LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V12: u32 = 12;
 // Billing fields change CachedSourceEntry's positional layout. Copilot's
 // released v12 envelope must reparse rather than decode it as the new layout.
 // Copilot is dispatched by namespace before the other envelope versions.
-const COPILOT_CACHE_FORMAT_VERSION: u32 = 13;
+const COPILOT_CACHE_FORMAT_VERSION: u32 = 16;
 const _: () = assert!(COPILOT_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
 const _: () = assert!(MICODE_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
 const _: () = assert!(CLAUDE_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
@@ -1077,6 +1082,7 @@ impl From<LegacyCodexStateV14> for CodexParseState {
             pending_usage_record: None,
             settled_usage_records: Default::default(),
             usage_event_ordinal: 0,
+            request_timing: Default::default(),
         }
     }
 }
@@ -1218,6 +1224,7 @@ impl From<LegacyCodexStateV15> for CodexParseState {
             turn_id_announced_by_task_started: state.turn_id_announced_by_task_started,
             usage_event_ordinal: state.usage_event_ordinal,
             turn_coverage: state.turn_coverage,
+            request_timing: Default::default(),
             pending_usage_record: None,
             settled_usage_records: Default::default(),
         }
@@ -1365,6 +1372,7 @@ impl From<LegacyCodexStateV19> for CodexParseState {
             settled_usage_records: state.settled_usage_records,
             has_entered_review_mode: false,
             has_own_turn_context: true,
+            request_timing: Default::default(),
         }
     }
 }
@@ -1988,7 +1996,9 @@ fn parser_version(client: ClientId) -> u32 {
         // The parse state gained `has_entered_review_mode` and
         // `has_own_turn_context`. A finished review never rewrites its parent,
         // so a warm v19 entry would keep reporting it without the parser running.
-        ClientId::Codex => 20,
+        // v20->v21 (downstream): request completion timing state joins the
+        // upstream review-mode state; every older layout reparses.
+        ClientId::Codex => 21,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -2560,6 +2570,7 @@ impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
             cost_source: message.cost_source,
             service_tier: None,
             duration_ms: message.duration_ms,
+            performance_timing: None,
             message_count: message.message_count,
             agent: message.agent.map(crate::sessions::SharedStr::from),
             dedup_key: message.dedup_key,
@@ -2655,6 +2666,7 @@ impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
             cost_source: message.cost_source,
             service_tier: message.service_tier.map(crate::sessions::SharedStr::from),
             duration_ms: message.duration_ms,
+            performance_timing: None,
             message_count: message.message_count,
             agent: message.agent.map(crate::sessions::SharedStr::from),
             dedup_key: message.dedup_key,
@@ -2748,6 +2760,7 @@ impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
             cost_source: message.cost_source,
             service_tier: message.service_tier.map(crate::sessions::SharedStr::from),
             duration_ms: message.duration_ms,
+            performance_timing: None,
             message_count: message.message_count,
             agent: message.agent.map(crate::sessions::SharedStr::from),
             dedup_key: message.dedup_key,
@@ -2912,6 +2925,7 @@ impl From<LegacyUnifiedMessageV10> for UnifiedMessage {
             cost_source: message.cost_source,
             service_tier: message.service_tier.map(crate::sessions::SharedStr::from),
             duration_ms: message.duration_ms,
+            performance_timing: None,
             message_count: message.message_count,
             agent: message.agent.map(crate::sessions::SharedStr::from),
             dedup_key: message.dedup_key,
@@ -4316,6 +4330,10 @@ fn read_shard_with_limit_unchecked(
         return ShardReadStatus::Stale;
     }
 
+    if let Some(status) = legacy_billing_timing::read(&envelope, identity, max_shard_bytes) {
+        return status;
+    }
+
     if identity.namespace == ClientId::Qoder.as_str() {
         if envelope.format_version != CACHE_FORMAT_VERSION {
             return ShardReadStatus::Stale;
@@ -4435,19 +4453,19 @@ fn read_shard_with_limit_unchecked(
         };
     }
 
-    if envelope.format_version == LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13
+    if envelope.format_version == LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V16
         && identity.namespace == ClientId::Claude.as_str()
     {
-        // Same entries and checkpoints as v14, without entry uuids. Loaded,
+        // Same entries and checkpoints as v17, without entry uuids. Loaded,
         // not migrated: nothing about the rows is stale, and a rebuild would
         // drop history the transcripts no longer hold.
-        type ClaudeWireEntryV13 = (
+        type ClaudeWireEntryV16 = (
             CachedSourceEntry,
             Option<crate::sessions::claudecode::ClaudeCheckpoint>,
         );
         return match bincode::options()
             .with_limit(max_shard_bytes)
-            .deserialize::<Vec<ClaudeWireEntryV13>>(&envelope.payload)
+            .deserialize::<Vec<ClaudeWireEntryV16>>(&envelope.payload)
         {
             Ok(entries) => ShardReadStatus::Loaded(
                 entries
@@ -4652,7 +4670,7 @@ fn read_shard_with_limit_unchecked(
             // the positional state, and the parser 19 attribution bump kept
             // that state layout byte-identical (the upstream-produced parser-19
             // fixture pins every persisted state field). It must not be decoded
-            // as parser 15. The current type is safe only under this exact
+            // as parser 15. Its frozen wire type is selected by this exact
             // version guard; the envelope gate above already rejected every
             // other parser version as stale.
             if identity.namespace == ClientId::Codex.as_str() {
@@ -5243,6 +5261,9 @@ mod tests {
             actual.rebucket_date(&fixture_timezone);
             fresh.rebucket_date(&fixture_timezone);
             fresh.billing_identity = actual.billing_identity.clone();
+            // Parser 19 never recorded request-performance timing.
+            actual.performance_timing = None;
+            fresh.performance_timing = None;
             assert_eq!(actual, fresh);
         }
         assert_eq!(fresh.state.turn_coverage, settled.state.turn_coverage);
@@ -5294,7 +5315,12 @@ mod tests {
             .unwrap()
             .remove("billing_identity_generation");
         for message in actual["messages"].as_array_mut().unwrap() {
-            for field in ["billing_identity", "pricing_model_id", "estimate_status"] {
+            for field in [
+                "billing_identity",
+                "pricing_model_id",
+                "estimate_status",
+                "performance_timing",
+            ] {
                 message.as_object_mut().unwrap().remove(field);
             }
         }
@@ -5487,7 +5513,7 @@ mod tests {
     #[test]
     fn historical_codex_cache_is_stale_before_decoding_old_state() {
         let identity = CacheIdentity::for_client(ClientId::Codex);
-        assert_eq!(identity.parser_version, 20);
+        assert_eq!(identity.parser_version, 21);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("old.bin");
         for bytes in [
@@ -6454,10 +6480,11 @@ mod tests {
         // settles pending usage when terminal events end a turn, and
         // v18->v19 re-attributes OpenCodex combo traffic to the observed
         // physical model so cached rows cannot keep the virtual selector, and
-        // v19->v20 exempts `codex review` parent rollouts from missing usage.
+        // v19->v20 exempts `codex review` parent rollouts from missing usage,
+        // and downstream v20->v21 adds request completion timing state.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 20);
+        assert_eq!(parser_version(ClientId::Codex), 21);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -7636,7 +7663,7 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         let cached = warm.get(identity, &source).unwrap();
-        assert_eq!(cached.parser_version, 20);
+        assert_eq!(cached.parser_version, 21);
         assert_eq!(cached.messages, parsed);
     }
 
@@ -7744,8 +7771,8 @@ mod tests {
         let fresh_cache = SourceMessageCache::load();
         let fresh_entry = fresh_cache
             .get(identity, &source)
-            .expect("the production scan must persist a v20 replacement");
-        assert_eq!(fresh_entry.parser_version, 20);
+            .expect("the production scan must persist a v21 replacement");
+        assert_eq!(fresh_entry.parser_version, 21);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
             "the v19 replacement must carry valid incremental metadata"
@@ -7864,8 +7891,8 @@ mod tests {
         let fresh_cache = SourceMessageCache::load();
         let fresh_entry = fresh_cache
             .get(identity, &source)
-            .expect("the production scan must persist a v20 replacement");
-        assert_eq!(fresh_entry.parser_version, 20);
+            .expect("the production scan must persist a v21 replacement");
+        assert_eq!(fresh_entry.parser_version, 21);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
             "the v19 replacement must carry valid incremental metadata"
@@ -7951,13 +7978,13 @@ mod tests {
                 .count()
         };
 
-        // Cold (stale v19 entry rejected) and warm (fresh v20 entry).
+        // Cold (stale v19 entry rejected) and warm (fresh v21 entry).
         for _ in 0..2 {
             assert!(scan().is_empty());
             assert_eq!(missing_usage_warnings(), 0);
         }
         let entry = SourceMessageCache::load().get(identity, &source).unwrap();
-        assert_eq!(entry.parser_version, 20);
+        assert_eq!(entry.parser_version, 21);
         let state = &entry.codex_incremental.as_ref().unwrap().state;
         assert!(state.has_entered_review_mode);
         assert!(!state.has_own_turn_context);
@@ -9399,7 +9426,7 @@ mod tests {
             .iter()
             .map(|(entry, checkpoint, _)| (entry, checkpoint))
             .collect();
-        envelope.format_version = LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13;
+        envelope.format_version = LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V16;
         envelope.payload = bincode::options().serialize(&legacy).unwrap();
         fs::write(&shard, bincode::options().serialize(&envelope).unwrap()).unwrap();
     }
@@ -9509,7 +9536,7 @@ mod tests {
             assert_eq!(totals(), both_matched, "{phase}");
             assert_eq!(
                 claude_shard_format(&source),
-                LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13,
+                LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V16,
                 "{phase}: an unchanged legacy entry must not be rebuilt"
             );
         }
@@ -11185,12 +11212,12 @@ mod tests {
         });
         // Claude's v13 decoder still shares Copilot's current number.
         assert_eq!(
-            LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13,
+            LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V16,
             COPILOT_CACHE_FORMAT_VERSION
         );
         let legacy_claude = dir.path().join("claude-v13.bin");
         let legacy_envelope = CachedShardEnvelope {
-            format_version: LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13,
+            format_version: LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V16,
             parser_namespace: claude.namespace.to_string(),
             parser_version: claude.parser_version,
             payload: bincode::options()
@@ -11513,12 +11540,10 @@ mod tests {
         assert_eq!(envelope.format_version, CLAUDE_CACHE_FORMAT_VERSION);
         envelope.format_version = MICODE_CACHE_FORMAT_VERSION;
         std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
-        // Version 12 is also the released Claude checkpoint envelope. A new
-        // Claude payload mislabeled as v12 reaches its historical decoder and
-        // is invalid, rather than being rejected as a foreign namespace.
+        // MiMo generation 15 is foreign to Claude and must not be decoded.
         assert!(matches!(
             read_shard(&path, unrelated),
-            ShardReadStatus::Invalid(_)
+            ShardReadStatus::Stale
         ));
         let foreign = CacheIdentity::for_client(ClientId::Cursor);
         envelope.parser_namespace = foreign.namespace.to_string();
