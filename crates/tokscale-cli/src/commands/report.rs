@@ -1805,6 +1805,7 @@ mod tests {
             cache_write_1h: 0,
             reasoning: 0,
             duration_ms: None,
+            performance_timing: None,
             message_count: 1,
             agent: None,
             cost: 0.0,
