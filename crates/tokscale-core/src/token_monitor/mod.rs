@@ -24,6 +24,7 @@
 //! does, filtered or not, so the id means the same data in every scan.
 
 mod catpaw;
+mod deeptutor;
 mod js;
 mod mcode;
 mod proma;
@@ -42,6 +43,14 @@ struct Client {
 /// Every Token Monitor-owned client, in the order they are parsed. Adding a
 /// client is one entry here plus its module; no upstream file changes.
 const CLIENTS: &[Client] = &[
+    Client {
+        id: deeptutor::CLIENT_ID,
+        parse: |scope| deeptutor::parse(scope, false),
+    },
+    Client {
+        id: deeptutor::ESTIMATED_CLIENT_ID,
+        parse: |scope| deeptutor::parse(scope, true),
+    },
     Client {
         id: catpaw::CLIENT_ID,
         parse: catpaw::parse,
