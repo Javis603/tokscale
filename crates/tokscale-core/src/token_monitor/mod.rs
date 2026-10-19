@@ -34,9 +34,10 @@ use crate::sessions::UnifiedMessage;
 use crate::{ClientCounts, ClientId};
 use std::collections::HashMap;
 
-/// A Token Monitor-owned client: its `--client` id and its parser.
+/// A Token Monitor-owned source and its `--client` partitions. Shared sources
+/// are parsed once, then filtered, so a changing call cannot be counted twice.
 struct Client {
-    id: &'static str,
+    ids: &'static [&'static str],
     parse: fn(&Scope) -> Vec<UnifiedMessage>,
 }
 
@@ -44,23 +45,19 @@ struct Client {
 /// client is one entry here plus its module; no upstream file changes.
 const CLIENTS: &[Client] = &[
     Client {
-        id: deeptutor::CLIENT_ID,
-        parse: |scope| deeptutor::parse(scope, false),
+        ids: &[deeptutor::CLIENT_ID, deeptutor::ESTIMATED_CLIENT_ID],
+        parse: deeptutor::parse,
     },
     Client {
-        id: deeptutor::ESTIMATED_CLIENT_ID,
-        parse: |scope| deeptutor::parse(scope, true),
-    },
-    Client {
-        id: catpaw::CLIENT_ID,
+        ids: &[catpaw::CLIENT_ID],
         parse: catpaw::parse,
     },
     Client {
-        id: proma::CLIENT_ID,
+        ids: &[proma::CLIENT_ID],
         parse: |scope| proma::parse(scope.home_dir),
     },
     Client {
-        id: qodercn::CLIENT_ID,
+        ids: &[qodercn::CLIENT_ID],
         parse: |scope| qodercn::parse(scope.home_dir),
     },
 ];
@@ -124,13 +121,15 @@ const SUPPLEMENTS: &[Supplement] = &[Supplement {
 /// Token Monitor-owned client ids. Supplement ids are upstream ids, so they
 /// are not listed here.
 pub fn client_ids() -> impl Iterator<Item = &'static str> {
-    CLIENTS.iter().map(|client| client.id)
+    CLIENTS.iter().flat_map(|client| client.ids.iter().copied())
 }
 
 fn requested<'a>(clients: &'a [String]) -> impl Iterator<Item = &'static Client> + 'a {
-    CLIENTS
-        .iter()
-        .filter(move |owned| clients.iter().any(|client| client == owned.id))
+    CLIENTS.iter().filter(move |owned| {
+        clients
+            .iter()
+            .any(|client| owned.ids.contains(&client.as_str()))
+    })
 }
 
 /// An empty filter scans every upstream client, so it runs every supplement.
@@ -145,6 +144,7 @@ fn requested_supplements<'a>(
 fn parse_requested(clients: &[String], scope: &Scope) -> Vec<UnifiedMessage> {
     requested(clients)
         .flat_map(|client| (client.parse)(scope))
+        .filter(|message| clients.contains(&message.client))
         .chain(requested_supplements(clients).flat_map(|supplement| (supplement.parse)(scope)))
         .collect()
 }
@@ -190,9 +190,18 @@ mod tests {
         assert_eq!(requested(&["claude".to_string()]).count(), 0);
         assert_eq!(
             requested(&["proma".to_string()])
-                .map(|client| client.id)
+                .flat_map(|client| client.ids.iter().copied())
                 .collect::<Vec<_>>(),
             vec!["proma"]
+        );
+    }
+
+    #[test]
+    fn deeptutor_partitions_share_one_source_read() {
+        assert_eq!(
+            requested(&["deeptutor".to_string(), "deeptutor-estimated".to_string()]).count(),
+            1,
+            "a native call can change precision between two separate source reads"
         );
     }
 
