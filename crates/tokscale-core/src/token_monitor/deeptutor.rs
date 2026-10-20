@@ -53,6 +53,9 @@ struct Snapshot {
     rows: Vec<Row>,
 }
 
+/// Selects an absolute ledger path only when host environment roots are allowed.
+/// A nonempty explicit DB setting takes precedence even when invalid; it must
+/// never fall back to a different account through the runtime home.
 fn configured_path(enabled: bool, db: Option<String>, home: Option<String>) -> Option<PathBuf> {
     if !enabled {
         return None;
@@ -67,6 +70,9 @@ fn configured_path(enabled: bool, db: Option<String>, home: Option<String>) -> O
         .then(|| home.join("data").join("user").join("usage.sqlite3"))
 }
 
+/// Reads both precision partitions from the configured ledger using a path-scoped
+/// cache. No configured source returns no messages; failed reads may return the
+/// last complete snapshot with a warning rather than claim fresh zero usage.
 pub fn parse(scope: &Scope) -> Vec<UnifiedMessage> {
     let Some(db) = configured_path(
         scope.use_env_roots,
@@ -81,6 +87,8 @@ pub fn parse(scope: &Scope) -> Vec<UnifiedMessage> {
     parse_with(&db, &cache)
 }
 
+/// Returns file size and modification time in Unix nanoseconds for invalidation.
+/// Rejects non-files and unavailable timestamps instead of inventing a stamp.
 fn stat(path: &Path) -> io::Result<(u64, u128)> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() {
@@ -96,6 +104,8 @@ fn stat(path: &Path) -> io::Result<(u64, u128)> {
     ))
 }
 
+/// Tracks DB and optional WAL metadata without opening unrelated account files.
+/// Only a missing WAL is normal; other metadata errors make the read unavailable.
 fn fingerprint(db: &Path) -> io::Result<Fingerprint> {
     let mut wal = db.as_os_str().to_owned();
     wal.push("-wal");
@@ -110,6 +120,8 @@ fn fingerprint(db: &Path) -> io::Result<Fingerprint> {
     })
 }
 
+/// Reads at most the budget plus one overflow sentinel byte, failing rather than
+/// returning truncated JSON when the input exceeds the budget.
 fn bounded_read(reader: impl Read, max_bytes: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
@@ -119,6 +131,8 @@ fn bounded_read(reader: impl Read, max_bytes: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Attempts a nonblocking exclusive publication lock, held by the returned file.
+/// Callers may continue reading on contention but must not publish a snapshot.
 fn lock_cache(cache: &Path) -> io::Result<File> {
     if let Some(parent) = cache.parent() {
         std::fs::create_dir_all(parent)?;
@@ -135,6 +149,9 @@ fn lock_cache(cache: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Reuses an unchanged cache or reads a complete snapshot before publishing it.
+/// Source failures retain the last compatible cache; a valid empty ledger clears
+/// it. A concurrent source change or unavailable lock suppresses cache writes.
 fn parse_with(db: &Path, cache: &Path) -> Vec<UnifiedMessage> {
     let cache_lock = match lock_cache(cache) {
         Ok(file) => Some(file),
@@ -184,6 +201,8 @@ fn parse_with(db: &Path, cache: &Path) -> Vec<UnifiedMessage> {
         .collect()
 }
 
+/// Atomically replaces a cache within the byte budget, cleaning failed staging
+/// writes. The caller must hold the cache lock to serialize publishers.
 fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
     let bytes = serde_json::to_vec(snapshot)?;
     if bytes.len() > MAX_BYTES {
@@ -198,6 +217,9 @@ fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
     result
 }
 
+/// Accepts nonnegative integer counters within JavaScript's safe integer range.
+/// Missing or null optional counters mean zero; invalid required values reject
+/// the row rather than silently undercount it.
 fn count(usage: &Value, key: &str, required: bool) -> Option<i64> {
     match usage.get(key) {
         None | Some(Value::Null) if !required => Some(0),
@@ -208,6 +230,10 @@ fn count(usage: &Value, key: &str, required: bool) -> Option<i64> {
     }
 }
 
+/// Validates a native call and splits inclusive totals into disjoint buckets.
+/// Unknown precision, inconsistent counters and invalid identities are omitted;
+/// estimates never acquire measured timing. Session identity falls back to the
+/// native turn, then call ID, without joining unrelated anonymous calls.
 fn normalize(id: String, stamp: f64, session: String, turn: String, raw: &str) -> Option<Row> {
     if id.is_empty()
         || id.len() > 512
@@ -272,6 +298,9 @@ fn normalize(id: String, stamp: f64, session: String, turn: String, raw: &str) -
     })
 }
 
+/// Reads only usage columns through one read-only SQLite query, including WAL
+/// commits. Row or byte exhaustion fails the whole scan; malformed usage rows
+/// are counted and omitted. Valid calls are deduplicated and sorted in memory.
 fn read_db(db: &Path, max_rows: usize, max_bytes: usize) -> Result<Vec<Row>, String> {
     let conn = open_readonly_sqlite(db).map_err(|e| e.to_string())?;
     conn.busy_timeout(Duration::from_millis(250))
@@ -332,6 +361,9 @@ fn read_db(db: &Path, max_rows: usize, max_bytes: usize) -> Result<Vec<Row>, Str
     Ok(output)
 }
 
+/// Assigns the precision partition while preserving a precision-independent
+/// native dedup key. Namespaces separate ledgers; unpriced provider identities
+/// prevent inferred API charges for estimates and known Codex OAuth providers.
 fn to_message(row: Row, namespace: &str) -> UnifiedMessage {
     // Estimates and subscription/OAuth counters have no reported API charge.
     // Existing unpriced-provider semantics prevent model-name tariff guessing.
@@ -372,12 +404,14 @@ mod tests {
     use rusqlite::{params, Connection};
     use serde_json::json;
 
+    /// Builds synthetic inclusive counters with cache and reasoning overlap.
     fn usage(estimated: bool) -> Value {
         json!({"model":"fixture-model","provider":"openai_codex","estimated":estimated,
             "prompt_tokens":120,"completion_tokens":30,"total_tokens":150,
             "cache_read_input_tokens":40,"cache_creation_input_tokens":10,"reasoning_tokens":5,
             "generation_seconds":2.5})
     }
+    /// Normalizes a fixture with stable identity and fractional-second timing.
     fn row(value: Value) -> Option<Row> {
         normalize(
             "call-1".into(),
@@ -387,11 +421,13 @@ mod tests {
             &value.to_string(),
         )
     }
+    /// Creates a minimal local usage schema without any real account content.
     fn fixture(db: &Path) -> Connection {
         let conn = Connection::open(db).unwrap();
         conn.execute_batch("CREATE TABLE llm_calls (call_id TEXT PRIMARY KEY, started_at REAL, session_id TEXT, turn_id TEXT, source TEXT, usage_json TEXT);").unwrap();
         conn
     }
+    /// Inserts a synthetic call with an explicitly chosen precision partition.
     fn insert(conn: &Connection, id: &str, estimated: bool) {
         conn.execute(
             "INSERT INTO llm_calls VALUES (?,1792368000,'session-1','turn-1','fixture',?)",

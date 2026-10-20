@@ -124,6 +124,8 @@ pub fn client_ids() -> impl Iterator<Item = &'static str> {
     CLIENTS.iter().flat_map(|client| client.ids.iter().copied())
 }
 
+/// Selects each owned source once even when several of its partitions are
+/// requested, so mutable source data cannot be read twice in the same scan.
 fn requested<'a>(clients: &'a [String]) -> impl Iterator<Item = &'static Client> + 'a {
     CLIENTS.iter().filter(move |owned| {
         clients
@@ -141,6 +143,9 @@ fn requested_supplements<'a>(
     })
 }
 
+/// Parses owned sources once and filters their shared snapshots by partition.
+/// Supplements keep their upstream client's selection rules and are appended
+/// separately; an empty filter does not enable opt-in owned sources.
 fn parse_requested(clients: &[String], scope: &Scope) -> Vec<UnifiedMessage> {
     requested(clients)
         .flat_map(|client| (client.parse)(scope))
