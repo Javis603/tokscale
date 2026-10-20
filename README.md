@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Tokscale](./.github/assets/hero-v2.png)](https://tokscale.ai)
+[![Tokscale](./.github/assets/hero-v3.png)](https://tokscale.ai)
 
 </div>
 
@@ -12,11 +12,11 @@
 >
 > I drop new open-source work every week. Don't miss the next one.
 >
-> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | Follow [@junhoyeo](https://github.com/junhoyeo) on GitHub for more projects. Hacking on AI, infra, and everything in between. |
+> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | Follow [@Tokscale](https://x.com/Tokscale) on X for release notes and updates. |
 > | :-----| :----- |
 > [<img alt="Discord link" src="https://img.shields.io/discord/1480206352755458110?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=flat-square" width="156px" />](https://discord.gg/h6DUGWdBbm) | Come hang out in our [Discord](https://discord.gg/h6DUGWdBbm) — and surround yourself with the world's top-tier vibers. |
-> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | Follow [@Tokscale](https://x.com/Tokscale) on X for release notes and updates. |
 > [<img alt="Sponsor Tokscale" src="https://img.shields.io/badge/sponsor-Tokscale-EA4AAA?style=flat-square&logo=githubsponsors&logoColor=white&labelColor=black" width="156px" />](https://github.com/sponsors/junhoyeo) | Support Tokscale's continued development through [GitHub Sponsors](https://github.com/sponsors/junhoyeo). |
+> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | Follow [@junhoyeo](https://github.com/junhoyeo) on GitHub for more projects. Hacking on AI, infra, and everything in between. |
 
 <div align="center">
 
@@ -86,7 +86,7 @@
 | <img width="48px" src=".github/assets/client-kilocode.png" alt="Kilo CLI" /> | [Kilo CLI](https://github.com/nicepkg/kilo) | `~/.local/share/kilo/kilo.db` |
 | <img width="48px" src=".github/assets/client-mux.png" alt="Mux" /> | [Mux](https://github.com/coder/mux) | `~/.mux/sessions/` |
 | <img width="48px" src=".github/assets/client-crush.png" alt="Crush" /> | [Crush](https://crush.ai/) | `$XDG_DATA_HOME/crush/projects.json` (project registry; fallback: `~/.local/share/crush/projects.json`) |
-| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` (+ macOS Application Support, legacy Block/goose paths; override via `GOOSE_PATH_ROOT`) |
+| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` / `%APPDATA%\Block\goose\data\sessions\sessions.db` (+ macOS Application Support, legacy Block/goose paths; override via `GOOSE_PATH_ROOT`) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | Cached via `tokscale antigravity sync` to `~/.config/tokscale/antigravity-cache/sessions/*.jsonl` (live RPC against the local language server) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity CLI" /> | [Antigravity CLI](https://antigravity.google/) | `~/.gemini/antigravity-cli/conversations/*.db` (override the Gemini home via `GEMINI_CLI_HOME`; local SQLite, read directly — no `antigravity sync` needed) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity IDE Extension" /> | [Antigravity IDE Extension](https://www.antigravity.google/docs/ide/extensions/) | `~/.gemini/antigravity/conversations/*.db` (local SQLite, read directly) |
@@ -118,6 +118,8 @@
 | <img width="48px" src="https://github.com/MiniMax-AI.png" alt="MiniMax Code" /> | [MiniMax Code](https://github.com/MiniMax-AI) | `~/.config/tokscale/headless/mcode/*.jsonl` (headless capture of `mcode exec --output-format stream-json`; override via `TOKSCALE_HEADLESS_DIR`) |
 | <img width="48px" src=".github/assets/client-fx.png" alt="Fx" /> | [fx](https://github.com/vercel-labs/fx) | `~/.fx/sessions/<sessionId>/usage-v2.json` (per-session aggregates) |
 | <img width="48px" src="https://github.com/meta-models.png" alt="Muse Code" /> | [Muse Code](https://dev.meta.ai/docs/muse-code) | `~/.local/share/muse/sessions/**/session.jsonl` (same XDG-style path on Windows; subagent transcripts under `subagent/<uuid>/` included) |
+| <img width="48px" src=".github/assets/client-aside.png" alt="Aside" /> | [Aside](https://asidehq.com) | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` |
+| <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json` (same path on Windows; override the root via `VIBE_HOME`) |
 
 Get real-time pricing calculations using [🚅 LiteLLM's pricing data](https://github.com/BerriAI/litellm), with support for tiered pricing models and cache token discounts.
 
@@ -190,7 +192,7 @@ In the age of AI-assisted development, **tokens are the new energy**. They power
   - GitHub-style contribution graph with configurable color themes
   - Real-time filtering and sorting
   - Zero flicker rendering
-- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Prime Agent, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimchi Coding, Reasonix, Kimi CLI, Kimi Work, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth Studio, Hindsight, fx, Oh My Pi, and Muse Code
+- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Prime Agent, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimchi Coding, Reasonix, Kimi CLI, Kimi Work, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth Studio, Hindsight, fx, Oh My Pi, Muse Code, Aside, and Mistral Vibe
 - **Real-time pricing** - Fetches current pricing from LiteLLM with 1-hour disk cache; automatic OpenRouter fallback and Cursor model pricing for newly released models
 - **Detailed breakdowns** - Input, output, cache read/write, and reasoning token tracking
 - **Native Rust core** - All parsing and aggregation done in Rust for 10x faster processing
@@ -419,7 +421,7 @@ tokscale --client opencode,claude
 # Repeated: same effect, useful with shell aliases
 tokscale -c opencode -c claude
 
-# Cursor IDE uses Tokscale's API cache; run login + sync --json first
+# Cursor IDE uses Tokscale's API cache; a signed-in desktop session is imported when no login is saved
 tokscale --client cursor
 
 # Synthetic (synthetic.new) is detected from other agent sessions
@@ -429,7 +431,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-Possible values: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`.
+Possible values: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`, `aside`, `vibe`.
 
 > **Breaking change (v4.0.0):** The per-client boolean flags (`--opencode`, `--claude`, `--codex`, etc.) have been removed and now error. Use the canonical `--client`/`-c` flag instead — e.g. `tokscale --client opencode,claude`.
 
@@ -499,7 +501,6 @@ Create `custom-pricing.json` in Tokscale's config directory (`~/.config/tokscale
 
 ```json
 {
-  "$schema": "https://tokscale.ai/custom-pricing.schema.json",
   "models": {
     "accounts/fireworks/routers/kimi-k2p6-turbo": {
       "input_cost_per_million_tokens": 2.00,
@@ -521,6 +522,8 @@ Create `custom-pricing.json` in Tokscale's config directory (`~/.config/tokscale
 }
 ```
 
+The JSON schema is available at [schemas/custom-pricing.schema.json](schemas/custom-pricing.schema.json) in this repository. For editor validation, use a local copy of that schema.
+
 Override prices are entered in dollars per million tokens, matching how most API providers publish pricing; Tokscale converts them to per-token rates internally. At least one of `input_cost_per_million_tokens` or `output_cost_per_million_tokens` must be present, and cache-read/cache-creation fields are optional. An explicit `0` is allowed and declares that token bucket free; an omitted field means the rate is unknown and leaves the usage unpriced, except for the all-zero model declaration described above. LiteLLM-style per-token field names such as `input_cost_per_token`, `output_cost_per_token`, and `cache_read_input_token_cost` are also accepted for copy/paste compatibility, but the per-million names are the recommended user-facing form. To omit a tier or cache price, leave the field out; negative or non-finite values are treated as invalid and the whole model entry is skipped so typos do not silently alter accounting. Optional `source` and `notes` fields are ignored by Tokscale and can be used for your own bookkeeping.
 
 Overrides are exact-only and case-insensitive. Tokscale checks the raw model ID first, then the existing synthetic `/models/` normalization, then falls through to LiteLLM, OpenRouter, Cursor pricing, and fuzzy matching if no override matches. Raw exact matches beat normalized exact matches, so `accounts/fireworks/routers/kimi-k2p6-turbo` can override one gateway-specific model while `kimi-k2p6-turbo` can cover normalized `/models/` paths. Overrides are loaded once at startup; restart the command after editing the file. This is the recommended local fix for wrong-model pricing bugs while waiting on upstream LiteLLM pricing updates.
@@ -538,6 +541,12 @@ When multiple matches exist, original model creators are preferred over reseller
 | `meta-llama/` | `fireworks_ai/` |
 
 Example: `grok-code` matches `xai/grok-code-fast-1` ($0.20/$1.50) instead of `azure_ai/grok-code-fast-1` ($3.50/$17.50).
+
+#### Billing-channel pricing
+
+Custom pricing now supports `provider_overrides` alongside the existing global `models` object. Use `tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner`; the old `--provider` flag still means pricing source. Channels are exact whole log labels (trim + ASCII case-insensitive), not inferred model vendors or verified billing accounts. Unknown channels only use global/upstream estimates.
+
+Run `tokscale pricing validate-overrides --strict --json --no-spinner` to check configuration offline and `tokscale pricing explain --json --no-spinner` for local per-message scope, coverage, multiplier and estimate status. Rules are base rates; authoritative costs including zero are preserved. Restart after editing: historical estimates use current rates, while missing/stale prices do not remain in totals. Older binaries ignore scoped rules on downgrade. [Full contract, precedence, cache behavior and example](docs/provider-pricing.md).
 
 ### Social
 
@@ -622,15 +631,15 @@ Scheduled runs are non-interactive: they never prompt for GitHub auth or star co
 
 ### Cursor IDE Commands
 
-Cursor IDE support uses Cursor's web usage API, cached by Tokscale at `~/.config/tokscale/cursor-cache/usage*.json`. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
+Cursor IDE support uses Cursor's usage-events API. Tokscale caches usage at `~/.config/tokscale/cursor-cache/usage.json` for the active account and `usage.account-<sha256-of-exact-account-id>.json` for each other account, with verified ownership metadata. Unmarked legacy JSON/CSV caches are preserved in `cursor-cache/archive/` before sync or an account change; see the migration details below. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
 
-When the Cursor desktop app is installed and signed in, `tokscale cursor login` prefers the local `cursorAuth/accessToken` from Cursor's `state.vscdb` and builds the session cookie automatically. `tokscale cursor sync` also refreshes that token when available. Usage rows still come only from Cursor's usage API.
+When the Cursor desktop app is installed and signed in, reports, submit, and wrapped can import `cursorAuth/accessToken` from `state.vscdb` when no Cursor login is saved yet. Wrapped only does this when Cursor is included in the requested clients. Reports skip syncing while the usage cache is fresh. Whenever a sync runs, including explicit `tokscale cursor sync`, it refreshes the desktop token when available and can switch the active account to that desktop login. A saved login remains usable when no desktop session is available. Usage rows still come only from Cursor's usage-events API, not from local `~/.cursor` transcripts.
 
 Setup (desktop auto-login):
 
 1. Sign in to the Cursor desktop app.
-2. Run `tokscale cursor login --name work` (auto-detects the local desktop session when available).
-3. Run `tokscale cursor sync --json` to populate `~/.config/tokscale/cursor-cache/usage.json`.
+2. Optional: run `tokscale cursor login --name work` to save that desktop session under a name. Reports, submit, and sync import it automatically when no Cursor login is saved yet.
+3. Optional: run `tokscale cursor sync --json` to refresh `~/.config/tokscale/cursor-cache/usage.json` now. A report syncs on its own when the cache is stale.
 4. Run `tokscale --client cursor` or any report command.
 
 Fallback (manual browser cookie), if desktop login is unavailable:
@@ -874,7 +883,9 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 | **Z.ai** | API key (env var) | Token limits, Web Searches | Set `ZAI_API_KEY` or `GLM_API_KEY` |
 | **Amp** | API key (`~/.local/share/amp/secrets.json`) | Free tier balance, Credits | Run `amp` to log in |
 | **GitHub Copilot** | GitHub token (keychain or `~/.config/gh/hosts.yml`) | Premium interactions, Chat quotas | Run `gh auth login` |
-| **Grok Build** | OAuth (`~/.grok/auth.json`) | Credits, subscription plan | Run `grok login` |
+| **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Cursor Models and Other Models plan quotas (one Weekly pool on unified plans) | Sign in to Cursor desktop, or run `tokscale cursor login` |
+| **Grok Bot** | Cursor desktop JWT (with macOS Keychain refresh when available) | Weekly personal quota | Sign in to Cursor desktop; shown when a personal quota is available |
+| **Grok** | OAuth (`~/.grok/auth.json`) | Included credits (weekly or monthly), subscription plan | Run `grok login` |
 | **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | Session, Weekly quotas | Run `kimi` to log in |
 | **MiniMax** | API key (env var) | Prompt quotas per model | Set `MINIMAX_API_KEY` or `MINIMAX_API_TOKEN` |
 | **MiniMax Token Plan** | API key (env var) | Interval + weekly remaining-percent quotas (per region: CN minimaxi.com + Global minimax.io) | Set `MINIMAX_TOKEN_PLAN_CN_KEY` and/or `MINIMAX_TOKEN_PLAN_GLOBAL_KEY` |
@@ -948,6 +959,7 @@ Tokscale stores settings in `settings.json` in its config directory. By default 
 ```json
 {
   "colorPalette": "blue",
+  "glyphs": "auto",
   "includeUnusedModels": false,
   "defaultClients": ["opencode", "claude"],
   "usage": {
@@ -971,12 +983,13 @@ Tokscale stores settings in `settings.json` in its config directory. By default 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `colorPalette` | string | `"blue"` | TUI color theme (green, halloween, teal, blue, pink, purple, orange, monochrome, ylgnbu, graphite, lagoon, dusk, tokyo-night, catppuccin, solarized, gruvbox, gruvbox-material, one-dark) |
+| `glyphs` | `"auto"` \| `"unicode"` \| `"ascii"` | `"auto"` | TUI glyph policy. `auto` probes the terminal's ambiguous-character width at startup; use `unicode` or `ascii` to override detection for terminals that do not answer the probe correctly. Invalid values safely fall back to `auto`. |
 | `includeUnusedModels` | boolean | `false` | Show models with zero tokens in reports |
 | `autoRefreshEnabled` | boolean | `false` | Enable auto-refresh in TUI |
 | `autoRefreshMs` | number | `60000` | Auto-refresh interval (30000-3600000ms) |
 | `nativeTimeoutMs` | number | `300000` | Maximum time for native subprocess processing (5000-3600000ms) |
 | `defaultClients` | string[] | `[]` | Client filter applied when no `--client/-c` flag is passed. Accepts the same ids as `--client` (e.g. `["opencode", "claude", "synthetic"]`). Unknown ids are silently dropped. CLI flags always override this list completely — no merging. |
-| `usage.disabledProviders` | string[] | `[]` | Subscription-usage providers to skip before credential discovery or network access. Valid ids (case-insensitive; surrounding whitespace ignored): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `warp`, `sakana`, and `opencode-go`. Unknown ids are ignored. Disabled providers are also hidden from cached TUI cards and diagnostics. Changes apply to the next `tokscale usage` run or TUI launch/refresh. |
+| `usage.disabledProviders` | string[] | `[]` | Subscription-usage providers to skip before credential discovery or network access. Valid ids (case-insensitive; surrounding whitespace ignored): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `cursor`, `grok-bot`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `warp`, `sakana`, and `opencode-go`. Legacy `grok-build`, `grok_build`, and `Grok Build` aliases also select `grok`. Unknown ids are ignored. Disabled providers are also hidden from cached TUI cards and diagnostics. Changes apply to the next `tokscale usage` run or TUI launch/refresh. |
 | `light.writeCache` | boolean | `false` | When true, `tokscale --light` overwrites the TUI cache atomically after rendering. CLI flags `--write-cache` / `--no-write-cache` override per-invocation. |
 | `minutelyTabEnabled` | boolean | `false` | Show the per-minute Minutely tab in the TUI and aggregate per-minute usage during data loading. Default-off because minute-granularity is a niche/diagnostic view for most users and the per-minute bucketing has a non-trivial cost on large datasets. |
 | `autosubmit` | object | disabled | Saved `tokscale autosubmit` state: interval, client/date filters, scheduler backend, last run time, and last error. Prefer `tokscale autosubmit enable/status/disable` over editing this object by hand. |
@@ -1067,6 +1080,7 @@ Environment variables override config file values. For CI/CD or one-off use:
 | `TOKSCALE_API_TOKEN` | unset | Tokscale personal API token for non-interactive `submit` and `delete-submitted-data` runs. Create one from Settings > API Tokens or save it locally with `tokscale login --token tt_xxx`. |
 | `TOKSCALE_EXTRA_DIRS` | unset | One-off extra session roots as `client:/abs/path,client:/abs/path` |
 | `TOKSCALE_CONFIG_DIR` | unset | Overrides the config directory root (where `settings.json`, `star-cache.json`, `cache/`, `antigravity-cache/`, and `trae-cache/` live). Absolute path recommended; relative paths resolve against the process CWD. Useful for CI sandboxes or pinning a non-default location. When set, tokscale will not fall back to the legacy macOS `~/Library/Application Support/tokscale/` path. |
+| `TOKSCALE_CODEX_MAX_DECODED_BYTES` | `1073741824` (1 GiB) | Sets the decoded-size ceiling, in bytes, for compressed Codex `.jsonl.zst` rollouts. Accepts positive integers below `u64::MAX`; invalid values use the default. Raising it increases the work Tokscale permits for one archive. |
 | `TOKSCALE_FM_DEBUG` | unset | When set, prints Apple Foundation Models diagnostics (macOS version gate, dlopen dylib path, load/symbol errors) to stderr to explain why on-device apple-fm did or didn't engage. |
 | `TOKSCALE_RECOVERY_DISABLE` | unset | When set, disables the local usage recovery ledger (`recovered-usage-v1.json`) even if the file exists. |
 
@@ -1162,7 +1176,7 @@ The frontend provides a GitHub-style contribution graph visualization:
 - **Interactive tooltips**: Hover for detailed daily breakdowns
 - **Day breakdown panel**: Click to see per-source and per-model details
 - **Year filtering**: Navigate between years
-- **Source filtering**: Filter by platform (OpenCode, Claude, Codex, MiniMax Code, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth, Hindsight, Muse Code)
+- **Source filtering**: Filter by platform (OpenCode, Claude, Codex, MiniMax Code, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth, Hindsight, Muse Code, Aside, Mistral Vibe)
 - **Stats panel**: Total cost, tokens, active days, streaks
 - **FOUC prevention**: Theme applied before React hydrates (no flash)
 
@@ -1565,7 +1579,7 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Codebuff | `~/.config/manicode/projects/` (+ `manicode-dev`, `manicode-staging`) | `%USERPROFILE%\.config\manicode\projects\` | Override via `CODEBUFF_DATA_DIR` env var |
 | Kilo CLI | `~/.local/share/kilo/` | `%USERPROFILE%\.local\share\kilo\` | Uses `xdg-basedir` like OpenCode |
 | Crush | `$XDG_DATA_HOME/crush/` (fallback: `~/.local/share/crush/`) | `%USERPROFILE%\.local\share\crush\` (or `%XDG_DATA_HOME%\crush\` if set) | Uses XDG data directory with fallback |
-| Goose | `~/.local/share/goose/sessions/` (+ macOS Application Support, legacy Block paths) | `%USERPROFILE%\.local\share\goose\sessions\` | Configurable via `GOOSE_PATH_ROOT` env var |
+| Goose | `~/.local/share/goose/sessions/` (+ macOS Application Support, legacy Block paths) | `%APPDATA%\Block\goose\data\sessions` (fallback: `%USERPROFILE%\.local\share\goose\sessions\` and the legacy `Block` paths) | Configurable via `GOOSE_PATH_ROOT` env var |
 | Antigravity | `~/.config/tokscale/antigravity-cache/sessions/` | — | `tokscale antigravity sync` is currently supported on macOS/Linux only |
 | Antigravity CLI | `~/.gemini/antigravity-cli/conversations/` | `%USERPROFILE%\.gemini\antigravity-cli\conversations\` | Configurable via `GEMINI_CLI_HOME` env var |
 | Antigravity IDE Extension | `~/.gemini/antigravity/conversations/` | `%USERPROFILE%\.gemini\antigravity\conversations\` | Same path on all platforms |
@@ -1591,11 +1605,13 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Unsloth Studio | `$UNSLOTH_STUDIO_HOME/studio.db` (fallback: `~/.unsloth/studio/studio.db`) | `%UNSLOTH_STUDIO_HOME%\studio.db` (fallback: `%USERPROFILE%\.unsloth\studio\studio.db`) | Reads exact inference counters from internal assistant metadata and the content-free authenticated API usage table; never selects prompts or responses; excludes training metrics |
 | Hindsight | `$HINDSIGHT_HOME/usage/` (fallback: `~/.hindsight/usage/`) | `%HINDSIGHT_HOME%\usage\` (fallback: `%USERPROFILE%\.hindsight\usage\`) | API sync via `tokscale hindsight sync`; Hindsight writes no local session logs of its own, so data is synced from the LLM trace API into an append-only JSONL cache |
 | Muse Code | `~/.local/share/muse/sessions/` | `%USERPROFILE%\.local\share\muse\sessions\` | Same XDG-style path on all platforms; parses `session.jsonl` `model_completed` usage events plus `subagent/` transcripts |
+| Aside | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` | `%USERPROFILE%\.aside\u\<account>\sessions\<session>\messages.jsonl` | Native browser session usage across accounts; only `messages.jsonl`, excluding artifacts, memory and passwords. |
+| Mistral Vibe | `$VIBE_HOME/logs/session/` (fallback: `~/.vibe/logs/session/`) | `%VIBE_HOME%\logs\session\` (fallback: `%USERPROFILE%\.vibe\logs\session\`) | Same `~/.vibe` root on all platforms; reads each session directory's `meta.json` cumulative `stats`, never the `messages.jsonl` transcript |
 | MiniMax Code | `~/.config/tokscale/headless/mcode/` | `%APPDATA%\tokscale\headless\mcode\` | Headless capture only; Tokscale reads its own capture directory rather than MiniMax Code's shared Desktop/Runtime store, which does not identify the originating surface. Override the root with `TOKSCALE_HEADLESS_DIR` |
 
 > **Devin Desktop agent support**: Local usage parsing works for ACP-connected agents (e.g. Cascade/Windsurf, claude-code, opencode) that emit `usage_update` events in the NDJSON stream. The default **devin-cloud** agent does not emit local `usage_update` events — its usage stays server-side and cannot be tracked by tokscale without an account-level API.
 
-> **Note**: On Windows, `~` expands to `%USERPROFILE%` (e.g., `C:\Users\YourName`). These tools intentionally use Unix-style paths (like `.local/share`) even on Windows for cross-platform consistency, rather than Windows-native paths like `%APPDATA%`.
+> **Note**: On Windows, `~` expands to `%USERPROFILE%` (e.g., `C:\Users\YourName`). Some tools use Unix-style paths (like `.local/share`) for cross-platform consistency, while others, including Goose, use Windows-native paths like `%APPDATA%`, as listed above.
 
 #### Windows-Specific Configuration
 
@@ -1796,6 +1812,10 @@ $env:COPILOT_OTEL_FILE_EXPORTER_PATH = Join-Path $otelDir ("copilot-otel-{0}.jso
 
 Using a timestamped filename is recommended so each Copilot session writes to a fresh file instead of accumulating into one huge OTEL log.
 
+Repeated OTEL span snapshots are merged across files only when they carry a complete trace/span identity and compatible attribution and timestamps. Missing model, session, or agent context is filled from a matching richer snapshot; conflicting populated values remain separate. Records with a span ID but no trace ID can still merge within one file; they remain separate across files. The local parser cache is rebuilt when the parser generation changes.
+
+This local deduplication does not immediately lower already-uploaded historical totals. The hosted high-water policy retains the previous maximum until corrected usage exceeds it: incoming totals of `200 → 100 → 150 → 200 → 250` retain hosted totals of `200 → 200 → 200 → 200 → 250`. Later growth is still counted; repairing previously inflated hosted days requires a separate safe historical-correction mechanism. The local cache parser generation is independent of the submission wire generation, which is unchanged by this fix.
+
 Tokscale treats `chat` spans as the source of truth for token accounting and ignores tool spans plus cumulative metrics in phase 1:
 
 ```json
@@ -1911,6 +1931,8 @@ JSONL format with session header and message entries:
 {"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
 {"type":"message","id":"msg_001","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}
 ```
+
+Pi also bills work that is not an assistant reply: `/compact` writes a `compaction` record, branch summarization a `branch_summary` record, and standalone accounting (e.g. cache warming) a `usage` record, while a `toolResult` message can carry usage for the call behind it. Tokscale counts each of those as its own request and preserves its reported cost when present. A current-format standalone `usage` record names its billed provider and model explicitly, while an older model-less one inherits the session's current selection (the last `model_change` or reply). Model-less tool results, compactions, and branch summaries stay in Pi's separate `tools/summaries` bucket instead of being charged to the preceding conversation model. A record without usage bills nothing.
 
 ### Senpi (OmO Native)
 
@@ -2046,6 +2068,8 @@ Crush stores usage in per-project SQLite databases (`crush.db`). Tokscale import
 
 Location: `~/.local/share/goose/sessions/sessions.db` (also scans `~/Library/Application Support/goose/`, `~/Library/Application Support/Block/goose/`, `~/.local/share/Block/goose/`; override via `GOOSE_PATH_ROOT`)
 
+Native Windows scans check `%APPDATA%\Block\goose\data\sessions\sessions.db` before XDG and legacy locations. With `APPDATA` unset or empty, the native roaming directory is checked before Desktop's `<HOME>/AppData/Roaming` fallback. `--home` scans ignore `GOOSE_PATH_ROOT` and process-specific Windows locations, and also check `<home>/AppData/Roaming/Block/goose/data/sessions/sessions.db`. Without `--home`, an absolute `GOOSE_PATH_ROOT` is authoritative even when its database is absent; relative values are ignored. Moving the executable does not relocate the database.
+
 Goose stores per-session usage in a SQLite `sessions.db`. Tokscale extracts the model from `model_config_json`, the provider from `provider_name`, and accumulated input/output token totals per session. Reasoning tokens are inferred when the column is populated.
 
 ### Codebuff
@@ -2106,6 +2130,10 @@ The `data` column is a JSON blob with the following token-relevant fields:
 
 Tokscale deduplicates messages across forked sessions using a fingerprint of timestamps, model, provider, token counts, cost, and agent name.
 
+### Aside
+
+Aside stores flat assistant usage at `~/.aside/u/<account>/sessions/<session>/messages.jsonl`. Tokscale preserves native timestamps, model metadata and separate cached-input buckets, including the 1-hour-TTL subset of cache writes. Reasoning is split out of output, so totals and estimated cost count it once. Aside's `provider` field records the route rather than the vendor, so a Claude Code route is reported as Anthropic and a generic gateway route defers to model-family inference; explicit vendor ids stay authoritative. Repeated provider-scoped response IDs are counted once across sessions/accounts; calls without an ID remain separate. Positive recorded costs are retained; zero or absent costs use standard pricing. Use `tokscale --no-spinner --client aside` to filter usage. Windows execution has not been verified.
+
 ### Muse Code
 
 Location: `~/.local/share/muse/sessions/YYYY/MM/DD/<session-uuid>/session.jsonl` (same XDG-style path on all platforms, including Windows; subagent transcripts under `subagent/<uuid>/` are scanned too)
@@ -2113,6 +2141,14 @@ Location: `~/.local/share/muse/sessions/YYYY/MM/DD/<session-uuid>/session.jsonl`
 Muse Code writes one event-sourced JSONL transcript per session. Tokscale reads `model_completed` events, which carry the model id (`muse-spark-*`), a Responses-shaped `usage` object (`input_tokens`, `output_tokens`, `cached_tokens`/`cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`) and the call's `duration_ms`; `recorded_at` is in microseconds. `cached_tokens` is a subset of `input_tokens` and reasoning rides inside `output_tokens`, so both are split out before pricing and aggregation. The parent session's `workflow_child_lifecycle` usage aggregates are skipped because the child transcripts they summarize are scanned separately. Workspace labels come from the file's `runtime.session.metadata` record.
 
 Muse Spark models are priced from upstream datasets — LiteLLM and models.dev carry `meta/muse-spark-*` rows at Meta's published rates — so Muse usage is costed out of the box (Standard: $1.25/$4.25 per 1M input/output tokens, $0.15 cached input; Contributor: $0.10/$0.20, $0.002 cached input — see [pricing and rate limits](https://dev.meta.ai/docs/pricing-rate-limits)).
+
+### Mistral Vibe
+
+Location: `~/.vibe/logs/session/<prefix>_<YYYYMMDD_HHMMSS>_<short-id>/meta.json` (same `~/.vibe` root on macOS, Linux and Windows — Vibe uses no XDG or `%APPDATA%` location; override the root with `VIBE_HOME`, or the session directory itself with `session_logging.save_dir`)
+
+Vibe writes a directory per session holding `meta.json` and a `messages.jsonl` transcript. Usage is session-granular: the transcript carries no per-message model, timestamp, or token counts, so Tokscale reads only the cumulative `stats` block in `meta.json` (`session_prompt_tokens`, `session_completion_tokens`, `session_cached_tokens`) and never the conversation content. `session_cached_tokens` is a *subset* of `session_prompt_tokens` rather than an addition to it, so cached reads are split out of the input count before pricing — the same arithmetic Vibe's own cost display uses. One message per session is therefore the finest row the format supports; `steps` becomes the session's message count, and `end_time` (ISO-8601, falling back to `start_time`) its timestamp. Pre-2.0 sessions stored one flat `<prefix>_*.json` per session with the same fields under a `metadata` key; those are still read.
+
+The model comes from `config.active_model` in `meta.json`, which holds the alias the session was pinned to. A session that was never pinned records the empty string — Vibe's documented "follow the configured default" sentinel — so Tokscale resolves it from the session's own `config.models` table, then from Mistral's published default alias, rather than attributing the usage to a blank model. Note that the alias (`mistral-medium-3.5`) is not the wire id: Vibe sends a CLI-routed endpoint name (`mistral-vibe-cli-latest`) that no public pricing dataset carries, so the alias is what pricing resolves against. Workspace labels come from `environment.working_directory`, falling back to `origin_directory`.
 
 ## Pricing
 

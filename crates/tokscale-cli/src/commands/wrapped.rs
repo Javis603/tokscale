@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::runtime::Runtime;
 use tokscale_core::{
-    generate_graph, parse_local_clients, ClientId, GroupBy, LocalParseOptions, ReportOptions,
+    generate_graph_v2, parse_local_clients, ClientId, GroupBy, LocalParseOptions, ReportOptions,
 };
 
 const SCALE: i32 = 2;
@@ -178,7 +178,7 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
     let until = format!("{}-12-31", year);
 
     let has_cursor_cache = cursor::has_cursor_usage_cache();
-    let cursor_logged_in = cursor::is_cursor_logged_in();
+    let cursor_logged_in = include_cursor && cursor::ensure_cursor_session_for_sync();
     let mut cursor_sync_result: Option<cursor::SyncCursorResult> = None;
 
     if include_cursor && cursor_logged_in {
@@ -246,7 +246,7 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
         None
     };
 
-    let graph = generate_graph(ReportOptions {
+    let graph = generate_graph_v2(ReportOptions {
         home_dir: None,
         use_env_roots: true,
         clients: Some(graph_clients),
@@ -3049,7 +3049,7 @@ fn cursor_setup_warning_for_wrapped(
     };
 
     Some(format!(
-        "Cursor usage requires Tokscale's Cursor API cache at `~/.config/tokscale/cursor-cache/usage*.csv`; {action}. Tokscale does not parse local `~/.cursor` session data."
+        "Cursor usage requires Tokscale's Cursor API cache at `~/.config/tokscale/cursor-cache/usage*.json`; {action}. Tokscale does not parse local `~/.cursor` session data."
     ))
 }
 
@@ -3062,6 +3062,10 @@ mod cursor_setup_warning_tests {
         let warning = cursor_setup_warning_for_wrapped(true, false, false).unwrap();
         assert!(warning.contains("tokscale cursor login"));
         assert!(warning.contains("tokscale cursor sync --json"));
+        assert!(
+            warning.contains("cursor-cache/usage*.json"),
+            "the warning must name the maintained JSON cache: {warning}"
+        );
     }
 
     #[test]

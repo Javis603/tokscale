@@ -5,6 +5,7 @@
 pub mod amp;
 pub mod antigravity;
 pub mod antigravity_cli;
+pub mod aside;
 pub mod augment;
 pub mod cherrystudio;
 pub mod claudecode;
@@ -48,6 +49,7 @@ pub mod openclaw;
 pub mod opencode;
 pub mod opencode_schema;
 pub mod opencodereview;
+pub(crate) mod opencodex;
 pub mod pi;
 pub mod prime_agent;
 pub mod qwen;
@@ -59,6 +61,7 @@ pub(crate) mod tencent_buddy;
 pub mod trae;
 pub mod unsloth;
 pub(crate) mod utils;
+pub mod vibe;
 pub mod warp;
 pub mod workbuddy;
 pub mod zcode;
@@ -76,6 +79,52 @@ pub enum CostSource {
     Unknown,
     ProviderReported,
     Estimated,
+}
+
+/// Log-declared billing channel. Never infer it from a model or attribution alias.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BillingIdentity {
+    #[default]
+    Unknown,
+    Known {
+        id: String,
+        origin: BillingIdentityOrigin,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BillingIdentityOrigin {
+    ExplicitRecord,
+    ExplicitSession,
+    KnownHostedChannel,
+}
+
+pub fn normalize_billing_provider(raw: &str) -> Option<String> {
+    let id = raw.trim().to_ascii_lowercase();
+    (!id.is_empty() && id != "unknown").then_some(id)
+}
+
+impl BillingIdentity {
+    pub fn from_explicit(raw: Option<&str>, origin: BillingIdentityOrigin) -> Self {
+        raw.and_then(normalize_billing_provider)
+            .map_or(Self::Unknown, |id| Self::Known { id, origin })
+    }
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Known { id, .. } => Some(id),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EstimateStatus {
+    StaleEstimate,
+    Authoritative,
+    CurrentEstimate,
+    PartialEstimate,
+    #[default]
+    Unpriced,
 }
 
 /// An explicit performance sample may be unavailable even when the message
@@ -133,6 +182,17 @@ pub struct UnifiedMessage {
     /// Such rows must remain unpriced rather than accepting fallback attribution.
     #[serde(default)]
     pub model_attribution_conflicted: bool,
+    #[serde(default)]
+    pub billing_identity: BillingIdentity,
+    /// Original model before display/grouping normalization, when different.
+    #[serde(default)]
+    pub pricing_model_id: Option<String>,
+    #[serde(default)]
+    pub estimate_status: EstimateStatus,
+    /// Copilot-only attribution provenance. Stored in its namespace-specific
+    /// cache envelope so adding this does not change other clients' wire layout.
+    #[serde(skip)]
+    pub copilot_context: Option<copilot::CopilotContextProvenance>,
 }
 
 const fn default_message_count() -> i32 {
@@ -422,6 +482,40 @@ impl UnifiedMessage {
             parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
+            copilot_context: None,
+            billing_identity: BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: EstimateStatus::Unpriced,
+        }
+    }
+
+    pub fn with_billing(mut self, raw: Option<&str>, origin: BillingIdentityOrigin) -> Self {
+        self.billing_identity = BillingIdentity::from_explicit(raw, origin);
+        self
+    }
+
+    pub fn with_pricing_model(mut self, raw: &str) -> Self {
+        self.preserve_pricing_model(raw);
+        self
+    }
+
+    pub fn preserve_pricing_model(&mut self, raw: &str) {
+        if raw != self.model_id && self.pricing_model_id.is_none() {
+            self.pricing_model_id = Some(raw.into());
+        }
+    }
+
+    pub fn pricing_context(&self) -> crate::pricing::PricingContext<'_> {
+        crate::pricing::PricingContext {
+            raw_model: self.pricing_model_id.as_deref().unwrap_or(&self.model_id),
+            model: &self.model_id,
+            billing_provider: self.billing_identity.id(),
+            upstream_hint: Some(&self.provider_id),
+            service_tier: self.service_tier.as_deref(),
+            // A Grok turn row aggregates every call of the turn, so
+            // per-request full-request tier boundaries cannot be inferred
+            // from its token sums (#1410).
+            multi_call_aggregate: self.client == "grok" && self.message_count > 1,
         }
     }
 
@@ -483,9 +577,10 @@ impl UnifiedMessage {
 
     pub fn mark_provider_reported_cost(&mut self) {
         self.cost_source = CostSource::ProviderReported;
+        self.estimate_status = EstimateStatus::Authoritative;
     }
 
-    pub(crate) fn mark_estimated_cost(&mut self) {
+    pub fn mark_estimated_cost(&mut self) {
         self.cost_source = CostSource::Estimated;
     }
 

@@ -2,20 +2,14 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::spinner::{get_phase_message, get_scanner_spans};
-use super::widgets::{format_cost, format_tokens, AMBIENT_STABLE_BORDER_SET};
+use super::widgets::{format_cost, format_tokens};
 use crate::tui::app::{App, ClickAction, SortField, Tab};
-use crate::tui::i18n::{format_count, tr, MessageKey, TuiLanguage};
-use crate::ui_glyphs::{
-    AMBIENT_STABLE_HORIZONTAL_NAVIGATION as HORIZONTAL_NAV,
-    AMBIENT_STABLE_SCROLL_DOWN as SCROLL_DOWN, AMBIENT_STABLE_SEPARATOR as SEPARATOR,
-    AMBIENT_STABLE_SPACED_SEPARATOR as SPACED_SEPARATOR,
-    AMBIENT_STABLE_VERTICAL_NAVIGATION as VERTICAL_NAV,
-};
+use crate::tui::i18n::{format_count, tr, tr_with_glyphs, MessageKey, TuiLanguage};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_set(AMBIENT_STABLE_BORDER_SET)
+        .border_set(app.glyphs.border)
         .border_style(Style::default().fg(app.theme.border))
         .style(Style::default().bg(app.theme.background));
 
@@ -117,26 +111,44 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
             if !is_very_narrow {
                 let scroll_text = match lang {
                     TuiLanguage::Ko => {
-                        format!("{} {}-{} (총 {}개) ", SCROLL_DOWN, start, end, total_models)
+                        format!(
+                            "{} {}-{} (총 {}개) ",
+                            app.glyphs.range_down, start, end, total_models
+                        )
                     }
                     TuiLanguage::Ja => {
-                        format!("{} {}-{} (全{}件) ", SCROLL_DOWN, start, end, total_models)
+                        format!(
+                            "{} {}-{} (全{}件) ",
+                            app.glyphs.range_down, start, end, total_models
+                        )
                     }
                     TuiLanguage::ZhCn => {
-                        format!("{} {}-{} (共{}项) ", SCROLL_DOWN, start, end, total_models)
+                        format!(
+                            "{} {}-{} (共{}项) ",
+                            app.glyphs.range_down, start, end, total_models
+                        )
                     }
                     TuiLanguage::Fr => {
-                        format!("{} {}-{} sur {} ", SCROLL_DOWN, start, end, total_models)
+                        format!(
+                            "{} {}-{} sur {} ",
+                            app.glyphs.range_down, start, end, total_models
+                        )
                     }
                     TuiLanguage::En => {
-                        format!("{} {}-{} of {} ", SCROLL_DOWN, start, end, total_models)
+                        format!(
+                            "{} {}-{} of {} ",
+                            app.glyphs.range_down, start, end, total_models
+                        )
                     }
                 };
                 right_spans.push(Span::styled(
                     scroll_text,
                     Style::default().fg(app.theme.muted),
                 ));
-                right_spans.push(Span::styled("| ", Style::default().fg(app.theme.muted)));
+                right_spans.push(Span::styled(
+                    format!("{} ", app.glyphs.axis_vertical),
+                    Style::default().fg(app.theme.muted),
+                ));
             }
         }
     }
@@ -156,7 +168,10 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let undated_position = right_spans.len();
 
-    right_spans.push(Span::styled(" | ", Style::default().fg(app.theme.muted)));
+    right_spans.push(Span::styled(
+        app.glyphs.tab_divider,
+        Style::default().fg(app.theme.muted),
+    ));
 
     // Total cost
     right_spans.push(Span::styled(
@@ -240,27 +255,57 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             ["s", "k", "g", "p", "r"]
         };
         let mut spans = vec![
-            Span::styled(VERTICAL_NAV, Style::default().fg(app.theme.muted)),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
-            Span::styled(HORIZONTAL_NAV, Style::default().fg(app.theme.muted)),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                app.glyphs.vertical_navigation,
+                Style::default().fg(app.theme.muted),
+            ),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
+            Span::styled(
+                app.glyphs.horizontal_navigation,
+                Style::default().fg(app.theme.muted),
+            ),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
             Span::styled("d/t/c", Style::default().fg(Color::Blue)),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
             Span::styled(shortcuts[0], count_style),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
             Span::styled(shortcuts[1], count_style),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
             Span::styled(shortcuts[2], count_style),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
             Span::styled(shortcuts[3], Style::default().fg(Color::Magenta)),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
             Span::styled(shortcuts[4], hint_style),
-            Span::styled(SEPARATOR, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                app.glyphs.compact_separator,
+                Style::default().fg(app.theme.muted),
+            ),
             Span::styled("q", Style::default().fg(app.theme.muted)),
         ];
         if app.current_tab == Tab::Daily {
             spans.push(Span::styled(
-                SEPARATOR,
+                app.glyphs.compact_separator,
                 Style::default().fg(app.theme.muted),
             ));
             if app.is_daily_detail_active() {
@@ -268,7 +313,7 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 spans.push(Span::styled("↵", hint_style));
                 spans.push(Span::styled(
-                    SEPARATOR,
+                    app.glyphs.compact_separator,
                     Style::default().fg(app.theme.muted),
                 ));
                 spans.push(Span::styled("j", hint_style));
@@ -276,7 +321,7 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
         }
         if app.current_tab == Tab::Monthly {
             spans.push(Span::styled(
-                SEPARATOR,
+                app.glyphs.compact_separator,
                 Style::default().fg(app.theme.muted),
             ));
             if app.is_monthly_detail_active() {
@@ -287,7 +332,7 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
         }
         if app.current_tab == Tab::Models {
             spans.push(Span::styled(
-                SEPARATOR,
+                app.glyphs.compact_separator,
                 Style::default().fg(app.theme.muted),
             ));
             if app.is_model_trend_active() {
@@ -298,19 +343,19 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
         }
         if app.current_tab == Tab::Hourly {
             spans.push(Span::styled(
-                SEPARATOR,
+                app.glyphs.compact_separator,
                 Style::default().fg(app.theme.muted),
             ));
             spans.push(Span::styled("v", hint_style));
         }
         if app.current_tab == Tab::Sessions {
             spans.push(Span::styled(
-                SEPARATOR,
+                app.glyphs.compact_separator,
                 Style::default().fg(app.theme.muted),
             ));
             spans.push(Span::styled("↵/i", hint_style));
             spans.push(Span::styled(
-                SEPARATOR,
+                app.glyphs.compact_separator,
                 Style::default().fg(app.theme.muted),
             ));
             spans.push(Span::styled("b", hint_style));
@@ -328,13 +373,27 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
 
     let labeled_spans = |dense: bool| {
         let lang = app.settings.tui_language;
-        let separator = if dense { SEPARATOR } else { SPACED_SEPARATOR };
-        let inline_gap = if dense { SEPARATOR } else { " " };
+        let separator = if dense {
+            app.glyphs.compact_separator
+        } else {
+            app.glyphs.spaced_separator
+        };
+        let inline_gap = if dense {
+            app.glyphs.compact_separator
+        } else {
+            " "
+        };
         let mut spans = if dense {
             vec![
-                Span::styled(VERTICAL_NAV, Style::default().fg(app.theme.muted)),
+                Span::styled(
+                    app.glyphs.vertical_navigation,
+                    Style::default().fg(app.theme.muted),
+                ),
                 Span::styled(separator, Style::default().fg(app.theme.muted)),
-                Span::styled(HORIZONTAL_NAV, Style::default().fg(app.theme.muted)),
+                Span::styled(
+                    app.glyphs.horizontal_navigation,
+                    Style::default().fg(app.theme.muted),
+                ),
                 Span::styled(separator, Style::default().fg(app.theme.muted)),
                 Span::styled(
                     tr(lang, MessageKey::HelpSort),
@@ -345,7 +404,11 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             vec![
                 Span::styled(
-                    format!("{} {} ", tr(lang, MessageKey::HelpScroll), SEPARATOR),
+                    format!(
+                        "{} {} ",
+                        tr_with_glyphs(lang, MessageKey::HelpScroll, app.glyphs),
+                        app.glyphs.compact_separator,
+                    ),
                     Style::default().fg(app.theme.muted),
                 ),
                 Span::styled(
@@ -544,19 +607,19 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
                 "{}{} {} {}",
                 tr(lang, MessageKey::StatusAllDevices),
                 format_tokens(remote.total_tokens),
-                SEPARATOR,
+                app.glyphs.compact_separator,
                 format_cost(remote.total_cost)
             ),
             Style::default().fg(app.theme.muted),
         ));
     }
     spans.push(Span::styled(
-        SPACED_SEPARATOR,
+        app.glyphs.spaced_separator,
         Style::default().fg(app.theme.muted),
     ));
 
     if app.data.loading {
-        let scanner_spans = get_scanner_spans(app.spinner_frame, &app.theme);
+        let scanner_spans = get_scanner_spans(app.spinner_frame, &app.theme, app.glyphs);
         spans.extend(scanner_spans);
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -570,7 +633,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(app.theme.muted),
             ));
         } else {
-            let scanner_spans = get_scanner_spans(app.spinner_frame, &app.theme);
+            let scanner_spans = get_scanner_spans(app.spinner_frame, &app.theme, app.glyphs);
             spans.extend(scanner_spans);
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
@@ -626,7 +689,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(
                 format!(
                     " {} Auto: {}s",
-                    SEPARATOR,
+                    app.glyphs.compact_separator,
                     app.auto_refresh_interval.as_secs()
                 ),
                 Style::default().fg(app.theme.muted),
@@ -883,7 +946,7 @@ mod tests {
             );
             let natural_width =
                 unicode_width::UnicodeWidthStr::width(data_source_label(&app).as_str())
-                    + unicode_width::UnicodeWidthStr::width(" • ")
+                    + unicode_width::UnicodeWidthStr::width(app.glyphs.spaced_separator)
                     + unicode_width::UnicodeWidthStr::width(persistence_text);
             assert!(
                 natural_width <= usize::from(WIDTH),
@@ -1030,6 +1093,7 @@ mod tests {
         for lang in TuiLanguage::ALL {
             for width in [59, 194] {
                 let mut app = make_app_on(Tab::Daily);
+                app.glyphs = crate::ui_glyphs::Glyphs::ascii_safe();
                 app.settings.tui_language = lang;
                 app.terminal_width = width;
                 app.auto_refresh = true;

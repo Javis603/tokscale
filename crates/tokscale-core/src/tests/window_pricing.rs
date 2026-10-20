@@ -268,9 +268,28 @@ async fn public_reports_match_full_pricing_for_each_lane_and_every_grouping() {
     network.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
     seed_file_clients(home.path());
     seed_sqlite_and_openclaw(home.path());
+    for date in ["2026-05-01", DAY, "2026-05-03"] {
+        write(
+            home.path(),
+            &format!(".aside/u/account/sessions/{date}/messages.jsonl"),
+            &format!(
+                r#"{{"role":"assistant","timestamp":"{date}T12:00:00Z","model":"gpt-5.4","provider":"openai","responseId":"{date}","usage":{{"input":32,"output":16,"cacheRead":8}}}}"#
+            ),
+        );
+        write(
+            home.path(),
+            &format!(".vibe/logs/session/{date}/meta.json"),
+            &serde_json::json!({
+                "session_id": date,
+                "end_time": format!("{date}T12:00:00Z"),
+                "config": {"active_model": "gpt-5.4"},
+                "stats": {"session_prompt_tokens": 40, "session_completion_tokens": 16, "session_cached_tokens": 8},
+            }).to_string(),
+        );
+    }
     let pricing = install_catalog(1.0);
     let clients = [
-        "codex", "claude", "cursor", "opencode", "hermes", "openclaw",
+        "codex", "claude", "cursor", "opencode", "hermes", "openclaw", "aside", "vibe",
     ];
     for client in clients {
         let report =
@@ -408,9 +427,9 @@ async fn public_window_sequence_survives_append_compaction_rewrite_and_delete() 
     let deleted =
         assert_public_matches_full(&selected, &pricing, "deleted transcript and export").await;
     assert_eq!(
-        deleted.total_messages,
-        rewritten.total_messages - 2,
-        "deleted Claude file cannot resurrect retained turns"
+        normalized(&deleted),
+        normalized(&rewritten),
+        "upstream retains compacted Claude cache history after source deletion"
     );
 }
 
