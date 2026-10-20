@@ -39,7 +39,9 @@ const JSONL_MAX_FILES: usize = 5000;
 const JSONL_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const JSONL_MAX_ROWS: usize = 100_000;
 const JSONL_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
+// Retain the existing CLI namespace for Desktop copies of the same request.
+const REQUEST_ID_PREFIX: &str = "qodercn:cli:request:";
 // CN resource packs: CNY 40 / 1,000 credits (not global Qoder or Kiro).
 // https://docs.qoder.cn/product-overview/billing-description
 const DEFAULT_USD_PER_CREDIT: f64 = 0.04 / 6.8;
@@ -91,6 +93,8 @@ const ROUTING_TIERS: &[&str] = &["auto", "ultimate", "performance", "efficient",
 struct Row {
     session_id: String,
     message_id: String,
+    /// Session-scoped message/envelope IDs can link a copy missing request_id.
+    aliases: Vec<String>,
     model: String,
     /// Workspace key: the transcript's `cwd` (a real path the report can
     /// resolve to a project), or the legacy store's bare `project_name`.
@@ -185,30 +189,52 @@ fn parse_with(paths: &Paths, cache_path: &Path) -> Vec<UnifiedMessage> {
     collect_db(&paths.db, &mut cache, &mut next);
     collect_jsonl(&paths.projects, &mut cache, &mut next);
 
+    let rows: Vec<&Row> = next
+        .sources
+        .values()
+        .flat_map(|source| &source.rows)
+        .collect();
+    let aliases = canonical_aliases(&rows);
     let mut unique: HashMap<String, Row> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut reported_credits: HashMap<String, (i64, f64)> = HashMap::new();
-    for row in next.sources.values().flat_map(|source| source.rows.iter()) {
-        if !unique.contains_key(&row.message_id) {
-            order.push(row.message_id.clone());
+    let mut measured_tokens: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
+    for row in rows {
+        let id = canonical_message_id(row, &aliases);
+        if !unique.contains_key(&id) {
+            order.push(id.clone());
         }
         // A newer observation can omit optional credits. Keep the newest
         // explicit credit value separately, including an authoritative zero.
         if let Some(credits) = row.credits {
             if reported_credits
-                .get(&row.message_id)
+                .get(&id)
                 .is_none_or(|(at, _)| row.created_at >= *at)
             {
-                reported_credits.insert(row.message_id.clone(), (row.created_at, credits));
+                reported_credits.insert(id.clone(), (row.created_at, credits));
             }
+        }
+        // All-zero counters can be masked by another writer. Only a newer
+        // measured observation can replace measured tokens for this request.
+        if row.input + row.output + row.cache_read > 0
+            && measured_tokens
+                .get(&id)
+                .is_none_or(|(at, ..)| row.created_at >= *at)
+        {
+            measured_tokens.insert(
+                id.clone(),
+                (row.created_at, row.input, row.output, row.cache_read),
+            );
         }
         // Copied/resumed transcripts contain the same request; retain its
         // newest observation rather than adding its tokens and credits twice.
         if unique
-            .get(&row.message_id)
+            .get(&id)
             .is_none_or(|old| row.created_at >= old.created_at)
         {
-            unique.insert(row.message_id.clone(), row.clone());
+            let mut observation = row.clone();
+            observation.message_id = id.clone();
+            unique.insert(id, observation);
         }
     }
     // Token Monitor scans several times a minute; rewrite only on a change.
@@ -220,12 +246,90 @@ fn parse_with(paths: &Paths, cache_path: &Path) -> Vec<UnifiedMessage> {
         .into_iter()
         .filter_map(|id| unique.remove(&id))
         .map(|mut row| {
+            if let Some((_, input, output, cache_read)) = measured_tokens.get(&row.message_id) {
+                row.input = *input;
+                row.output = *output;
+                row.cache_read = *cache_read;
+            }
             if let Some((_, credits)) = reported_credits.get(&row.message_id) {
                 row.credits = Some(*credits);
             }
             to_message(row, usd_per_credit)
         })
         .collect()
+}
+
+/// Message/envelope copies can form a chain. Resolve each connected group
+/// once, and refuse request attribution for the entire group on any conflict.
+fn canonical_aliases<'a>(rows: &[&'a Row]) -> HashMap<&'a str, Option<&'a str>> {
+    let mut links: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut requests: HashMap<&str, Option<&str>> = HashMap::new();
+    for row in rows {
+        for alias in &row.aliases {
+            links.entry(alias).or_default();
+            if row.message_id.starts_with(REQUEST_ID_PREFIX) {
+                let request = row.message_id.as_str();
+                requests
+                    .entry(alias)
+                    .and_modify(|known| {
+                        if *known != Some(request) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(Some(request));
+            }
+        }
+        for pair in row.aliases.windows(2) {
+            links.entry(&pair[0]).or_default().push(&pair[1]);
+            links.entry(&pair[1]).or_default().push(&pair[0]);
+        }
+    }
+    let mut resolved = HashMap::new();
+    for &start in links.keys() {
+        if resolved.contains_key(start) {
+            continue;
+        }
+        let mut pending = vec![start];
+        let mut component = Vec::new();
+        let mut request = None;
+        let mut ambiguous = false;
+        while let Some(alias) = pending.pop() {
+            if resolved.contains_key(alias) {
+                continue;
+            }
+            resolved.insert(alias, None);
+            component.push(alias);
+            if let Some(known) = requests.get(alias) {
+                match known {
+                    Some(id) if request.is_none_or(|previous| previous == *id) => {
+                        request = Some(*id)
+                    }
+                    _ => ambiguous = true,
+                }
+            }
+            pending.extend(links[alias].iter().copied());
+        }
+        let canonical = if ambiguous {
+            None
+        } else {
+            request.or_else(|| component.iter().copied().min())
+        };
+        for alias in component {
+            resolved.insert(alias, canonical);
+        }
+    }
+    resolved
+}
+
+fn canonical_message_id(row: &Row, aliases: &HashMap<&str, Option<&str>>) -> String {
+    if row.message_id.starts_with(REQUEST_ID_PREFIX) {
+        return row.message_id.clone();
+    }
+    row.aliases
+        .iter()
+        .find_map(|alias| aliases.get(alias.as_str()).copied().flatten())
+        .unwrap_or(&row.message_id)
+        .to_string()
 }
 
 fn to_message(row: Row, usd_per_credit: f64) -> UnifiedMessage {
@@ -491,6 +595,7 @@ fn normalize_db_row(row: DbRow, source: &str) -> Option<Row> {
     Some(Row {
         session_id: format!("qodercn:{source}:{session}"),
         message_id: format!("qodercn:{source}:{session}:{message}"),
+        aliases: Vec::new(),
         model: display_model(&model_key),
         workspace: project,
         input: (prompt - cached).max(0),
@@ -662,9 +767,11 @@ fn normalize_jsonl_row(obj: &Value, source: &str) -> Option<Row> {
     let prompt = numeric(usage.get("input_tokens"))?;
     let cached = numeric_or_zero(usage.get("cache_read_input_tokens"))?;
     let output = numeric(usage.get("output_tokens"))?;
-    let credits = (obj.get("entrypoint").and_then(Value::as_str) == Some("cli"))
-        .then(|| usage.get("credits").and_then(Value::as_f64))
-        .flatten()
+    // These are per-request assistant records in Qoder CN's own projects root.
+    // Desktop and older writers can omit entrypoint; it is not a usage unit.
+    let credits = usage
+        .get("credits")
+        .and_then(Value::as_f64)
         .filter(|credits| credits.is_finite() && *credits >= 0.0);
     // Masked token counters do not erase measured credit usage. Never
     // manufacture tokens from credits or context occupancy.
@@ -689,42 +796,36 @@ fn normalize_jsonl_row(obj: &Value, source: &str) -> Option<Row> {
         .filter(|cwd| !jsonl_project_label(cwd).is_empty())
         .map(|cwd| cwd.trim_end_matches(['/', '\\']).to_string())
         .unwrap_or_default();
+    let aliases: Vec<String> = {
+        let scope = js_text(obj.get("sessionId")).unwrap_or_else(|| format!("source:{source}"));
+        [
+            ("message", message.and_then(|m| m.get("id"))),
+            ("entry", obj.get("uuid")),
+        ]
+        .into_iter()
+        .filter_map(|(kind, value)| {
+            value
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| format!("qodercn:cli:{kind}:{}", serde_json::json!([scope, id])))
+        })
+        .collect()
+    };
+    let stable_id = usage
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("{REQUEST_ID_PREFIX}{id}"))
+        .or_else(|| aliases.first().cloned());
+    let message_id = match stable_id {
+        Some(id) => id,
+        None if prompt + output == 0 => return None,
+        None => format!("qodercn:jsonl:{source}:{session}:{message_key}"),
+    };
     Some(Row {
         session_id: format!("qodercn:jsonl:{source}:{session}"),
-        message_id: {
-            // Optional credits must not change the identity of a CLI request.
-            let stable_id = (obj.get("entrypoint").and_then(Value::as_str) == Some("cli"))
-                .then(|| {
-                    [
-                        ("request", usage.get("request_id")),
-                        ("message", message.and_then(|m| m.get("id"))),
-                        ("entry", obj.get("uuid")),
-                    ]
-                    .into_iter()
-                    .find_map(|(kind, value)| {
-                        value
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.trim().is_empty())
-                            .map(|id| {
-                                if kind == "request" {
-                                    format!("qodercn:cli:request:{id}")
-                                } else {
-                                    // Message/entry IDs are only compared within
-                                    // the original session, never across sessions.
-                                    let scope = js_text(obj.get("sessionId"))
-                                        .unwrap_or_else(|| format!("source:{source}"));
-                                    format!("qodercn:cli:{kind}:{}", serde_json::json!([scope, id]))
-                                }
-                            })
-                    })
-                })
-                .flatten();
-            match stable_id {
-                Some(id) => id,
-                None if prompt + output == 0 => return None,
-                None => format!("qodercn:jsonl:{source}:{session}:{message_key}"),
-            }
-        },
+        message_id,
+        aliases,
         model,
         workspace,
         input: (prompt - cached).max(0),
@@ -915,6 +1016,89 @@ mod tests {
     }
 
     #[test]
+    fn masked_copies_preserve_latest_measured_tokens_and_explicit_zero_credits() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        let original = cli_credits("same", 132, 18, json!(0.25));
+        let mut correction = original.clone();
+        correction["timestamp"] = json!("2026-10-01T10:01:00Z");
+        correction["message"]["usage"]["input_tokens"] = json!(144);
+        correction["message"]["usage"]["output_tokens"] = json!(21);
+        let mut masked = cli_credits("same", 0, 0, json!(0));
+        masked["entrypoint"] = json!("desktop");
+        masked["timestamp"] = json!("2026-10-01T10:02:00Z");
+        for rows in [
+            vec![original.clone(), correction.clone(), masked.clone()],
+            vec![masked, correction, original],
+        ] {
+            write_jsonl(&p.projects.join("a.jsonl"), &rows);
+            let messages = parse_with(&p, &cache);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                (messages[0].tokens.input, messages[0].tokens.output),
+                (144, 21)
+            );
+            assert_eq!(messages[0].cost, 0.0);
+            assert_eq!(messages[0].cost_source, CostSource::ProviderReported);
+            assert_eq!(parse_with(&p, &cache), messages);
+        }
+    }
+
+    #[test]
+    fn transitive_copy_aliases_count_once_with_or_without_request_id() {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = paths(dir.path());
+            let cache = dir.path().join("cache.json");
+            let mut original = cli_credits("same", 132, 18, json!(0.25));
+            original["uuid"] = json!("entry-1");
+            if !explicit {
+                original["message"]["usage"]["request_id"] = Value::Null;
+            }
+            let mut bridge = original.clone();
+            bridge["message"]["usage"]["request_id"] = Value::Null;
+            bridge["uuid"] = json!("entry-2");
+            let mut last = bridge.clone();
+            last["message"]["id"] = Value::Null;
+            write_jsonl(&p.projects.join("a.jsonl"), &[original, bridge, last]);
+            let messages = parse_with(&p, &cache);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tokens.input, 132);
+            assert!((messages[0].cost - 0.25 * credit_usd_rate()).abs() < 1e-12);
+            assert_eq!(parse_with(&p, &cache), messages);
+        }
+    }
+
+    #[test]
+    fn transitive_alias_conflicts_never_join_explicit_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        let mut first = cli_credits("first", 10, 0, json!(0.25));
+        first["uuid"] = json!("entry-1");
+        let mut second = cli_credits("second", 20, 0, json!(0.5));
+        second["uuid"] = json!("entry-2");
+        let mut bridge = first.clone();
+        bridge["message"]["usage"]["request_id"] = Value::Null;
+        bridge["uuid"] = json!("entry-2");
+        for rows in [
+            vec![first.clone(), second.clone(), bridge.clone()],
+            vec![bridge, second, first],
+        ] {
+            write_jsonl(&p.projects.join("a.jsonl"), &rows);
+            let messages = parse_with(&p, &cache);
+            assert_eq!(
+                messages.len(),
+                3,
+                "a conflicting alias group cannot establish equivalence"
+            );
+            assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
+            assert_eq!(parse_with(&p, &cache), messages);
+        }
+    }
+
+    #[test]
     fn cli_credits_use_cn_resource_value_without_fabricating_tokens() {
         let row = normalize_jsonl_row(&cli_credits("masked", 0, 0, json!(0.25)), "source").unwrap();
         let message = to_message(row, 0.04 / 6.8);
@@ -957,13 +1141,15 @@ mod tests {
     }
 
     #[test]
-    fn credits_require_cli_numeric_nonnegative_usage_and_a_stable_identity() {
+    fn credits_require_numeric_nonnegative_request_usage_and_a_stable_identity() {
         for invalid in [Value::Null, json!(-1), json!("0.25"), json!(true)] {
             assert!(normalize_jsonl_row(&cli_credits("m", 0, 0, invalid), "source").is_none());
         }
         let mut row = cli_credits("m", 0, 0, json!(0.25));
-        row["entrypoint"] = json!("desktop");
+        row["type"] = json!("result");
         assert!(normalize_jsonl_row(&row, "source").is_none());
+        row["type"] = json!("assistant");
+        row["message"]["usage"]["credits"] = Value::Null;
         row["message"]["usage"]["input_tokens"] = json!(10);
         let message = to_message(normalize_jsonl_row(&row, "source").unwrap(), 0.01);
         assert_eq!(message.cost, 0.0);
@@ -1053,7 +1239,7 @@ mod tests {
         assert_eq!(messages[0].cost, 0.0);
         assert_eq!(messages[0].cost_source, CostSource::ProviderReported);
         let mut old_cache = load_cache(&cache_path);
-        old_cache.version = 2;
+        old_cache.version = CACHE_VERSION - 1;
         for source in old_cache.sources.values_mut() {
             source.rows.clear();
         }
@@ -1103,6 +1289,132 @@ mod tests {
         assert_eq!(raw.credits, Some(0.25));
         assert_eq!(to_message(raw.clone(), 0.01).cost, 0.0025);
         assert_eq!(to_message(raw, 0.02).cost, 0.005);
+    }
+
+    #[test]
+    fn copied_requests_with_missing_request_ids_keep_one_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        let original = cli_credits("same", 132, 18, json!(0.25));
+        let mut copy = original.clone();
+        copy["message"]["usage"]["request_id"] = Value::Null;
+        copy["message"]["usage"]["input_tokens"] = json!(144);
+        copy["message"]["usage"]["output_tokens"] = json!(21);
+        copy["message"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("credits");
+        copy["timestamp"] = json!("2026-10-01T10:01:00Z");
+        for (first, second) in [(&original, &copy), (&copy, &original)] {
+            write_jsonl(&p.projects.join("a.jsonl"), &[first.clone()]);
+            write_jsonl(&p.projects.join("subagents/copy.jsonl"), &[second.clone()]);
+            let messages = parse_with(&p, &cache);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                (messages[0].tokens.input, messages[0].tokens.output),
+                (144, 21)
+            );
+            assert_eq!(messages[0].cost_source, CostSource::ProviderReported);
+            assert!((messages[0].cost - 0.25 * credit_usd_rate()).abs() < 1e-12);
+            assert_eq!(parse_with(&p, &cache), messages);
+        }
+    }
+
+    #[test]
+    fn copied_requests_with_only_the_envelope_id_keep_one_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        let mut original = cli_credits("same", 0, 0, json!(0.25));
+        original["uuid"] = json!("entry-1");
+        let mut copy = original.clone();
+        copy["message"]["usage"]["request_id"] = Value::Null;
+        copy["message"]["id"] = Value::Null;
+        write_jsonl(&p.projects.join("a.jsonl"), &[original]);
+        write_jsonl(&p.projects.join("b.jsonl"), &[copy]);
+        let messages = parse_with(&p, &cache);
+        assert_eq!(messages.len(), 1);
+        assert!((messages[0].cost - 0.25 * credit_usd_rate()).abs() < 1e-12);
+        assert_eq!(parse_with(&p, &cache), messages);
+    }
+
+    #[test]
+    fn conflicting_request_aliases_do_not_merge_distinct_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        let first = cli_credits("shared-message", 10, 0, json!(0.25));
+        let mut second = first.clone();
+        second["message"]["usage"]["request_id"] = json!("different-request");
+        let mut unknown = first.clone();
+        unknown["message"]["usage"]["request_id"] = Value::Null;
+        write_jsonl(&p.projects.join("a.jsonl"), &[first, second, unknown]);
+        let messages = parse_with(&p, &cache);
+        assert_eq!(
+            messages.len(),
+            3,
+            "an ambiguous alias cannot identify a request"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            30
+        );
+        assert_eq!(parse_with(&p, &cache), messages);
+    }
+
+    #[test]
+    fn request_aliases_do_not_join_different_or_missing_sessions() {
+        for missing_session in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = paths(dir.path());
+            let cache = dir.path().join("cache.json");
+            let mut original = cli_credits("same", 10, 0, json!(0.25));
+            let mut copy = original.clone();
+            copy["message"]["usage"]["request_id"] = Value::Null;
+            if missing_session {
+                original["sessionId"] = Value::Null;
+                copy["sessionId"] = Value::Null;
+            } else {
+                copy["sessionId"] = json!("other-session");
+            }
+            write_jsonl(&p.projects.join("a.jsonl"), &[original]);
+            write_jsonl(&p.projects.join("b.jsonl"), &[copy]);
+            assert_eq!(parse_with(&p, &cache).len(), 2);
+        }
+    }
+
+    #[test]
+    fn desktop_and_unmarked_assistant_credits_use_the_same_request_accounting() {
+        for entrypoint in [json!("desktop"), Value::Null] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = paths(dir.path());
+            let cache = dir.path().join("cache.json");
+            let mut desktop = cli_credits("same", 0, 0, json!(0.25));
+            if entrypoint.is_null() {
+                desktop.as_object_mut().unwrap().remove("entrypoint");
+            } else {
+                desktop["entrypoint"] = entrypoint;
+            }
+            let cli_copy = cli_credits("same", 0, 0, json!(0.25));
+            write_jsonl(&p.projects.join("desktop.jsonl"), &[desktop]);
+            let messages = parse_with(&p, &cache);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                (messages[0].tokens.input, messages[0].tokens.output),
+                (0, 0)
+            );
+            assert!((messages[0].cost - 0.25 * credit_usd_rate()).abs() < 1e-12);
+            assert_eq!(messages[0].cost_source, CostSource::ProviderReported);
+            write_jsonl(&p.projects.join("cli-copy.jsonl"), &[cli_copy]);
+            let copied = parse_with(&p, &cache);
+            assert_eq!(copied.len(), 1);
+            assert!((copied[0].cost - messages[0].cost).abs() < 1e-12);
+            assert_eq!(parse_with(&p, &cache), copied);
+        }
     }
 
     #[test]
