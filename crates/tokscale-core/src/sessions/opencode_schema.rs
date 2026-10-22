@@ -265,9 +265,13 @@ pub(crate) struct OpenCodeSchemaConfig {
 }
 
 impl OpenCodeSchemaConfig {
-    /// Baseline shared by every OpenCode-schema client. Each constructor below
-    /// states only the fields where that client departs from OpenCode itself.
-    const fn base(client: &'static str) -> Self {
+    /// Baseline shared by every OpenCode-schema client. Client-specific
+    /// constructors either live here (when the client is one of the shared
+    /// schema's own) or, for fork-owned clients with their own
+    /// `token_monitor/<id>.rs` module, are built there from this baseline —
+    /// each states only the fields where that client departs from OpenCode
+    /// itself.
+    pub(crate) const fn base(client: &'static str) -> Self {
         Self {
             client,
             query_groups: &[],
@@ -422,7 +426,7 @@ const OPENCODE_V1_QUERIES: &[&str] = &[
 /// Both OpenCode generations are probed against the same database; whichever
 /// tables exist contribute rows, and the fingerprint dedup collapses any
 /// overlap between them.
-const OPENCODE_QUERY_GROUPS: &[&[&str]] = &[OPENCODE_V2_QUERIES, OPENCODE_V1_QUERIES];
+pub(crate) const OPENCODE_QUERY_GROUPS: &[&[&str]] = &[OPENCODE_V2_QUERIES, OPENCODE_V1_QUERIES];
 
 /// Incremental spelling of [`OPENCODE_V2_QUERIES`], one variant per full
 /// variant and in the same order.

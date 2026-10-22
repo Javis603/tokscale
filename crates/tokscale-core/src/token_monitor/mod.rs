@@ -24,6 +24,7 @@
 //! does, filtered or not, so the id means the same data in every scan.
 
 mod catpaw;
+mod codearts;
 mod js;
 mod mcode;
 mod proma;
@@ -42,6 +43,10 @@ struct Client {
 /// Every Token Monitor-owned client, in the order they are parsed. Adding a
 /// client is one entry here plus its module; no upstream file changes.
 const CLIENTS: &[Client] = &[
+    Client {
+        id: codearts::CLIENT_ID,
+        parse: codearts::parse,
+    },
     Client {
         id: catpaw::CLIENT_ID,
         parse: catpaw::parse,
