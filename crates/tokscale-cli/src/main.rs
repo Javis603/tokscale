@@ -2471,6 +2471,8 @@ fn run_models_report(
         #[serde(rename_all = "camelCase")]
         struct ModelReportJson {
             group_by: String,
+            claude_source_exclusions: bool,
+            claude_cached_roots: bool,
             entries: Vec<ModelUsageJson>,
             /// Per-session facts for session-grouped reports, joined by
             /// `(client, sessionId)`. Absent for every other grouping.
@@ -2518,7 +2520,9 @@ fn run_models_report(
             })
             .collect();
         let output = ModelReportJson {
+            claude_source_exclusions: true,
             group_by: group_by.to_string(),
+            claude_cached_roots: true,
             sessions,
             workspaces,
             entries: report
@@ -5955,7 +5959,19 @@ fn run_graph_command(
 
     let processing_time_ms = context.start.elapsed().as_millis() as u32;
     let output_data = to_ts_token_contribution_data(&graph_result, None, None);
-    let json_output = serde_json::to_string_pretty(&output_data)?;
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GraphReportJson<'a, T> {
+        #[serde(flatten)]
+        graph: &'a T,
+        claude_cached_roots: bool,
+        claude_source_exclusions: bool,
+    }
+    let json_output = serde_json::to_string_pretty(&GraphReportJson {
+        graph: &output_data,
+        claude_cached_roots: true,
+        claude_source_exclusions: true,
+    })?;
 
     if let Some(output_path) = output {
         std::fs::write(&output_path, json_output)?;

@@ -3403,6 +3403,8 @@ impl Drop for TestSourceCachePersistObserverGuard {
 #[derive(Default)]
 pub(crate) struct SourceMessageCache {
     state: Mutex<CacheState>,
+    frozen_claude_roots: Vec<PathBuf>,
+    claude_scan_roots: Option<Vec<PathBuf>>,
     /// `false` for [`SourceCachePolicy::InMemory`] callers, who must never
     /// touch the on-disk shards.
     persistent: bool,
@@ -3460,8 +3462,39 @@ impl SourceMessageCache {
     pub(crate) fn load() -> Self {
         Self {
             state: Mutex::new(CacheState::default()),
+            frozen_claude_roots: Vec::new(),
+            claude_scan_roots: None,
             persistent: true,
         }
+    }
+
+    pub(crate) fn freeze_claude_roots(&mut self, roots: &[PathBuf]) {
+        self.frozen_claude_roots = roots.to_vec();
+    }
+
+    pub(crate) fn restrict_claude_source_probes(&mut self, roots: &[PathBuf]) {
+        self.claude_scan_roots = Some(roots.to_vec());
+    }
+
+    fn can_probe_source(&self, namespace: &str, path: &Path) -> bool {
+        namespace != ClientId::Claude.as_str()
+            || self
+                .claude_scan_roots
+                .as_ref()
+                .is_none_or(|roots| roots.iter().any(|root| path.starts_with(root)))
+    }
+
+    fn is_frozen_claude_path(&self, namespace: &str, path: &Path) -> bool {
+        namespace == ClientId::Claude.as_str()
+            // An active scan owns deletion checks even when the caller also
+            // requests a cached fallback for this root.
+            && !self.claude_scan_roots.as_ref().is_some_and(|roots| {
+                roots.iter().any(|root| path.starts_with(root))
+            })
+            && self
+                .frozen_claude_roots
+                .iter()
+                .any(|root| path.starts_with(root))
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, CacheState> {
@@ -3574,7 +3607,11 @@ impl SourceMessageCache {
                 let repaired_billing = entry.remove_legacy_claude_tool_result_billing();
                 // Only retained Claude history can outlive a missing source;
                 // an ordinary deleted session must stop contributing usage.
-                if !key.path.to_path_buf().exists() && !entry.holds_retained_history() {
+                if self.can_probe_source(&key.namespace, &key.path.to_path_buf())
+                    && !self.is_frozen_claude_path(&key.namespace, &key.path.to_path_buf())
+                    && matches!(key.path.to_path_buf().try_exists(), Ok(false))
+                    && !entry.holds_retained_history()
+                {
                     state.deleted_keys.insert(key, DeletionReason::Missing);
                     state.dirty = true;
                     continue;
@@ -3627,15 +3664,53 @@ impl SourceMessageCache {
             .values()
             .filter(|entry| {
                 entry.holds_retained_history()
-                    && !entry.path.to_path_buf().exists()
+                    && !self
+                        .is_frozen_claude_path(&entry.parser_namespace, &entry.path.to_path_buf())
                     && roots
                         .iter()
                         .any(|root| entry.path.to_path_buf().starts_with(root))
+                    && matches!(entry.path.to_path_buf().try_exists(), Ok(false))
             })
             .cloned()
             .collect();
         entries.sort_by_key(|entry| entry.path.to_path_buf());
         entries
+    }
+
+    /// A caller can freeze an external Claude source between full scans. Read
+    /// its last parsed messages without touching that filesystem (in particular,
+    /// probing a stopped WSL distro's UNC path can start the distro).
+    pub(crate) fn cached_claude_sources(
+        &self,
+        roots: &[PathBuf],
+        scanned: &[PathBuf],
+    ) -> Vec<CachedSourceEntry> {
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let scanned: HashSet<_> = scanned.iter().collect();
+        let mut paths: Vec<_> = {
+            let mut state = self.state();
+            self.ensure_namespace_loaded(&mut state, ClientId::Claude.as_str());
+            state
+                .entries
+                .values()
+                .filter_map(|entry| {
+                    let path = entry.path.to_path_buf();
+                    (entry.matches_identity(identity)
+                        && roots.iter().any(|root| path.starts_with(root))
+                        && self.is_frozen_claude_path(identity.namespace, &path)
+                        && !scanned.contains(&path))
+                    .then_some(path)
+                })
+                .collect()
+        };
+        paths.sort();
+        paths
+            .into_iter()
+            .filter_map(|path| self.take(identity, &path))
+            .collect()
     }
 
     /// Reads an entry without disturbing the cache's copy.
@@ -3927,7 +4002,9 @@ impl SourceMessageCache {
                 if let Some(deleted) = deleted_by_shard.get(&shard_key) {
                     for (key, reason) in deleted {
                         let should_remove = match reason {
-                            DeletionReason::Missing => !key.path.to_path_buf().exists(),
+                            DeletionReason::Missing => {
+                                matches!(key.path.to_path_buf().try_exists(), Ok(false))
+                            }
                             DeletionReason::Invalidated(expected) => merged_entries
                                 .get(key)
                                 .is_some_and(|entry| entry.fingerprint == *expected),

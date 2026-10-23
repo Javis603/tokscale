@@ -1,0 +1,11 @@
+# Cached Claude sources
+
+Local aggregators can combine a host transcript with an intermittently available copy without aggregating two independent report totals. Claude's existing message/request identities deduplicate the two observations before reporting.
+
+`TOKSCALE_EXTRA_DIRS` selects additional transcript roots to read. `TOKSCALE_CACHED_CLAUDE_DIRS` is a JSON array of absolute Claude transcript roots whose last parsed observations may also contribute from the source cache. A root selected for scanning in the current invocation owns its observations: ordinary deleted sessions are pruned from the persistent cache, including when the root is empty. Compacted retained history still contributes through the missing-history lane. Only roots not selected for an active scan use frozen cached observations. Listing a root in both inputs does not freeze it. Cached-only roots are matched lexically and are not canonicalized, opened or checked for existence. They must use the same absolute spelling as the original scan roots.
+
+The cache-only contract is scoped to persistent model/graph report collection with environment roots enabled. Explicit `--home` ignores it. Clearing the source cache removes cached-only usage. Desktop IndexedDB billing is outside this transcript contract. Entries without a stable event key retain the ordinary parser behavior; this interface does not invent identities or deduplicate independent machines.
+
+Model JSON and graph JSON advertise `claudeCachedRoots: true`. A caller must verify this capability before suppressing another scan's accounting: older binaries ignore unknown environment variables.
+
+The source cache skips missing-file pruning for the selected frozen roots. Report scans also avoid probing Claude entries outside their selected scan roots, so an isolated home scan cannot prune another home's offline observation, and disabling a root cannot activate it through cache loading. Unselected cached messages do not contribute to reports. This matters for UNC sources: even an existence probe can activate a stopped WSL distro.
