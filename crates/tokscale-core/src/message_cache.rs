@@ -2128,6 +2128,7 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Antigravity => 1,
         ClientId::Zed => 1,
         ClientId::Trae => 1,
+        ClientId::TraeCn => 1,
         ClientId::Warp => 1,
         ClientId::Gjc => 1,
         ClientId::CommandCode => 1,
