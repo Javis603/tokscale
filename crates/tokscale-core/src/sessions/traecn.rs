@@ -51,17 +51,21 @@ fn normalize_epoch_ms(value: &Value) -> Option<i64> {
 }
 
 fn max_positive(values: impl Iterator<Item = Option<i64>>) -> i64 {
-    values.filter_map(|v| v).max().unwrap_or(0)
+    values.flatten().max().unwrap_or(0)
 }
 
 /// Extract timestamp (epoch ms) from a single event's parsed `data`.
 /// Returns 0 when the event carries no clock.
 fn event_timestamp_ms(event_type: &str, data: &Value) -> i64 {
     match event_type {
-        "metadata" => max_positive([
-            data.pointer("/created_at").and_then(normalize_epoch_ms),
-            data.pointer("/chat_start_time").and_then(normalize_epoch_ms),
-        ].into_iter()),
+        "metadata" => max_positive(
+            [
+                data.pointer("/created_at").and_then(normalize_epoch_ms),
+                data.pointer("/chat_start_time")
+                    .and_then(normalize_epoch_ms),
+            ]
+            .into_iter(),
+        ),
         "context_usage" => data
             .pointer("/updated_at")
             .and_then(normalize_epoch_ms)
@@ -71,7 +75,10 @@ fn event_timestamp_ms(event_type: &str, data: &Value) -> i64 {
                 return 0;
             };
             let mut best = 0i64;
-            if let Some(v) = timing.pointer("/generated_at_ms").and_then(normalize_epoch_ms) {
+            if let Some(v) = timing
+                .pointer("/generated_at_ms")
+                .and_then(normalize_epoch_ms)
+            {
                 best = v;
             }
             if let Some(v) = timing
@@ -133,7 +140,7 @@ fn parse_event(line: &str) -> Option<(String, String, Value)> {
     Some((event_type, task_id, data))
 }
 
-pub fn parse_traecn_file(client: &str, path: &Path) -> Vec<UnifiedMessage> {
+pub fn parse_traecn_file(path: &Path) -> Vec<UnifiedMessage> {
     let Some(bytes) = read_file_head(path) else {
         return Vec::new();
     };
@@ -198,7 +205,9 @@ pub fn parse_traecn_file(client: &str, path: &Path) -> Vec<UnifiedMessage> {
                 .to_ascii_lowercase();
             if smart_mode.is_empty() {
                 smart_mode = data
-                    .pointer("/user_message_context/model_info/persist_meta/smart_selection/strategy")
+                    .pointer(
+                        "/user_message_context/model_info/persist_meta/smart_selection/strategy",
+                    )
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim()
@@ -300,12 +309,21 @@ pub fn parse_traecn_file(client: &str, path: &Path) -> Vec<UnifiedMessage> {
         if event_type != "token_usage" {
             continue;
         }
-        let total = data.pointer("/total_tokens").and_then(Value::as_i64).unwrap_or(0);
+        let total = data
+            .pointer("/total_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         if total <= 0 {
             continue;
         }
-        let input = data.pointer("/prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
-        let output = data.pointer("/completion_tokens").and_then(Value::as_i64).unwrap_or(0);
+        let input = data
+            .pointer("/prompt_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let output = data
+            .pointer("/completion_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let cache_read = data
             .pointer("/cache_read_input_tokens")
             .and_then(Value::as_i64)
@@ -346,38 +364,24 @@ pub fn parse_traecn_file(client: &str, path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        let dedup_key = format!(
-            "traecn:{}:usage-{}:{}-{}",
-            task_id, idx, total, timestamp
-        );
+        let dedup_key = format!("traecn:{}:usage-{}:{}-{}", task_id, idx, total, timestamp);
 
-        messages.push(UnifiedMessage {
-            client: client.to_string(),
-            model_id: model_id.clone(),
-            provider_id: provider_id.to_string(),
-            session_id: task_id.clone(),
-            workspace_key: None,
-            workspace_label: None,
+        let mut message = UnifiedMessage::new_with_dedup(
+            "traecn",
+            model_id.clone(),
+            provider_id,
+            task_id.clone(),
             timestamp,
-            date: String::new(),
             tokens,
-            cost: 0.0,
-            cost_source: super::CostSource::Unknown,
-            service_tier: None,
-            duration_ms: None,
-            performance_timing: None,
-            message_count: 1,
-            agent: agent_name.clone(),
-            dedup_key: Some(dedup_key),
-            session_title: session_title.clone(),
-            parent_session_id: None,
-            is_turn_start: true,
-            model_attribution_conflicted: false,
-            billing_identity: super::BillingIdentity::Unknown,
-            pricing_model_id: None,
-            estimate_status: super::EstimateStatus::Unpriced,
-            copilot_context: None,
-        });
+            0.0,
+            Some(dedup_key),
+        );
+        message.agent = agent_name.clone();
+        message.session_title = session_title.clone();
+        // Every `token_usage` row is one user turn start, so the first row of
+        // a session anchors the turn-scoped metrics lane.
+        message.is_turn_start = idx == 0;
+        messages.push(message);
     }
 
     messages.sort_by_key(|m| (m.session_id.clone(), m.timestamp));
@@ -398,10 +402,7 @@ mod tests {
     }
 
     fn ev(t: &str, d: &str) -> String {
-        format!(
-            r#"{{"task_id":"t","seq":1,"type":"{}","data":{}}}"#,
-            t, d
-        )
+        format!(r#"{{"task_id":"t","seq":1,"type":"{}","data":{}}}"#, t, d)
     }
 
     #[test]
@@ -426,7 +427,7 @@ mod tests {
             ],
         );
 
-        let msgs = parse_traecn_file("traecn", &path);
+        let msgs = parse_traecn_file(&path);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].model_id, "auto");
         // tokscale TokenBreakdown::total() is input+output+cache_read
@@ -460,7 +461,7 @@ mod tests {
             ],
         );
 
-        let msgs = parse_traecn_file("traecn", &path);
+        let msgs = parse_traecn_file(&path);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].model_id, "GLM-4.6");
         assert_eq!(msgs[0].tokens.total(), 5000);
@@ -483,7 +484,7 @@ mod tests {
                 ),
             ],
         );
-        let msgs = parse_traecn_file("traecn", &path);
+        let msgs = parse_traecn_file(&path);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].timestamp, 1_765_400_000_000);
     }
@@ -505,7 +506,7 @@ mod tests {
                 ),
             ],
         );
-        let msgs = parse_traecn_file("traecn", &path);
+        let msgs = parse_traecn_file(&path);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].timestamp, 1_765_400_000_510);
         assert_eq!(msgs[0].tokens.cache_read, 100);
@@ -528,7 +529,7 @@ mod tests {
                 ),
             ],
         );
-        let msgs = parse_traecn_file("traecn", &path);
+        let msgs = parse_traecn_file(&path);
         assert!(msgs.is_empty());
     }
 
@@ -547,7 +548,7 @@ mod tests {
             br#"{"task_id":"t","seq":1,"type":"token_usage","data":"{\"total_tokens\":100,"#,
         )
         .unwrap();
-        let msgs = parse_traecn_file("traecn", &path);
+        let msgs = parse_traecn_file(&path);
         assert!(msgs.is_empty());
     }
 }

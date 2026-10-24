@@ -1253,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 58);
+        assert_eq!(ClientId::COUNT, 59);
     }
 
     #[test]
@@ -2393,6 +2393,19 @@ mod tests {
         assert_eq!(client.data().pattern, "vibe-session");
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_traecn_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("traecn").expect("traecn client should be registered");
+        assert_eq!(
+            client.data().relative_path,
+            ".trae-cn/hub_event_cache/TraeCode"
+        );
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().parse_local);
+        assert!(!client.data().submit_default);
         assert!(!client.data().headless);
     }
 
