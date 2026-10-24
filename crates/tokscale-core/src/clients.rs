@@ -1124,6 +1124,20 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // TRAE CN local hub_event_cache JSONL event stream.
+    // Reads `~/.trae-cn/hub_event_cache/TraeCode/<install>/<task>.jsonl`
+    // — the plain-text event log TRAE CN writes after every turn.
+    TraeCn = 58 => {
+        id: "traecn",
+        display: "TRAE CN",
+        logo: None,
+        root: PathRoot::Home,
+        relative: ".trae-cn/hub_event_cache/TraeCode",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: false
     }
 );
 
