@@ -280,6 +280,57 @@ fn antigravity_db_cache_empty_snapshot_is_valid_and_recreation_replaces_it() {
 
 #[test]
 #[serial_test::serial]
+fn antigravity_db_cache_without_steps_metadata_reuses_and_refreshes_snapshots() {
+    for (surface, client) in [
+        ("antigravity-cli", ClientId::AntigravityCli),
+        ("antigravity", ClientId::AntigravityExtension),
+    ] {
+        for previously_cached in [false, true] {
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = cache_env(home.path());
+            let (path, conn) = database(home.path(), surface, "payload-only");
+            let identity = CacheIdentity::for_client(client);
+            if previously_cached {
+                assert_eq!(scan(home.path(), &[client.as_str()])[0].tokens.input, 100);
+                assert!(SourceMessageCache::load().get(identity, &path).is_some());
+            }
+            // Observed IDE schema: step_payload exists, but optional metadata
+            // timestamps are unavailable. Token rows remain fully readable.
+            conn.execute_batch(
+                "DROP TABLE steps;
+                CREATE TABLE steps(idx INTEGER PRIMARY KEY,
+                    step_type INTEGER NOT NULL DEFAULT 0,
+                    status INTEGER NOT NULL DEFAULT 0, step_payload BLOB);
+                INSERT INTO steps VALUES(0, 15, 0, X'00');",
+            )
+            .unwrap();
+            for input in [400_i64, 900] {
+                insert(&conn, 0, "shared-response", input as u64);
+                let fresh =
+                    sessions::antigravity_cli::scan_antigravity_db_file(&path, client.as_str());
+                assert_eq!(fresh.messages[0].tokens.input, input);
+                assert_eq!(scan(home.path(), &[client.as_str()])[0].tokens.input, input);
+                assert!(
+                    fresh.complete,
+                    "absent optional timestamps are not a failed read"
+                );
+                let cached = SourceMessageCache::load().get(identity, &path).unwrap();
+                assert_eq!(cached.messages, fresh.messages);
+                let (warm, entry) = load_or_parse_antigravity_db_source(
+                    &path,
+                    client,
+                    &SourceMessageCache::load(),
+                    |_, _| panic!("unchanged payload-only schema must reuse its cache"),
+                );
+                assert_eq!(warm, fresh.messages);
+                assert!(entry.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
 fn antigravity_db_cache_warm_hit_never_opens_sqlite_and_racing_read_is_retried() {
     let home = tempfile::TempDir::new().unwrap();
     let _env = cache_env(home.path());

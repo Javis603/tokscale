@@ -679,6 +679,17 @@ struct StepTimestamps {
 /// a turn timestamp (it holds cache metadata instead). Looking up by `responseId`
 /// (or generation index) restores the genuine per-turn execution time.
 fn read_step_timestamps(conn: &Connection, path: &Path) -> (StepTimestamps, bool) {
+    // Some IDE schemas have step_payload but no metadata timestamp column.
+    // Confirm its absence rather than treating every query failure as optional.
+    match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('steps') WHERE name = 'metadata' COLLATE NOCASE)",
+        [],
+        |row| row.get::<_, bool>(0),
+    ) {
+        Ok(true) => {}
+        Ok(false) => return (StepTimestamps::default(), true),
+        Err(_) => return (StepTimestamps::default(), false),
+    }
     let mut timestamps = StepTimestamps::default();
     let mut rows_complete = true;
     let scan = sqlite_for_each_row_on(
