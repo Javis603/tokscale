@@ -4629,7 +4629,11 @@ fn parse_all_messages_streaming<S: MessageSink>(
         all_messages.extend(crush_messages);
     }
 
-    all_messages.extend(parse_antigravity_family_messages(&scan_result, pricing));
+    all_messages.extend(parse_antigravity_family_messages(
+        &scan_result,
+        pricing,
+        Some(&mut source_cache),
+    ));
 
     // Trae API dump uses exact dollar_float totals, so pricing lookup is not needed.
     let trae_messages: Vec<UnifiedMessage> = scan_result
@@ -8194,7 +8198,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Crush, crush_count);
     messages.extend(crush_msgs);
 
-    let antigravity_msgs = parse_antigravity_family_messages(&scan_result, None);
+    let antigravity_msgs = parse_antigravity_family_messages(&scan_result, None, None);
     for client in [
         ClientId::Antigravity,
         ClientId::AntigravityCli,
@@ -8555,6 +8559,9 @@ fn should_keep_deduped_message(seen_keys: &mut HashSet<String>, message: &Unifie
 
 type AntigravitySourceParser = fn(&Path) -> Vec<UnifiedMessage>;
 
+#[cfg(test)]
+mod antigravity_cache_tests;
+
 /// Read every Antigravity surface in legacy-first order, then collapse copies
 /// of the same provider response even when each surface assigned it a
 /// different session ID. Antigravity's response ID is shared by the desktop
@@ -8562,6 +8569,7 @@ type AntigravitySourceParser = fn(&Path) -> Vec<UnifiedMessage>;
 fn parse_antigravity_family_messages(
     scan_result: &scanner::ScanResult,
     pricing: Option<&pricing::PricingService>,
+    mut source_cache: Option<&mut message_cache::SourceMessageCache>,
 ) -> Vec<UnifiedMessage> {
     let sources: [(ClientId, AntigravitySourceParser); 3] = [
         (
@@ -8580,11 +8588,28 @@ fn parse_antigravity_family_messages(
 
     let mut messages = Vec::new();
     for (client, parse) in sources {
-        let mut source_messages: Vec<UnifiedMessage> = scan_result
+        let outcomes: Vec<_> = scan_result
             .get(client)
             .par_iter()
-            .flat_map_iter(|path| parse(path))
+            .map(|path| match source_cache.as_deref() {
+                Some(cache) if client != ClientId::Antigravity => {
+                    load_or_parse_antigravity_db_source(
+                        path,
+                        client,
+                        cache,
+                        sessions::antigravity_cli::scan_antigravity_db_file,
+                    )
+                }
+                _ => (parse(path), None),
+            })
             .collect();
+        let mut source_messages = Vec::new();
+        for (parsed, entry) in outcomes {
+            source_messages.extend(parsed);
+            if let (Some(cache), Some(entry)) = (source_cache.as_deref_mut(), entry) {
+                cache.insert(entry);
+            }
+        }
         if let Some(pricing) = pricing {
             for message in &mut source_messages {
                 apply_pricing_if_available(message, Some(pricing));
@@ -8594,6 +8619,99 @@ fn parse_antigravity_family_messages(
     }
 
     dedupe_antigravity_family_messages(messages)
+}
+
+/// Cache each database before family deduplication and pricing. WAL bytes can
+/// precede publication in SQLite's wal-index, so a nonempty WAL is never proof
+/// of the snapshot a reader observed, even when its fingerprint stays stable.
+fn load_or_parse_antigravity_db_source(
+    path: &Path,
+    client: ClientId,
+    source_cache: &message_cache::SourceMessageCache,
+    scan_source: impl FnOnce(&Path, &'static str) -> sessions::antigravity_cli::AntigravityDbScan,
+) -> (
+    Vec<UnifiedMessage>,
+    Option<message_cache::CachedSourceEntry>,
+) {
+    use message_cache::{CachedSourceEntry, FingerprintStatus, SourceFingerprint};
+    let identity = message_cache::CacheIdentity::for_client(client);
+    let cached = source_cache.take(identity, path);
+    let cache_eligible_before = antigravity_db_cache_eligible(path);
+    let before =
+        SourceFingerprint::check_sqlite_path(path, cached.as_ref().map(|entry| &entry.fingerprint));
+    if cache_eligible_before
+        && matches!(before, Some(FingerprintStatus::Unchanged))
+        && cached
+            .as_ref()
+            .is_some_and(|entry| entry.billing_identity_generation > 0)
+    {
+        return (refresh_antigravity_cached_messages(cached.unwrap()), None);
+    }
+    let fingerprint = match before {
+        Some(FingerprintStatus::Changed(fingerprint)) => Some(fingerprint),
+        Some(FingerprintStatus::Unchanged) => {
+            cached.as_ref().map(|entry| entry.fingerprint.clone())
+        }
+        None => None,
+    };
+    let scan = scan_source(path, client.as_str());
+    let stable = fingerprint.as_ref().is_some_and(|fingerprint| {
+        matches!(
+            SourceFingerprint::check_sqlite_path(path, Some(fingerprint)),
+            Some(FingerprintStatus::Unchanged)
+        )
+    });
+    let cache_eligible_after = antigravity_db_cache_eligible(path);
+    if scan.complete && (!cache_eligible_before || !cache_eligible_after || !stable) {
+        // A successful fresh read remains useful even when it cannot be cached.
+        // Reserve the old-entry fallback for failed or incomplete reads.
+        return (scan.messages, None);
+    }
+    if scan.complete && stable {
+        let entry = CachedSourceEntry::new(
+            identity,
+            path,
+            fingerprint.unwrap(),
+            scan.messages.clone(),
+            Vec::new(),
+            None,
+        );
+        return (scan.messages, Some(entry));
+    }
+    // Keep the last successful entry with its OLD fingerprint. It can cover a
+    // transient lock/read failure, but every later scan must retry the new DB.
+    match cached {
+        Some(entry) => (refresh_antigravity_cached_messages(entry), None),
+        None => (scan.messages, None),
+    }
+}
+
+fn antigravity_db_cache_eligible(path: &Path) -> bool {
+    // SQLite can resolve a database symlink before locating its WAL. The
+    // alias's sibling WAL then says nothing about the snapshot SQLite reads.
+    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    antigravity_wal_allows_cache(std::fs::metadata(Path::new(&wal)))
+}
+
+fn antigravity_wal_allows_cache(metadata: std::io::Result<std::fs::Metadata>) -> bool {
+    match metadata {
+        Ok(metadata) => metadata.is_file() && metadata.len() == 0,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn refresh_antigravity_cached_messages(
+    entry: message_cache::CachedSourceEntry,
+) -> Vec<UnifiedMessage> {
+    let mut messages = entry.messages;
+    for message in &mut messages {
+        message.refresh_derived_fields();
+    }
+    messages
 }
 
 /// Deduplicate only response IDs within the Antigravity family. Missing IDs

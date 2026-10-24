@@ -7576,6 +7576,39 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn antigravity_v2_publication_window_shards_are_rejected() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        for client in [ClientId::AntigravityCli, ClientId::AntigravityExtension] {
+            let source = home.path().join(format!("{}.db", client.as_str()));
+            fs::write(&source, b"unchanged source bytes").unwrap();
+            let identity = CacheIdentity::for_client(client);
+            assert_eq!(identity.parser_version, 3);
+            let old_identity = CacheIdentity {
+                parser_version: 2,
+                ..identity
+            };
+            let fingerprint = SourceFingerprint::from_sqlite_path(&source).unwrap();
+            let stale = CachedSourceEntry::new(
+                old_identity,
+                &source,
+                fingerprint,
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
+            let shard = cache_shard_path(identity, &source);
+            ensure_cache_dir(shard.parent().unwrap()).unwrap();
+            write_shard_with_limit(&shard, old_identity, &[stale], MAX_CACHE_SHARD_BYTES).unwrap();
+            assert!(
+                SourceMessageCache::load().get(identity, &source).is_none(),
+                "v2 must not survive the WAL publication guard"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn openclaw_v6_sqlite_shards_are_reparsed_with_compressed_rows() {
         use crate::sessions::openclaw::{scan_openclaw_sqlite, test_fixtures::*};
         let temp_home = TempDir::new().unwrap();
