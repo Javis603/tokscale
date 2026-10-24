@@ -455,6 +455,177 @@ fn antigravity_db_cache_absent_and_empty_wals_allow_warm_hits() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_symlink_wal_updates_bypass_old_entries() {
+    for (surface, client) in [
+        ("antigravity-cli", ClientId::AntigravityCli),
+        ("antigravity", ClientId::AntigravityExtension),
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let _env = cache_env(home.path());
+        let target_home = tempfile::TempDir::new().unwrap();
+        let (target, conn) = database(target_home.path(), surface, "linked");
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let path = home
+            .path()
+            .join(".gemini")
+            .join(surface)
+            .join("conversations/linked.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let identity = CacheIdentity::for_client(client);
+        let initial = scan(home.path(), &[client.as_str()]);
+        assert_eq!(initial[0].tokens.input, 100);
+        let cold_published = SourceMessageCache::load().get(identity, &path).is_some();
+        // Seed an entry created before the symlink guard. SQLite follows the
+        // target's WAL, while fingerprinting the alias misses that WAL.
+        let fingerprint = message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap();
+        let mut cache = SourceMessageCache::load();
+        cache.insert(message_cache::CachedSourceEntry::new(
+            identity,
+            &path,
+            fingerprint.clone(),
+            initial,
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+        let main_before = fs::read(&target).unwrap();
+        let modified_before = fs::metadata(&target).unwrap().modified().unwrap();
+        insert(&conn, 0, "shared-response", 900);
+        assert_eq!(fs::read(&target).unwrap(), main_before);
+        assert_eq!(
+            fs::metadata(&target).unwrap().modified().unwrap(),
+            modified_before
+        );
+        assert!(!path.with_extension("db-wal").exists());
+        assert!(fs::metadata(target.with_extension("db-wal")).unwrap().len() > 0);
+        assert_eq!(
+            message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap(),
+            fingerprint
+        );
+        let fresh = sessions::antigravity_cli::scan_antigravity_db_file(&path, client.as_str());
+        assert!(fresh.complete);
+        assert_eq!(fresh.messages[0].tokens.input, 900);
+        assert_eq!(scan(home.path(), &[client.as_str()])[0].tokens.input, 900);
+        assert!(
+            !cold_published,
+            "symlink scans must not publish a cache entry"
+        );
+        let (messages, entry) = load_or_parse_antigravity_db_source(
+            &path,
+            client,
+            &SourceMessageCache::load(),
+            sessions::antigravity_cli::scan_antigravity_db_file,
+        );
+        assert_eq!(messages[0].tokens.input, 900);
+        assert!(entry.is_none());
+        assert!(!antigravity_db_cache_eligible(&path));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_symlink_appearing_during_parse_prevents_publication() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "moved");
+    drop(conn);
+    let target = home.path().join("target.db");
+    let before = message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap();
+    let (messages, entry) = load_or_parse_antigravity_db_source(
+        &path,
+        ClientId::AntigravityExtension,
+        &SourceMessageCache::default(),
+        |path, client| {
+            let snapshot = sessions::antigravity_cli::scan_antigravity_db_file(path, client);
+            fs::rename(path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, path).unwrap();
+            snapshot
+        },
+    );
+    assert_eq!(messages[0].tokens.input, 100);
+    assert_eq!(
+        message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap(),
+        before
+    );
+    assert!(entry.is_none());
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_complete_unstable_reads_return_fresh_messages() {
+    for wal in [false, true] {
+        let home = tempfile::TempDir::new().unwrap();
+        let _env = cache_env(home.path());
+        let (path, conn) = database(home.path(), "antigravity", "unstable");
+        let checkpoint = || {
+            if wal {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+        };
+        if wal {
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        }
+        checkpoint();
+        assert_eq!(
+            scan(home.path(), &["antigravity-extension"])[0]
+                .tokens
+                .input,
+            100
+        );
+        let identity = CacheIdentity::for_client(ClientId::AntigravityExtension);
+        let cached = SourceMessageCache::load().get(identity, &path).unwrap();
+        insert(&conn, 0, "shared-response", 400);
+        checkpoint();
+        assert!(antigravity_db_cache_eligible(&path));
+        let before = message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap();
+        let (messages, entry) = load_or_parse_antigravity_db_source(
+            &path,
+            ClientId::AntigravityExtension,
+            &SourceMessageCache::load(),
+            |path, client| {
+                let snapshot = sessions::antigravity_cli::scan_antigravity_db_file(path, client);
+                assert!(snapshot.complete);
+                assert_eq!(snapshot.messages[0].tokens.input, 400);
+                insert(&conn, 0, "shared-response", 600);
+                checkpoint();
+                snapshot
+            },
+        );
+        assert!(antigravity_db_cache_eligible(&path));
+        assert_ne!(
+            message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap(),
+            before
+        );
+        assert_eq!(
+            messages[0].tokens.input, 400,
+            "return the complete SQL snapshot"
+        );
+        assert!(
+            entry.is_none(),
+            "do not cache a snapshot under an unstable fingerprint"
+        );
+        let retained = SourceMessageCache::load().get(identity, &path).unwrap();
+        assert_eq!(retained.fingerprint, cached.fingerprint);
+        assert_eq!(retained.messages, cached.messages);
+        assert_eq!(
+            scan(home.path(), &["antigravity-extension"])[0]
+                .tokens
+                .input,
+            600
+        );
+    }
+}
+
 #[test]
 fn antigravity_db_cache_metadata_failures_and_nonfiles_fail_closed() {
     use std::io::{Error, ErrorKind};

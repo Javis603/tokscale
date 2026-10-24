@@ -10600,9 +10600,9 @@ fn load_or_parse_antigravity_db_source(
         )
     });
     let cache_eligible_after = antigravity_db_cache_eligible(path);
-    if scan.complete && (!cache_eligible_before || !cache_eligible_after) {
+    if scan.complete && (!cache_eligible_before || !cache_eligible_after || !stable) {
         // A successful fresh read remains useful even when it cannot be cached.
-        // Returning an old entry here would hide committed WAL-only updates.
+        // Reserve the old-entry fallback for failed or incomplete reads.
         return (scan.messages, None);
     }
     if scan.complete && stable {
@@ -10625,6 +10625,11 @@ fn load_or_parse_antigravity_db_source(
 }
 
 fn antigravity_db_cache_eligible(path: &Path) -> bool {
+    // SQLite can resolve a database symlink before locating its WAL. The
+    // alias's sibling WAL then says nothing about the snapshot SQLite reads.
+    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
     let mut wal = path.as_os_str().to_os_string();
     wal.push("-wal");
     antigravity_wal_allows_cache(std::fs::metadata(Path::new(&wal)))
