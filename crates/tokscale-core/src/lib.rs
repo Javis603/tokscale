@@ -10559,8 +10559,9 @@ fn parse_antigravity_family_messages_with_recount_proofs(
     (messages, proofs)
 }
 
-/// Cache each database before family deduplication and pricing. A changed or
-/// unreadable WAL must never label an older read snapshot as current.
+/// Cache each database before family deduplication and pricing. WAL bytes can
+/// precede publication in SQLite's wal-index, so a nonempty WAL is never proof
+/// of the snapshot a reader observed, even when its fingerprint stays stable.
 fn load_or_parse_antigravity_db_source(
     path: &Path,
     client: ClientId,
@@ -10573,9 +10574,11 @@ fn load_or_parse_antigravity_db_source(
     use message_cache::{CachedSourceEntry, FingerprintStatus, SourceFingerprint};
     let identity = message_cache::CacheIdentity::for_client(client);
     let cached = source_cache.take(identity, path);
+    let cache_eligible_before = antigravity_db_cache_eligible(path);
     let before =
         SourceFingerprint::check_sqlite_path(path, cached.as_ref().map(|entry| &entry.fingerprint));
-    if matches!(before, Some(FingerprintStatus::Unchanged))
+    if cache_eligible_before
+        && matches!(before, Some(FingerprintStatus::Unchanged))
         && cached
             .as_ref()
             .is_some_and(|entry| entry.billing_identity_generation > 0)
@@ -10596,6 +10599,12 @@ fn load_or_parse_antigravity_db_source(
             Some(FingerprintStatus::Unchanged)
         )
     });
+    let cache_eligible_after = antigravity_db_cache_eligible(path);
+    if scan.complete && (!cache_eligible_before || !cache_eligible_after) {
+        // A successful fresh read remains useful even when it cannot be cached.
+        // Returning an old entry here would hide committed WAL-only updates.
+        return (scan.messages, None);
+    }
     if scan.complete && stable {
         let entry = CachedSourceEntry::new(
             identity,
@@ -10612,6 +10621,19 @@ fn load_or_parse_antigravity_db_source(
     match cached {
         Some(entry) => (refresh_antigravity_cached_messages(entry), None),
         None => (scan.messages, None),
+    }
+}
+
+fn antigravity_db_cache_eligible(path: &Path) -> bool {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    antigravity_wal_allows_cache(std::fs::metadata(Path::new(&wal)))
+}
+
+fn antigravity_wal_allows_cache(metadata: std::io::Result<std::fs::Metadata>) -> bool {
+    match metadata {
+        Ok(metadata) => metadata.is_file() && metadata.len() == 0,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 

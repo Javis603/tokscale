@@ -287,6 +287,8 @@ fn antigravity_db_cache_warm_hit_never_opens_sqlite_and_racing_read_is_retried()
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
     insert(&conn, 0, "shared-response", 100);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
     let before = scan(home.path(), &["antigravity-extension"]);
     let client = ClientId::AntigravityExtension;
     let identity = CacheIdentity::for_client(client);
@@ -309,8 +311,8 @@ fn antigravity_db_cache_warm_hit_never_opens_sqlite_and_racing_read_is_retried()
         },
     );
     assert_eq!(
-        racing, before,
-        "a changing source retains only its last accepted snapshot"
+        racing[0].tokens.input, 400,
+        "successful WAL reads return their fresh snapshot"
     );
     assert!(
         entry.is_none(),
@@ -330,4 +332,144 @@ fn antigravity_db_cache_warm_hit_never_opens_sqlite_and_racing_read_is_retried()
         600
     );
     drop(conn);
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_nonempty_wal_bypasses_poisoned_warm_entry() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "publication");
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    insert(&conn, 0, "shared-response", 900);
+    let identity = CacheIdentity::for_client(ClientId::AntigravityExtension);
+    let fresh = sessions::antigravity_cli::scan_antigravity_db_file(&path, "antigravity-extension");
+    assert!(fresh.complete);
+    let mut stale = fresh.messages.clone();
+    stale[0].tokens.input = 100;
+    // Model the publication race: old SQL values stored under the FINAL WAL
+    // fingerprint. No DB/WAL bytes change between this entry and the scan.
+    let fingerprint = message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap();
+    let mut cache = SourceMessageCache::load();
+    cache.insert(message_cache::CachedSourceEntry::new(
+        identity,
+        &path,
+        fingerprint.clone(),
+        stale,
+        Vec::new(),
+        None,
+    ));
+    cache.save_if_dirty();
+    let (messages, entry) = load_or_parse_antigravity_db_source(
+        &path,
+        ClientId::AntigravityExtension,
+        &SourceMessageCache::load(),
+        sessions::antigravity_cli::scan_antigravity_db_file,
+    );
+    assert_eq!(messages[0].tokens.input, 900);
+    assert!(
+        entry.is_none(),
+        "a nonempty WAL must never publish a new cache entry"
+    );
+    assert_eq!(
+        message_cache::SourceFingerprint::from_sqlite_path(&path).unwrap(),
+        fingerprint
+    );
+    // The bypass also protects a cold cache, and a failed parse still falls
+    // back to the previous accepted snapshot instead of treating it as empty.
+    let empty_cache = SourceMessageCache::default();
+    let (messages, entry) = load_or_parse_antigravity_db_source(
+        &path,
+        ClientId::AntigravityExtension,
+        &empty_cache,
+        sessions::antigravity_cli::scan_antigravity_db_file,
+    );
+    assert_eq!(messages[0].tokens.input, 900);
+    assert!(entry.is_none());
+    let (fallback, entry) = load_or_parse_antigravity_db_source(
+        &path,
+        ClientId::AntigravityExtension,
+        &SourceMessageCache::load(),
+        |_, _| sessions::antigravity_cli::AntigravityDbScan::default(),
+    );
+    assert_eq!(fallback[0].tokens.input, 100);
+    assert!(entry.is_none());
+    drop(conn);
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_wal_appearing_during_parse_prevents_publication() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "appearing");
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert!(antigravity_db_cache_eligible(&path));
+    let (messages, entry) = load_or_parse_antigravity_db_source(
+        &path,
+        ClientId::AntigravityExtension,
+        &SourceMessageCache::default(),
+        |path, client| {
+            let scan = sessions::antigravity_cli::scan_antigravity_db_file(path, client);
+            insert(&conn, 0, "shared-response", 900);
+            scan
+        },
+    );
+    assert_eq!(messages[0].tokens.input, 100);
+    assert!(entry.is_none());
+    assert!(!antigravity_db_cache_eligible(&path));
+    assert_eq!(
+        scan(home.path(), &["antigravity-extension"])[0]
+            .tokens
+            .input,
+        900
+    );
+    drop(conn);
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_absent_and_empty_wals_allow_warm_hits() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "eligible");
+    drop(conn);
+    for empty_wal in [false, true] {
+        if empty_wal {
+            fs::write(path.with_extension("db-wal"), []).unwrap();
+        }
+        let expected = scan(home.path(), &["antigravity-extension"]);
+        assert!(antigravity_db_cache_eligible(&path));
+        let (warm, entry) = load_or_parse_antigravity_db_source(
+            &path,
+            ClientId::AntigravityExtension,
+            &SourceMessageCache::load(),
+            |_, _| panic!("eligible unchanged DB must not open SQLite"),
+        );
+        assert_eq!(warm, expected);
+        assert!(entry.is_none());
+    }
+}
+
+#[test]
+fn antigravity_db_cache_metadata_failures_and_nonfiles_fail_closed() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::Interrupted,
+        ErrorKind::Other,
+    ] {
+        assert!(!antigravity_wal_allows_cache(Err(Error::from(kind))));
+    }
+    assert!(antigravity_wal_allows_cache(Err(Error::from(
+        ErrorKind::NotFound
+    ))));
+    let directory = tempfile::TempDir::new().unwrap();
+    assert!(!antigravity_wal_allows_cache(fs::metadata(
+        directory.path()
+    )));
 }

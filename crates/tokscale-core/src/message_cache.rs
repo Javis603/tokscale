@@ -8484,6 +8484,39 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn antigravity_v2_publication_window_shards_are_rejected() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        for client in [ClientId::AntigravityCli, ClientId::AntigravityExtension] {
+            let source = home.path().join(format!("{}.db", client.as_str()));
+            fs::write(&source, b"unchanged source bytes").unwrap();
+            let identity = CacheIdentity::for_client(client);
+            assert_eq!(identity.parser_version, 3);
+            let old_identity = CacheIdentity {
+                parser_version: 2,
+                ..identity
+            };
+            let fingerprint = SourceFingerprint::from_sqlite_path(&source).unwrap();
+            let stale = CachedSourceEntry::new(
+                old_identity,
+                &source,
+                fingerprint,
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
+            let shard = cache_shard_path(identity, &source);
+            ensure_cache_dir(shard.parent().unwrap()).unwrap();
+            write_shard_with_limit(&shard, old_identity, &[stale], MAX_CACHE_SHARD_BYTES).unwrap();
+            assert!(
+                SourceMessageCache::load().get(identity, &source).is_none(),
+                "v2 must not survive the WAL publication guard"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn openclaw_v8_sqlite_shards_are_reparsed_with_archived_rows() {
         use crate::sessions::openclaw::{scan_openclaw_sqlite, test_fixtures::*};
         let temp_home = TempDir::new().unwrap();
@@ -11246,16 +11279,13 @@ mod tests {
     #[test]
     fn test_antigravity_family_bump_moves_the_parser_generation() {
         assert_eq!(parser_version(ClientId::Antigravity), 2);
-        assert_eq!(parser_version(ClientId::AntigravityCli), 2);
-        assert_eq!(parser_version(ClientId::AntigravityExtension), 2);
+        assert_eq!(parser_version(ClientId::AntigravityCli), 3);
+        assert_eq!(parser_version(ClientId::AntigravityExtension), 3);
 
         let pre_bump_generation = parser_generation_for_versions(
             ClientId::ALL.iter().copied().map(|c| {
-                if c == ClientId::Antigravity
-                    || c == ClientId::AntigravityCli
-                    || c == ClientId::AntigravityExtension
-                {
-                    1
+                if c == ClientId::AntigravityCli || c == ClientId::AntigravityExtension {
+                    2
                 } else {
                     parser_version(c)
                 }
@@ -11265,8 +11295,8 @@ mod tests {
         assert_ne!(
             parser_generation(),
             pre_bump_generation,
-            "bumping Antigravity family to v2 must invalidate parser_generation(), \
-             preventing stale warm caches from reusing pre-v2 totals"
+            "bumping Antigravity databases to v3 must invalidate parser_generation(), \
+             preventing stale warm caches from reusing pre-v3 totals"
         );
     }
 

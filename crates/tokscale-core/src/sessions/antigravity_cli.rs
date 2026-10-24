@@ -69,7 +69,8 @@ use std::time::Duration;
 
 /// Bump when parsing behavior for Antigravity generation databases changes.
 /// The CLI and IDE extension clients share this parser and cache generation.
-pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 2;
+// v3 retires snapshots cached before the WAL publication-window guard.
+pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 3;
 
 /// Parse an Antigravity CLI conversation database.
 pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
