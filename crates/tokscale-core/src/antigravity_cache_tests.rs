@@ -1,0 +1,333 @@
+use super::*;
+use message_cache::{CacheIdentity, SourceMessageCache};
+use rusqlite::{params, Connection};
+use std::fs;
+
+fn varint(mut value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while value >= 128 {
+        bytes.push((value as u8 & 127) | 128);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    bytes
+}
+
+fn number(field: u64, value: u64) -> Vec<u8> {
+    [varint(field << 3), varint(value)].concat()
+}
+
+fn blob(field: u64, value: &[u8]) -> Vec<u8> {
+    [
+        varint((field << 3) | 2),
+        varint(value.len() as u64),
+        value.to_vec(),
+    ]
+    .concat()
+}
+
+fn generation(response: &str, input: u64) -> Vec<u8> {
+    let usage = [
+        number(2, input),
+        number(9, 20),
+        blob(11, response.as_bytes()),
+    ]
+    .concat();
+    let chat = [
+        blob(4, &usage),
+        blob(19, b"gemini-3-flash-a"),
+        blob(9, &blob(4, &number(1, 1_781_502_653))),
+        blob(11, &number(1, 1)),
+        blob(12, &number(1, 2)),
+    ]
+    .concat();
+    blob(1, &chat)
+}
+
+fn database(home: &Path, surface: &str, session: &str) -> (PathBuf, Connection) {
+    let path = home
+        .join(".gemini")
+        .join(surface)
+        .join("conversations")
+        .join(format!("{session}.db"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY, data BLOB);
+        CREATE TABLE trajectory_metadata_blob(data BLOB);
+        CREATE TABLE steps(idx INTEGER, step_type INTEGER, metadata BLOB);",
+    )
+    .unwrap();
+    let workspace = blob(1, &blob(1, b"file:///test/workspace"));
+    conn.execute(
+        "INSERT INTO trajectory_metadata_blob VALUES (?1)",
+        [workspace],
+    )
+    .unwrap();
+    insert(&conn, 0, "shared-response", 100);
+    (path, conn)
+}
+
+fn insert(conn: &Connection, idx: i64, response: &str, input: u64) {
+    conn.execute(
+        "INSERT OR REPLACE INTO gen_metadata VALUES (?1, ?2)",
+        params![idx, generation(response, input)],
+    )
+    .unwrap();
+}
+
+fn scan(home: &Path, clients: &[&str]) -> Vec<UnifiedMessage> {
+    parse_all_messages_with_pricing_with_env_strategy(
+        home.to_str().unwrap(),
+        &clients
+            .iter()
+            .map(|client| client.to_string())
+            .collect::<Vec<_>>(),
+        None,
+        false,
+        &scanner::ScannerSettings::default(),
+    )
+}
+
+fn cache_env(home: &Path) -> paths::test_env::EnvGuard {
+    let mut env = paths::test_env::EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"]);
+    env.set("TOKSCALE_CONFIG_DIR", home.join("cache-config"));
+    env
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_persists_before_family_dedup_and_matches_cold_scan() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (cli, conn) = database(home.path(), "antigravity-cli", "cli");
+    insert(&conn, 1, "cli-only", 200);
+    drop(conn);
+    let (extension, conn) = database(home.path(), "antigravity", "extension");
+    insert(&conn, 1, "extension-only", 300);
+    drop(conn);
+
+    let clients = ["antigravity-cli", "antigravity-extension"];
+    let cold = scan(home.path(), &clients);
+    assert_eq!(cold.len(), 3);
+    for (client, path) in [
+        (ClientId::AntigravityCli, &cli),
+        (ClientId::AntigravityExtension, &extension),
+    ] {
+        let cached = SourceMessageCache::load()
+            .get(CacheIdentity::for_client(client), path)
+            .expect("successful Antigravity DB parses must persist across CLI processes");
+        assert_eq!(
+            cached.messages.len(),
+            2,
+            "cache owns raw rows before family dedup"
+        );
+        assert_eq!(cached.messages[0].duration_ms, Some(3000));
+        assert!(cached.messages[0].workspace_key.is_some());
+    }
+    assert_eq!(scan(home.path(), &clients), cold);
+    // Removing the winning source must expose the duplicate stored in the other
+    // source; deduped results must never have been persisted as raw DB contents.
+    fs::remove_file(cli).unwrap();
+    let remaining = scan(home.path(), &clients);
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining
+        .iter()
+        .all(|message| message.client == "antigravity-extension"));
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_wal_updates_replace_old_rows_and_match_cold_scan() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "wal");
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    assert_eq!(
+        scan(home.path(), &["antigravity-extension"])[0]
+            .tokens
+            .input,
+        100
+    );
+    let main_before = fs::read(&path).unwrap();
+    let modified_before = fs::metadata(&path).unwrap().modified().unwrap();
+    insert(&conn, 0, "shared-response", 900);
+    assert_eq!(fs::read(&path).unwrap(), main_before);
+    assert_eq!(
+        fs::metadata(&path).unwrap().modified().unwrap(),
+        modified_before
+    );
+    let warm = scan(home.path(), &["antigravity-extension"]);
+    assert_eq!(warm[0].tokens.input, 900);
+    let _cold_env = cache_env(&home.path().join("cold"));
+    assert_eq!(scan(home.path(), &["antigravity-extension"]), warm);
+    drop(conn);
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_locked_read_keeps_last_success_and_retries() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "locked");
+    let before = scan(home.path(), &["antigravity-extension"]);
+    let identity = CacheIdentity::for_client(ClientId::AntigravityExtension);
+    let fingerprint = SourceMessageCache::load()
+        .get(identity, &path)
+        .unwrap()
+        .fingerprint;
+    conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    insert(&conn, 0, "shared-response", 700);
+    let later =
+        fs::metadata(&path).unwrap().modified().unwrap() + std::time::Duration::from_secs(2);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(later))
+        .unwrap();
+    assert_eq!(scan(home.path(), &["antigravity-extension"]), before);
+    assert_eq!(
+        SourceMessageCache::load()
+            .get(identity, &path)
+            .unwrap()
+            .fingerprint,
+        fingerprint
+    );
+    conn.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        scan(home.path(), &["antigravity-extension"])[0]
+            .tokens
+            .input,
+        700
+    );
+    drop(conn);
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_failed_optional_or_generation_rows_are_not_persisted() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "invalid");
+    let before = scan(home.path(), &["antigravity-extension"]);
+    let identity = CacheIdentity::for_client(ClientId::AntigravityExtension);
+    let original = SourceMessageCache::load()
+        .get(identity, &path)
+        .unwrap()
+        .fingerprint;
+    for bad_sql in [
+        "UPDATE trajectory_metadata_blob SET data = 'not a blob'",
+        "INSERT INTO steps VALUES (0,15,'not a blob')",
+        "INSERT INTO gen_metadata VALUES (99,'not a blob')",
+    ] {
+        conn.execute_batch(bad_sql).unwrap();
+        insert(&conn, 0, "shared-response", 800);
+        assert_eq!(scan(home.path(), &["antigravity-extension"]), before);
+        assert_eq!(
+            SourceMessageCache::load()
+                .get(identity, &path)
+                .unwrap()
+                .fingerprint,
+            original
+        );
+        conn.execute_batch("DELETE FROM trajectory_metadata_blob; DELETE FROM steps; DELETE FROM gen_metadata WHERE idx=99").unwrap();
+    }
+    let repaired = scan(home.path(), &["antigravity-extension"]);
+    assert_eq!(repaired[0].tokens.input, 800);
+    assert_eq!(scan(home.path(), &["antigravity-extension"]), repaired);
+    drop(conn);
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_empty_snapshot_is_valid_and_recreation_replaces_it() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "empty");
+    conn.execute_batch(
+        "DELETE FROM gen_metadata; DROP TABLE steps; DROP TABLE trajectory_metadata_blob",
+    )
+    .unwrap();
+    assert!(scan(home.path(), &["antigravity-extension"]).is_empty());
+    let cached = SourceMessageCache::load()
+        .get(
+            CacheIdentity::for_client(ClientId::AntigravityExtension),
+            &path,
+        )
+        .unwrap();
+    assert!(cached.messages.is_empty());
+    insert(&conn, 0, "new-response", 50);
+    assert_eq!(
+        scan(home.path(), &["antigravity-extension"])[0]
+            .tokens
+            .input,
+        50
+    );
+    drop(conn);
+    fs::remove_file(&path).unwrap();
+    assert!(scan(home.path(), &["antigravity-extension"]).is_empty());
+    let (_, conn) = database(home.path(), "antigravity", "empty");
+    assert_eq!(
+        scan(home.path(), &["antigravity-extension"])[0]
+            .tokens
+            .input,
+        100
+    );
+    drop(conn);
+}
+
+#[test]
+#[serial_test::serial]
+fn antigravity_db_cache_warm_hit_never_opens_sqlite_and_racing_read_is_retried() {
+    let home = tempfile::TempDir::new().unwrap();
+    let _env = cache_env(home.path());
+    let (path, conn) = database(home.path(), "antigravity", "racing");
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    insert(&conn, 0, "shared-response", 100);
+    let before = scan(home.path(), &["antigravity-extension"]);
+    let client = ClientId::AntigravityExtension;
+    let identity = CacheIdentity::for_client(client);
+    let cached = SourceMessageCache::load().get(identity, &path).unwrap();
+    let (warm, entry) =
+        load_or_parse_antigravity_db_source(&path, client, &SourceMessageCache::load(), |_, _| {
+            panic!("unchanged DB must not open SQLite")
+        });
+    assert_eq!(warm, before);
+    assert!(entry.is_none());
+    insert(&conn, 0, "shared-response", 400);
+    let (racing, entry) = load_or_parse_antigravity_db_source(
+        &path,
+        client,
+        &SourceMessageCache::load(),
+        |path, client| {
+            let snapshot = sessions::antigravity_cli::scan_antigravity_db_file(path, client);
+            insert(&conn, 0, "shared-response", 600);
+            snapshot
+        },
+    );
+    assert_eq!(
+        racing, before,
+        "a changing source retains only its last accepted snapshot"
+    );
+    assert!(
+        entry.is_none(),
+        "never cache the old snapshot under the newer WAL"
+    );
+    assert_eq!(
+        SourceMessageCache::load()
+            .get(identity, &path)
+            .unwrap()
+            .fingerprint,
+        cached.fingerprint
+    );
+    assert_eq!(
+        scan(home.path(), &["antigravity-extension"])[0]
+            .tokens
+            .input,
+        600
+    );
+    drop(conn);
+}

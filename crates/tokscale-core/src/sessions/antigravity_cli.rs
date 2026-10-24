@@ -61,7 +61,7 @@
 use super::utils::{open_readonly_sqlite_opt, sqlite_for_each_row_on, SqliteScan};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{pricing, provider_identity, TokenBreakdown};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::Path;
@@ -98,28 +98,52 @@ pub fn parse_antigravity_extension_file_with_v1(
 }
 
 fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMessage> {
-    parse_antigravity_db_file_inner(path, client, false).0
+    scan_antigravity_db_file(path, client).messages
 }
 
 fn parse_antigravity_db_file_with_v1(
     path: &Path,
     client: &'static str,
 ) -> (Vec<UnifiedMessage>, Vec<UnifiedMessage>, bool) {
-    parse_antigravity_db_file_inner(path, client, true)
+    let scan = parse_antigravity_db_file_inner(path, client, true);
+    (
+        scan.current.messages,
+        scan.v1_messages,
+        scan.usage_read_complete,
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct AntigravityDbScan {
+    pub messages: Vec<UnifiedMessage>,
+    pub complete: bool,
+}
+
+#[derive(Default)]
+struct AntigravityDbRead {
+    current: AntigravityDbScan,
+    v1_messages: Vec<UnifiedMessage>,
+    usage_read_complete: bool,
+}
+
+/// Read one SQLite snapshot, distinguishing an empty database from a failed
+/// read so callers never persist a transient failure as a successful cache hit.
+pub(crate) fn scan_antigravity_db_file(path: &Path, client: &'static str) -> AntigravityDbScan {
+    parse_antigravity_db_file_inner(path, client, false).current
 }
 
 fn parse_antigravity_db_file_inner(
     path: &Path,
     client: &'static str,
     include_v1: bool,
-) -> (Vec<UnifiedMessage>, Vec<UnifiedMessage>, bool) {
+) -> AntigravityDbRead {
     let Some(conn) = open_readonly_sqlite_opt(path) else {
-        return (Vec::new(), Vec::new(), false);
+        return AntigravityDbRead::default();
     };
     if conn.busy_timeout(Duration::from_millis(100)).is_err()
         || conn.execute_batch("BEGIN").is_err()
     {
-        return (Vec::new(), Vec::new(), false);
+        return AntigravityDbRead::default();
     }
 
     let session_id = path
@@ -128,8 +152,8 @@ fn parse_antigravity_db_file_inner(
         .unwrap_or("unknown")
         .to_string();
 
-    let meta = read_trajectory_meta(&conn, path);
-    let step_timestamps = read_step_timestamps(&conn, path);
+    let (meta, meta_complete) = read_trajectory_meta(&conn, path);
+    let (step_timestamps, steps_complete) = read_step_timestamps(&conn, path);
 
     // Buffered rather than streamed so a row missing its own `#19` can borrow
     // attribution from anywhere in the conversation, not just from rows that
@@ -138,15 +162,21 @@ fn parse_antigravity_db_file_inner(
     // Quiet: a database without `gen_metadata` is not an Antigravity generation
     // database at all, so there is nothing to warn about.
     let mut rows: Vec<(Option<i64>, Vec<u8>)> = Vec::new();
+    let mut rows_complete = true;
     let scan = sqlite_for_each_row_on(
         &conn,
         path,
         "SELECT idx, data FROM gen_metadata ORDER BY idx",
         None,
         &mut |row| {
-            let idx = row.get::<_, Option<i64>>(0)?;
-            let data: Vec<u8> = row.get(1)?;
-            rows.push((idx, data));
+            let decoded = (|| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Vec<u8>>(1)?)))();
+            match decoded {
+                Ok(row) => rows.push(row),
+                Err(error) => {
+                    rows_complete = false;
+                    return Err(error);
+                }
+            }
             Ok(())
         },
     );
@@ -197,7 +227,14 @@ fn parse_antigravity_db_file_inner(
         }
     }
 
-    (messages, v1_messages, read_complete)
+    AntigravityDbRead {
+        current: AntigravityDbScan {
+            messages,
+            complete: meta_complete && steps_complete && rows_complete && read_complete,
+        },
+        v1_messages,
+        usage_read_complete: read_complete,
+    }
 }
 
 /// Whether the database has the `gen_metadata` table Antigravity writes. A
@@ -561,20 +598,31 @@ struct TrajectoryMeta {
     workspace_label: Option<String>,
 }
 
+fn optional_table_absent(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
 /// Read the session-level created-at timestamp and workspace from the single
 /// `trajectory_metadata_blob` row. The created-at dates the conversation as a
 /// whole; the per-row fallback for any `gen_metadata` row missing its own
 /// per-generation `#9` wall-clock stamp drops to the file mtime when the blob
 /// is absent or undecodable. See [`TrajectoryMeta`] for why the two are
 /// reported separately.
-fn read_trajectory_meta(conn: &Connection, path: &Path) -> TrajectoryMeta {
-    let blob: Option<Vec<u8>> = conn
+fn read_trajectory_meta(conn: &Connection, path: &Path) -> (TrajectoryMeta, bool) {
+    let result = conn
         .query_row(
             "SELECT data FROM trajectory_metadata_blob LIMIT 1",
             [],
             |row| row.get::<_, Vec<u8>>(0),
         )
-        .ok();
+        .optional();
+    let complete = result.is_ok() || optional_table_absent(conn, "trajectory_metadata_blob");
+    let blob = result.ok().flatten();
 
     let mut created_ms = None;
     let mut workspace_key = None;
@@ -591,12 +639,15 @@ fn read_trajectory_meta(conn: &Connection, path: &Path) -> TrajectoryMeta {
         }
     }
 
-    TrajectoryMeta {
-        created_ms,
-        fallback_ms: created_ms.unwrap_or_else(|| file_modified_ms(path)),
-        workspace_key,
-        workspace_label,
-    }
+    (
+        TrajectoryMeta {
+            created_ms,
+            fallback_ms: created_ms.unwrap_or_else(|| file_modified_ms(path)),
+            workspace_key,
+            workspace_label,
+        },
+        complete,
+    )
 }
 
 fn session_created_ms(blob: &[u8]) -> Option<i64> {
@@ -626,17 +677,29 @@ struct StepTimestamps {
 /// In modern agy versions (1.1.18+), `chatModel.#9` in `gen_metadata` no longer carries
 /// a turn timestamp (it holds cache metadata instead). Looking up by `responseId`
 /// (or generation index) restores the genuine per-turn execution time.
-fn read_step_timestamps(conn: &Connection, path: &Path) -> StepTimestamps {
+fn read_step_timestamps(conn: &Connection, path: &Path) -> (StepTimestamps, bool) {
     let mut timestamps = StepTimestamps::default();
+    let mut rows_complete = true;
     let scan = sqlite_for_each_row_on(
         conn,
         path,
         "SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL",
         None,
         &mut |row| {
-            let idx: Option<i64> = row.get(0)?;
-            let step_type: Option<i64> = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
+            let decoded = (|| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })();
+            let (idx, step_type, blob) = match decoded {
+                Ok(row) => row,
+                Err(error) => {
+                    rows_complete = false;
+                    return Err(error);
+                }
+            };
             if let Some(ts_ms) = message_field(&blob, 1).and_then(proto_timestamp_ms) {
                 if ts_ms > 0 {
                     if let Some(idx) = idx {
@@ -665,9 +728,12 @@ fn read_step_timestamps(conn: &Connection, path: &Path) -> StepTimestamps {
         },
     );
     if scan.completed() {
-        timestamps
+        (timestamps, rows_complete)
     } else {
-        StepTimestamps::default()
+        (
+            StepTimestamps::default(),
+            optional_table_absent(conn, "steps"),
+        )
     }
 }
 

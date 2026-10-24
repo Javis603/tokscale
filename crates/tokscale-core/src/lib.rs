@@ -1437,6 +1437,12 @@ fn opencode_json_superseded_by_sqlite(
 trait MessageSink {
     fn accept(&mut self, message: UnifiedMessage);
 
+    // Graph and submission expose native read completeness and legacy totals.
+    // The model-report cache carries current messages only.
+    fn needs_antigravity_recount(&self) -> bool {
+        true
+    }
+
     fn accept_with_estimate_source(
         &mut self,
         message: UnifiedMessage,
@@ -1472,6 +1478,10 @@ impl MessageSink for GraphMessageCollector {
 }
 
 impl MessageSink for Vec<UnifiedMessage> {
+    fn needs_antigravity_recount(&self) -> bool {
+        false
+    }
+
     fn accept(&mut self, message: UnifiedMessage) {
         self.push(message);
     }
@@ -1485,6 +1495,10 @@ struct CustomPricingSink<'a, S> {
 }
 
 impl<S: MessageSink> MessageSink for CustomPricingSink<'_, S> {
+    fn needs_antigravity_recount(&self) -> bool {
+        self.sink.needs_antigravity_recount()
+    }
+
     fn accept(&mut self, message: UnifiedMessage) {
         let source = self
             .pricing
@@ -5779,16 +5793,25 @@ fn parse_all_messages_streaming<S: MessageSink>(
         all_messages.extend(crush_messages);
     }
 
-    let (antigravity_messages, antigravity_recount_proofs) =
-        parse_antigravity_family_messages_with_recount_proofs(
+    if sink.needs_antigravity_recount() {
+        let (antigravity_messages, antigravity_recount_proofs) =
+            parse_antigravity_family_messages_with_recount_proofs(
+                &scan_result,
+                pricing,
+                &machine_labeler,
+                &flush_context,
+                &mut source_reads,
+            );
+        all_messages.extend(antigravity_messages);
+        recount_proofs.extend(antigravity_recount_proofs);
+    } else {
+        all_messages.extend(parse_antigravity_family_messages(
             &scan_result,
             pricing,
             &machine_labeler,
-            &flush_context,
-            &mut source_reads,
-        );
-    all_messages.extend(antigravity_messages);
-    recount_proofs.extend(antigravity_recount_proofs);
+            Some(&mut source_cache),
+        ));
+    }
 
     // Trae API dump uses exact dollar_float totals, so pricing lookup is not needed.
     let trae_messages: Vec<UnifiedMessage> = scan_result
@@ -6929,6 +6952,10 @@ impl<'a> ModelReportSink<'a> {
 }
 
 impl MessageSink for ModelReportSink<'_> {
+    fn needs_antigravity_recount(&self) -> bool {
+        false
+    }
+
     fn accept(&mut self, message: UnifiedMessage) {
         if !message_passes_report_filter(&message, self.options) {
             return;
@@ -9865,6 +9892,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         &scan_result,
         None,
         &machine_label::MachineLabeler::default(),
+        None,
     );
     for client in [
         ClientId::Antigravity,
@@ -10281,6 +10309,9 @@ fn reconcile_omp_responses(
 type AntigravitySourceParser = fn(&Path) -> Vec<UnifiedMessage>;
 type AntigravitySourceParserWithV1 = fn(&Path) -> (Vec<UnifiedMessage>, Vec<UnifiedMessage>, bool);
 
+#[cfg(test)]
+mod antigravity_cache_tests;
+
 /// Read Antigravity surfaces in legacy-first order, but place cache entries that
 /// relied on fallback timestamps (e.g. file modification time when the usage record
 /// lacked a timestamp) after database sources (antigravity-cli and antigravity-extension).
@@ -10290,6 +10321,7 @@ fn parse_antigravity_family_messages(
     scan_result: &scanner::ScanResult,
     pricing: Option<&pricing::PricingService>,
     machine_labeler: &machine_label::MachineLabeler,
+    mut source_cache: Option<&mut message_cache::SourceMessageCache>,
 ) -> Vec<UnifiedMessage> {
     let parsed_antigravity = scan_result
         .get(ClientId::Antigravity)
@@ -10331,15 +10363,30 @@ fn parse_antigravity_family_messages(
 
     let mut db_messages = Vec::new();
     for (client, parse) in db_sources {
-        let mut source_messages: Vec<UnifiedMessage> = scan_result
+        let outcomes: Vec<_> = scan_result
             .get(client)
             .par_iter()
-            .flat_map_iter(|path| {
-                let mut messages = parse(path);
+            .map(|path| {
+                let (mut messages, entry) = match source_cache.as_deref() {
+                    Some(cache) => load_or_parse_antigravity_db_source(
+                        path,
+                        client,
+                        cache,
+                        sessions::antigravity_cli::scan_antigravity_db_file,
+                    ),
+                    None => (parse(path), None),
+                };
                 machine_labeler.label_messages(path, &mut messages);
-                messages
+                (messages, entry)
             })
             .collect();
+        let mut source_messages = Vec::new();
+        for (parsed, entry) in outcomes {
+            source_messages.extend(parsed);
+            if let (Some(cache), Some(entry)) = (source_cache.as_deref_mut(), entry) {
+                cache.insert(entry);
+            }
+        }
         if let Some(pricing) = pricing {
             for message in &mut source_messages {
                 apply_pricing_if_available(message, Some(pricing));
@@ -10510,6 +10557,72 @@ fn parse_antigravity_family_messages_with_recount_proofs(
     }
 
     (messages, proofs)
+}
+
+/// Cache each database before family deduplication and pricing. A changed or
+/// unreadable WAL must never label an older read snapshot as current.
+fn load_or_parse_antigravity_db_source(
+    path: &Path,
+    client: ClientId,
+    source_cache: &message_cache::SourceMessageCache,
+    scan_source: impl FnOnce(&Path, &'static str) -> sessions::antigravity_cli::AntigravityDbScan,
+) -> (
+    Vec<UnifiedMessage>,
+    Option<message_cache::CachedSourceEntry>,
+) {
+    use message_cache::{CachedSourceEntry, FingerprintStatus, SourceFingerprint};
+    let identity = message_cache::CacheIdentity::for_client(client);
+    let cached = source_cache.take(identity, path);
+    let before =
+        SourceFingerprint::check_sqlite_path(path, cached.as_ref().map(|entry| &entry.fingerprint));
+    if matches!(before, Some(FingerprintStatus::Unchanged))
+        && cached
+            .as_ref()
+            .is_some_and(|entry| entry.billing_identity_generation > 0)
+    {
+        return (refresh_antigravity_cached_messages(cached.unwrap()), None);
+    }
+    let fingerprint = match before {
+        Some(FingerprintStatus::Changed(fingerprint)) => Some(fingerprint),
+        Some(FingerprintStatus::Unchanged) => {
+            cached.as_ref().map(|entry| entry.fingerprint.clone())
+        }
+        None => None,
+    };
+    let scan = scan_source(path, client.as_str());
+    let stable = fingerprint.as_ref().is_some_and(|fingerprint| {
+        matches!(
+            SourceFingerprint::check_sqlite_path(path, Some(fingerprint)),
+            Some(FingerprintStatus::Unchanged)
+        )
+    });
+    if scan.complete && stable {
+        let entry = CachedSourceEntry::new(
+            identity,
+            path,
+            fingerprint.unwrap(),
+            scan.messages.clone(),
+            Vec::new(),
+            None,
+        );
+        return (scan.messages, Some(entry));
+    }
+    // Keep the last successful entry with its OLD fingerprint. It can cover a
+    // transient lock/read failure, but every later scan must retry the new DB.
+    match cached {
+        Some(entry) => (refresh_antigravity_cached_messages(entry), None),
+        None => (scan.messages, None),
+    }
+}
+
+fn refresh_antigravity_cached_messages(
+    entry: message_cache::CachedSourceEntry,
+) -> Vec<UnifiedMessage> {
+    let mut messages = entry.messages;
+    for message in &mut messages {
+        message.refresh_derived_fields();
+    }
+    messages
 }
 
 /// Deduplicate only response IDs within the Antigravity family. Missing IDs
@@ -10976,7 +11089,8 @@ mod tests {
             .push(ext_db_file);
 
         let machine_labeler = machine_label::MachineLabeler::default();
-        let messages = parse_antigravity_family_messages(&scan_result, None, &machine_labeler);
+        let messages =
+            parse_antigravity_family_messages(&scan_result, None, &machine_labeler, None);
 
         assert_eq!(messages.len(), 3);
 
