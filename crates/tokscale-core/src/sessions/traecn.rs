@@ -316,7 +316,7 @@ pub fn parse_traecn_file(path: &Path) -> Vec<UnifiedMessage> {
         if total <= 0 {
             continue;
         }
-        let input = data
+        let prompt = data
             .pointer("/prompt_tokens")
             .and_then(Value::as_i64)
             .unwrap_or(0);
@@ -332,10 +332,19 @@ pub fn parse_traecn_file(path: &Path) -> Vec<UnifiedMessage> {
             .pointer("/cache_creation_input_tokens")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let reasoning = data
-            .pointer("/reasoning_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        // TRAE CN bills with cache-inclusive prompt tokens: `prompt_tokens`
+        // already contains `cache_read + cache_write`. tokscale's
+        // `TokenBreakdown::total()` sums `input + output + cache_read +
+        // cache_write + reasoning`, so storing the raw prompt in `input`
+        // would double-count the cache. Split the fresh (uncached) input out
+        // so the components reconstruct the billed total exactly.
+        let input = (prompt - cache_read - cache_write).max(0);
+        // `reasoning_tokens` is a subset of `completion_tokens` (TRAE CN's
+        // `total_tokens == prompt_tokens + completion_tokens` holds strictly,
+        // with reasoning already folded into completion). It is therefore not
+        // emitted as a separate component — doing so would double-count it in
+        // `total()` — and is left inside `output`, matching the upstream trae
+        // parser which also reports reasoning as 0.
 
         // Fall back to file mtime when the stream was entirely clockless.
         let mtime_ms = std::fs::metadata(path)
@@ -358,7 +367,7 @@ pub fn parse_traecn_file(path: &Path) -> Vec<UnifiedMessage> {
             cache_read,
             cache_write,
             cache_write_1h: 0,
-            reasoning,
+            reasoning: 0,
         };
         if tokens.total() <= 0 {
             continue;
@@ -430,11 +439,16 @@ mod tests {
         let msgs = parse_traecn_file(&path);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].model_id, "auto");
-        // tokscale TokenBreakdown::total() is input+output+cache_read
-        // +cache_write+reasoning, not the TRAE CN official total_tokens
-        // which already subsumes cache. The sum is 2000+1000+1500+0+50.
-        assert_eq!(msgs[0].tokens.total(), 4550);
-        assert_eq!(msgs[0].tokens.reasoning, 50);
+        // TRAE CN's prompt_tokens (2000) is cache-inclusive: it already
+        // contains cache_read (1500). tokscale's total() sums
+        // input+output+cache_read+cache_write+reasoning, so the fresh input
+        // is split out (2000-1500=500) and total() reconstructs the billed
+        // total_tokens (3000) exactly.
+        assert_eq!(msgs[0].tokens.input, 500);
+        assert_eq!(msgs[0].tokens.output, 1000);
+        assert_eq!(msgs[0].tokens.cache_read, 1500);
+        assert_eq!(msgs[0].tokens.reasoning, 0);
+        assert_eq!(msgs[0].tokens.total(), 3000);
         assert_eq!(msgs[0].timestamp, 1_765_400_000_000);
         assert_eq!(msgs[0].session_title.as_deref(), Some("auto-test"));
     }
@@ -510,6 +524,40 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].timestamp, 1_765_400_000_510);
         assert_eq!(msgs[0].tokens.cache_read, 100);
+        // prompt_tokens is cache-inclusive, so total() must still reconstruct
+        // the billed total (1200), not 1300 from double-counting the cache.
+        assert_eq!(msgs[0].tokens.input, 800);
+        assert_eq!(msgs[0].tokens.total(), 1200);
+    }
+
+    #[test]
+    fn cache_inclusive_prompt_is_split_into_fresh_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task-cache.jsonl");
+        write_lines(
+            &path,
+            &[
+                &ev(
+                    "metadata",
+                    r#"{"created_at":1765400000,"model_smart_selection_meta":{"mode":"auto","config_name":""},"user_message_context":{"model_info":{"model_name":"","config_name":"","display_model_name":null}}}"#,
+                ),
+                // prompt=42462 already contains cache_read=5504. Fresh input
+                // is 42462-5504 = 36958, and total() == total_tokens == 42983.
+                &ev(
+                    "token_usage",
+                    r#"{"total_tokens":42983,"prompt_tokens":42462,"completion_tokens":521,"cache_read_input_tokens":5504,"cache_creation_input_tokens":0,"reasoning_tokens":389}"#,
+                ),
+            ],
+        );
+        let msgs = parse_traecn_file(&path);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].tokens.input, 36958);
+        assert_eq!(msgs[0].tokens.cache_read, 5504);
+        // reasoning stays inside completion and is reported as 0 so total()
+        // reconstructs the billed total_tokens exactly.
+        assert_eq!(msgs[0].tokens.reasoning, 0);
+        assert_eq!(msgs[0].tokens.output, 521);
+        assert_eq!(msgs[0].tokens.total(), 42983);
     }
 
     #[test]
