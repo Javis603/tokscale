@@ -81,6 +81,9 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     // uppercase) and `m`/`M`, `i`/`I` are too, so `T` takes the next free
     // letter from "misTral".
     ClientUi { hotkey: 'T' },
+    // TRAE CN: `c`/`C` are taken (Crush) and `t`/`T` too, so `J` is the next
+    // free letter.
+    ClientUi { hotkey: 'J' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

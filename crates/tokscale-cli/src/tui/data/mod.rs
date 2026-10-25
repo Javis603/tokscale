@@ -2456,6 +2456,7 @@ mod tests {
             "Antigravity IDE Extension",
             "Aside",
             "Mistral Vibe",
+            "TRAE CN",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
