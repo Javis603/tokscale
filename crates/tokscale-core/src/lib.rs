@@ -4282,6 +4282,21 @@ fn parse_all_messages_streaming<S: MessageSink>(
         sessions::vibe::parse_vibe_file,
     );
 
+    // TRAE CN writes plain hub_event_cache JSONL streams under
+    // `~/.trae-cn/hub_event_cache/TraeCode/<install>/<task>.jsonl`.
+    // Every `token_usage` event in the stream carries authoritative
+    // token counts; pricing is the only cost source because TRAE CN
+    // bills by credits and never emits USD totals.
+    parse_cached_lane_deduped(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        price_window,
+        &mut all_messages,
+        ClientId::TraeCn,
+        token_monitor::traecn::parse_traecn_file,
+    );
+
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
     let zcode_messages: Vec<UnifiedMessage> = scan_result

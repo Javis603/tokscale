@@ -28,6 +28,7 @@ mod js;
 mod mcode;
 mod proma;
 mod qodercn;
+pub(crate) mod traecn;
 
 use crate::sessions::UnifiedMessage;
 use crate::{ClientCounts, ClientId};

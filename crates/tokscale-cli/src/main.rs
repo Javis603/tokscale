@@ -1210,6 +1210,8 @@ pub enum ClientFilter {
     AntigravityExtension,
     Aside,
     Vibe,
+    #[value(name = "traecn")]
+    TraeCn,
     Synthetic,
 }
 
@@ -1278,6 +1280,7 @@ impl ClientFilter {
             Self::Muse => "muse",
             Self::Aside => "aside",
             Self::Vibe => "vibe",
+            Self::TraeCn => "traecn",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1349,6 +1352,7 @@ impl ClientFilter {
             Self::Muse => Some(ClientId::Muse),
             Self::Aside => Some(ClientId::Aside),
             Self::Vibe => Some(ClientId::Vibe),
+            Self::TraeCn => Some(ClientId::TraeCn),
             Self::Synthetic => None,
         }
     }
@@ -1416,6 +1420,7 @@ impl ClientFilter {
             ClientId::Muse => Self::Muse,
             ClientId::Aside => Self::Aside,
             ClientId::Vibe => Self::Vibe,
+            ClientId::TraeCn => Self::TraeCn,
         }
     }
 
