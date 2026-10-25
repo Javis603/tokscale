@@ -4294,7 +4294,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         price_window,
         &mut all_messages,
         ClientId::TraeCn,
-        sessions::traecn::parse_traecn_file,
+        token_monitor::traecn::parse_traecn_file,
     );
 
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
