@@ -92,6 +92,12 @@ pub struct CrushDbSource {
 #[derive(Debug)]
 pub struct ScanResult {
     pub files: [Vec<PathBuf>; ClientId::COUNT],
+    /// Roots actually selected for Claude scanning, including empty roots.
+    pub claude_scan_roots: Vec<PathBuf>,
+    /// Paths whose traversal failed; absence beneath these is not deletion.
+    pub claude_failed_paths: Vec<PathBuf>,
+    /// Alias and canonical pairs learned only from actively scanned roots.
+    pub claude_root_aliases: Vec<(PathBuf, PathBuf)>,
     /// All OpenCode SQLite databases discovered under the data dir.
     ///
     /// Includes the default `opencode.db` (used by `latest`/`beta` channels
@@ -141,6 +147,9 @@ impl Default for ScanResult {
     fn default() -> Self {
         Self {
             files: std::array::from_fn(|_| Vec::new()),
+            claude_scan_roots: Vec::new(),
+            claude_failed_paths: Vec::new(),
+            claude_root_aliases: Vec::new(),
             opencode_dbs: Vec::new(),
             copilot_desktop_db: None,
             copilot_session_store_db: None,
@@ -488,9 +497,16 @@ fn scan_aside_accounts(root: &Path) -> Vec<PathBuf> {
 
 /// Scan a single directory for session files
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
-    if !std::path::Path::new(root).exists() {
-        return Vec::new();
+    scan_directory_with_failures(root, pattern).0
+}
+
+fn scan_directory_with_failures(root: &str, pattern: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    match Path::new(root).try_exists() {
+        Ok(false) => return (Vec::new(), Vec::new()),
+        Err(_) => return (Vec::new(), vec![PathBuf::from(root)]),
+        Ok(true) => {}
     }
+    let failures = std::cell::RefCell::new(Vec::new());
 
     // #1153: `~/.config/Code/logs` can hold tens of thousands of entries
     // (34,598 measured) from many extensions. The `codebuddy-extension-log`
@@ -521,7 +537,20 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 || e.file_name()
                     .eq_ignore_ascii_case("Tencent-Cloud.coding-copilot")
         })
-        .filter_map(|e| e.ok())
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                if !error
+                    .io_error()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    failures
+                        .borrow_mut()
+                        .push(error.path().unwrap_or(Path::new(root)).to_path_buf());
+                }
+                None
+            }
+        })
         .filter(|e| {
             let path = e.path();
             // WalkDir already knows the entry type from the directory read, so
@@ -529,7 +558,17 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
             // stat() per file (warm scans over huge trees were stat-bound).
             // Symlinks still fall back to a following stat to preserve behavior.
             let file_type = e.file_type();
-            let is_file = file_type.is_file() || (file_type.is_symlink() && path.is_file());
+            let is_file = file_type.is_file()
+                || (file_type.is_symlink()
+                    && match path.metadata() {
+                        Ok(metadata) => metadata.is_file(),
+                        Err(error) => {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                failures.borrow_mut().push(path.to_path_buf());
+                            }
+                            false
+                        }
+                    });
             if !is_file {
                 return false;
             }
@@ -771,7 +810,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
     // requirement for PathBuf) and avoids allocation. Note: ordering is byte-lexical,
     // not case-normalized (known Windows/macOS caveat for mixed-case paths).
     paths.sort_unstable();
-    paths
+    (paths, failures.into_inner())
 }
 
 /// Parse a `TOKSCALE_EXTRA_DIRS`-formatted string into (ClientId, path) pairs.
@@ -3057,28 +3096,29 @@ fn scan_all_clients_with_env_strategy_inner(
                 // Aside needs a layout- and symlink-aware walk that no
                 // `scan_directory` pattern can express; see
                 // `scan_aside_accounts` for why its declared pattern is inert.
-                let files = if client_id == ClientId::Aside {
-                    scan_aside_accounts(Path::new(&path))
+                let (files, failures) = if client_id == ClientId::Aside {
+                    (scan_aside_accounts(Path::new(&path)), Vec::new())
                 } else {
-                    scan_directory(&path, pattern)
+                    scan_directory_with_failures(&path, pattern)
                 };
-                (client_id, path, files)
+                (client_id, path, files, failures)
             })
             .collect()
     };
     let scan_workers = std::thread::available_parallelism()
         .map_or(2, |cores| cores.get().min(SCAN_WORKER_CEILING));
-    let scan_results: Vec<(ClientId, String, Vec<PathBuf>)> = match rayon::ThreadPoolBuilder::new()
-        .num_threads(scan_workers)
-        .thread_name(|i| format!("tokscale-scan-{i}"))
-        .build()
-    {
-        Ok(pool) => pool.install(|| scan(tasks)),
-        // A pool that will not build is not worth failing the scan over. The
-        // global pool still produces correct results, just with the contention
-        // this cap exists to avoid.
-        Err(_) => scan(tasks),
-    };
+    let scan_results: Vec<(ClientId, String, Vec<PathBuf>, Vec<PathBuf>)> =
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(scan_workers)
+            .thread_name(|i| format!("tokscale-scan-{i}"))
+            .build()
+        {
+            Ok(pool) => pool.install(|| scan(tasks)),
+            // A pool that will not build is not worth failing the scan over. The
+            // global pool still produces correct results, just with the contention
+            // this cap exists to avoid.
+            Err(_) => scan(tasks),
+        };
 
     // Aggregate results, deduplicating canonical file paths across overlapping
     // roots while preserving one copy per client. Cherry Studio's V1 and V2
@@ -3086,7 +3126,28 @@ fn scan_all_clients_with_env_strategy_inner(
     // its path selection until V2 can win over a V1 counterpart.
     let mut seen: HashSet<(ClientId, PathBuf)> = HashSet::new();
     let mut cherry_files: Vec<(bool, String, PathBuf)> = Vec::new();
-    for (client_id, root, files) in scan_results {
+    for (client_id, root, files, failures) in scan_results {
+        if client_id == ClientId::Claude {
+            let root = PathBuf::from(&root);
+            if let Ok(canonical) = std::fs::canonicalize(&root) {
+                result
+                    .claude_failed_paths
+                    .extend(failures.iter().filter_map(|failed| {
+                        failed
+                            .strip_prefix(&root)
+                            .ok()
+                            .map(|relative| canonical.join(relative))
+                    }));
+                if canonical != root {
+                    result
+                        .claude_root_aliases
+                        .push((root.clone(), canonical.clone()));
+                }
+                result.claude_scan_roots.push(canonical);
+            }
+            result.claude_scan_roots.push(root);
+            result.claude_failed_paths.extend(failures);
+        }
         for file in files {
             if client_id == ClientId::CherryStudio {
                 let is_v2 = is_cherrystudio_v2_root(Path::new(&root));
