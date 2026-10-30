@@ -2437,7 +2437,32 @@ pub(crate) fn parse_codex_file_incremental(
             }
         };
 
-        let mut decoder = match zstd::stream::read::Decoder::new(file) {
+        let archive_limit = archive_limit_for_path(path);
+        let mut reader = BufReader::with_capacity(zstd::zstd_safe::DCtx::in_size(), file);
+        let declared_size = match reader.fill_buf() {
+            Ok(header) => zstd::zstd_safe::get_frame_content_size(header)
+                .ok()
+                .flatten(),
+            Err(error) => {
+                return failed_codex_parse(
+                    state,
+                    0,
+                    Some(CodexArchiveFailure::decode(path, error)),
+                );
+            }
+        };
+        // A first frame that already declares too much output cannot fit the
+        // archive limit. Unknown sizes still need the streaming bound below,
+        // as do additional frames after an acceptable first frame.
+        if declared_size.is_some_and(|size| size > archive_limit) {
+            return failed_codex_parse(
+                state,
+                0,
+                Some(CodexArchiveFailure::decoded_size_limit(path, archive_limit)),
+            );
+        }
+
+        let mut decoder = match zstd::stream::read::Decoder::with_buffer(reader) {
             Ok(decoder) => decoder,
             Err(error) => {
                 return failed_codex_parse(
@@ -2451,7 +2476,6 @@ pub(crate) fn parse_codex_file_incremental(
             return failed_codex_parse(state, 0, Some(CodexArchiveFailure::decode(path, error)));
         }
 
-        let archive_limit = archive_limit_for_path(path);
         let reader = BufReader::new(decoder.take(archive_limit.saturating_add(1)));
         let mut parsed = parse_codex_reader_with_record_limit(
             reader,
@@ -5724,6 +5748,148 @@ mod tests {
         r#""cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"#,
         r#""cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
     );
+
+    fn compressed_frame_with_declared_size(content: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder
+            .set_pledged_src_size(Some(content.len() as u64))
+            .unwrap();
+        encoder.include_contentsize(true).unwrap();
+        encoder.write_all(content).unwrap();
+        let bytes = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&bytes).unwrap(),
+            Some(content.len() as u64)
+        );
+        bytes
+    }
+
+    #[test]
+    fn declared_oversized_archive_is_rejected_before_decoding() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("declared-oversized.jsonl.zst");
+        let content = format!("{COMPRESSED_TURN_CONTEXT}\n{COMPRESSED_USAGE}\n");
+        std::fs::write(
+            &path,
+            compressed_frame_with_declared_size(content.as_bytes()),
+        )
+        .unwrap();
+        let limit = content.len() as u64 - 1;
+        let _limit = register_archive_limit_override(&path, limit);
+
+        let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+
+        assert!(!parsed.parse_succeeded);
+        assert!(parsed.messages.is_empty());
+        assert_eq!(
+            parsed.consumed_offset, 0,
+            "known-oversized input must not be decoded"
+        );
+        assert_eq!(
+            parsed.archive_failure.unwrap().cause,
+            CodexArchiveFailureCause::DecodedSizeLimit { limit_bytes: limit }
+        );
+    }
+
+    #[test]
+    fn declared_archive_size_at_limit_preserves_usage() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("declared-exact-limit.jsonl.zst");
+        let content = format!("{COMPRESSED_TURN_CONTEXT}\n{COMPRESSED_USAGE}\n");
+        std::fs::write(
+            &path,
+            compressed_frame_with_declared_size(content.as_bytes()),
+        )
+        .unwrap();
+        let _limit = register_archive_limit_override(&path, content.len() as u64);
+
+        let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+
+        assert!(parsed.parse_succeeded);
+        assert!(parsed.archive_failure.is_none());
+        assert_eq!(parsed.consumed_offset, content.len() as u64);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].tokens.total(), 160);
+    }
+
+    #[test]
+    fn unknown_archive_size_keeps_streaming_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("unknown-size.jsonl.zst");
+        let content = format!("{COMPRESSED_TURN_CONTEXT}\n{COMPRESSED_USAGE}\n");
+        let bytes = zstd::encode_all(content.as_bytes(), 0).unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&bytes).unwrap(),
+            None
+        );
+        std::fs::write(&path, bytes).unwrap();
+        let limit = content.len() as u64 - 1;
+        let _limit = register_archive_limit_override(&path, limit);
+
+        let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+
+        assert!(!parsed.parse_succeeded);
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.consumed_offset > limit);
+        assert_eq!(
+            parsed.archive_failure.unwrap().cause,
+            CodexArchiveFailureCause::DecodedSizeLimit { limit_bytes: limit }
+        );
+    }
+
+    #[test]
+    fn declared_first_frame_does_not_bypass_concatenated_archive_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("concatenated-declared.jsonl.zst");
+        let first = format!("{COMPRESSED_TURN_CONTEXT}\n");
+        let second = format!("{COMPRESSED_USAGE}\n");
+        let mut bytes = compressed_frame_with_declared_size(first.as_bytes());
+        bytes.extend(compressed_frame_with_declared_size(second.as_bytes()));
+        std::fs::write(&path, bytes).unwrap();
+        let total = (first.len() + second.len()) as u64;
+        {
+            let limit = total - 1;
+            assert!(first.len() as u64 <= limit);
+            let _limit = register_archive_limit_override(&path, limit);
+            let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+            assert!(!parsed.parse_succeeded);
+            assert!(parsed.messages.is_empty());
+            assert!(parsed.consumed_offset > limit);
+            assert_eq!(
+                parsed.archive_failure.unwrap().cause,
+                CodexArchiveFailureCause::DecodedSizeLimit { limit_bytes: limit }
+            );
+        }
+        let _limit = register_archive_limit_override(&path, total);
+        let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+        assert!(parsed.parse_succeeded);
+        assert!(parsed.archive_failure.is_none());
+        assert_eq!(parsed.consumed_offset, total);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].tokens.total(), 160);
+    }
+
+    #[test]
+    fn declared_size_does_not_accept_truncated_archive() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("declared-truncated.jsonl.zst");
+        let content = format!("{COMPRESSED_TURN_CONTEXT}\n{COMPRESSED_USAGE}\n");
+        let mut bytes = compressed_frame_with_declared_size(content.as_bytes());
+        bytes.pop();
+        std::fs::write(&path, bytes).unwrap();
+        let _limit = register_archive_limit_override(&path, content.len() as u64);
+
+        let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+
+        assert!(!parsed.parse_succeeded);
+        assert!(parsed.messages.is_empty());
+        assert!(matches!(
+            parsed.archive_failure.unwrap().cause,
+            CodexArchiveFailureCause::Decode { .. }
+        ));
+    }
 
     #[test]
     fn compressed_archive_accepts_aggregate_input_above_simulated_legacy_limit() {
