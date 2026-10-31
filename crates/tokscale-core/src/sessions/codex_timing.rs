@@ -28,10 +28,21 @@ impl CodexRequestTiming {
         timestamp: Option<&str>,
         payload: &CodexPayload,
     ) {
+        let kind = payload.payload_type.as_deref().unwrap_or("");
+        let model_output = entry_type == "response_item"
+            && (kind == "reasoning"
+                || kind.ends_with("_call")
+                || kind == "message"
+                    && payload.role.as_ref().and_then(serde_json::Value::as_str)
+                        == Some("assistant"));
         let Some(at) = super::codex::parse_codex_entry_timestamp(timestamp) else {
+            // Content evidence does not require a clock. An untimed tool call
+            // must still prevent a later empty message from hiding its sample.
+            if model_output {
+                self.observe_output_content(kind, payload);
+            }
             return;
         };
-        let kind = payload.payload_type.as_deref().unwrap_or("");
         match entry_type {
             "turn_context" => self.reset(Some(at)),
             "token_usage_record" => {
@@ -56,13 +67,7 @@ impl CodexRequestTiming {
                     self.tool_result_after_output_ms = Some(at);
                 }
             }
-            "response_item"
-                if kind == "reasoning"
-                    || kind.ends_with("_call")
-                    || kind == "message"
-                        && payload.role.as_ref().and_then(serde_json::Value::as_str)
-                            == Some("assistant") =>
-            {
+            "response_item" if model_output => {
                 // Some old versions flush the previous response's items just
                 // after token_count. They cannot anchor the next request.
                 if self.request_start_ms.is_none()
@@ -76,23 +81,7 @@ impl CodexRequestTiming {
                 if self.request_start_ms.is_none() {
                     self.request_start_ms = self.boundary_ms;
                 }
-                let empty_message = kind == "message"
-                    && payload
-                        .content
-                        .as_ref()
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|parts| {
-                            parts.iter().all(|part| {
-                                part.get("type").and_then(serde_json::Value::as_str)
-                                    == Some("output_text")
-                                    && part
-                                        .get("text")
-                                        .and_then(serde_json::Value::as_str)
-                                        .is_some_and(str::is_empty)
-                            })
-                        });
-                self.only_empty_messages =
-                    Some(self.only_empty_messages.unwrap_or(true) && empty_message);
+                self.observe_output_content(kind, payload);
                 self.model_end_ms = Some(at);
                 self.tool_result_after_output_ms = None;
             }
@@ -101,6 +90,24 @@ impl CodexRequestTiming {
             }
             _ => {}
         }
+    }
+
+    fn observe_output_content(&mut self, kind: &str, payload: &CodexPayload) {
+        let empty_message = kind == "message"
+            && payload
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().all(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("output_text")
+                            && part
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(str::is_empty)
+                    })
+                });
+        self.only_empty_messages = Some(self.only_empty_messages.unwrap_or(true) && empty_message);
     }
 
     fn reset(&mut self, boundary_ms: Option<i64>) {
@@ -431,6 +438,34 @@ mod tests {
             let messages = parse_codex_file(file.path());
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].performance_duration_ms(), Some(7_000));
+        }
+    }
+
+    #[test]
+    fn output_without_timestamp_is_not_misclassified_as_an_empty_completion() {
+        for timestamp in [None, Some("invalid")] {
+            for item in [
+                json!({"type":"function_call","call_id":"a"}),
+                json!({"type":"reasoning"}),
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}),
+            ] {
+                let mut untimed = json!({"type":"response_item","payload":item});
+                if let Some(timestamp) = timestamp {
+                    untimed["timestamp"] = json!(timestamp);
+                }
+                let mut file = NamedTempFile::new().unwrap();
+                writeln!(file, "{}", [
+                    row(0, "turn_context", json!({"model":"gpt-5.4"})),
+                    untimed.to_string(),
+                    row(7, "response_item", json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]})),
+                    row(7, "token_usage_record", json!({"usage":usage(4)})),
+                    count(7, 4, 4),
+                ].join("\n")).unwrap();
+                let messages = parse_codex_file(file.path());
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].tokens.output, 4);
+                assert_eq!(messages[0].performance_duration_ms(), Some(7_000));
+            }
         }
     }
 
