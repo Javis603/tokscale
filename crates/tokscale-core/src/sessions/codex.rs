@@ -65,6 +65,9 @@ pub struct CodexPayload {
     #[serde(rename = "type")]
     pub payload_type: Option<String>,
     pub role: Option<Value>,
+    /// Response-message content, used to distinguish explicit empty completions
+    /// from generation samples. Missing legacy content stays unknown.
+    pub content: Option<Value>,
     pub model: Option<String>,
     pub model_name: Option<String>,
     pub model_info: Option<CodexModelInfo>,
@@ -195,6 +198,10 @@ pub(crate) struct CodexTotals {
 }
 
 impl CodexTotals {
+    pub(super) fn has_reasoning(self) -> bool {
+        self.reasoning > 0
+    }
+
     pub(super) fn from_usage(usage: &CodexTokenUsage) -> Self {
         Self {
             input: usage.input_tokens.unwrap_or(0).max(0),
@@ -1763,8 +1770,11 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         .clone()
                         .or_else(|| state.thread_service_tier.clone());
                     message.duration_ms = duration_ms;
-                    message.performance_timing =
-                        Some(state.request_timing.finish(parsed_timestamp, last_usage));
+                    message.performance_timing = Some(state.request_timing.finish(
+                        parsed_timestamp,
+                        last_usage,
+                        emitted_usage,
+                    ));
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under
                     // way: a `turn_context` without an id that comes later
