@@ -44,21 +44,20 @@ impl CodexRequestTiming {
             return;
         };
         match entry_type {
-            "turn_context" => self.reset(Some(at)),
+            "turn_context" => self.start_turn(at),
             "token_usage_record" => {
                 self.usage_record = payload
                     .usage
                     .as_ref()
                     .map(|usage| (at, CodexTotals::from_usage(usage)));
             }
-            "event_msg" if kind == "task_started" || kind == "turn_aborted" => {
-                self.reset(Some(at));
-            }
+            "event_msg" if kind == "task_started" => self.start_turn(at),
+            "event_msg" if kind == "turn_aborted" => self.reset(Some(at)),
             "event_msg"
                 if kind == "user_message"
                     && super::codex::codex_message_is_human_turn(payload.message.as_deref()) =>
             {
-                self.reset(Some(at));
+                self.start_turn(at);
             }
             "event_msg" if kind == "task_complete" => self.reset(None),
             "response_item" if kind.ends_with("_output") => {
@@ -108,6 +107,13 @@ impl CodexRequestTiming {
                     })
                 });
         self.only_empty_messages = Some(self.only_empty_messages.unwrap_or(true) && empty_message);
+    }
+
+    fn start_turn(&mut self, at: i64) {
+        self.reset(Some(at));
+        // Only an actual new turn supersedes the preceding response's flush
+        // window. Terminal events still need to reject late old output.
+        self.last_count_ms = None;
     }
 
     fn reset(&mut self, boundary_ms: Option<i64>) {
@@ -200,6 +206,149 @@ mod tests {
         )
     }
 
+    fn row_millis(milliseconds: i64, kind: &str, payload: Value) -> String {
+        let mut value: Value =
+            serde_json::from_str(&row(milliseconds / 1000, kind, payload)).unwrap();
+        value["timestamp"] = json!(format!(
+            "2040-01-01T00:00:{:02}.{:03}Z",
+            milliseconds / 1000,
+            milliseconds % 1000
+        ));
+        value.to_string()
+    }
+
+    fn assert_incremental_matches(file: &NamedTempFile) {
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        for split in 1..raw.lines().count() {
+            let mut partial = NamedTempFile::new().unwrap();
+            let first = raw.lines().take(split).collect::<Vec<_>>().join("\n") + "\n";
+            write!(partial, "{first}").unwrap();
+            let initial =
+                parse_codex_file_incremental(partial.path(), 0, CodexParseState::default());
+            let state = bincode::deserialize(&bincode::serialize(&initial.state).unwrap()).unwrap();
+            writeln!(
+                partial,
+                "{}",
+                raw.lines().skip(split).collect::<Vec<_>>().join("\n")
+            )
+            .unwrap();
+            let appended = parse_codex_file_incremental(partial.path(), first.len() as u64, state);
+            let mut combined = initial.messages;
+            combined.extend(appended.messages);
+            assert_eq!(
+                combined,
+                parse_codex_file(partial.path()),
+                "split at line {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_turn_keeps_output_inside_previous_counts_flush_window() {
+        for boundary in [
+            row_millis(2010, "turn_context", json!({"model":"gpt-5.4"})),
+            row_millis(2010, "event_msg", json!({"type":"task_started"})),
+            row_millis(
+                2010,
+                "event_msg",
+                json!({"type":"user_message","message":"next"}),
+            ),
+        ] {
+            for gap in [20, 100, 101] {
+                for item in [
+                    json!({"type":"function_call","call_id":"next"}),
+                    json!({"type":"reasoning"}),
+                    json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}),
+                ] {
+                    let mut file = NamedTempFile::new().unwrap();
+                    let rows = [
+                        row(0, "turn_context", json!({"model":"gpt-5.4"})),
+                        call(1, "first"),
+                        row(2, "token_usage_record", json!({"usage":usage(100)})),
+                        count(2, 100, 100),
+                        boundary.clone(),
+                        row_millis(2000 + gap, "response_item", item),
+                        row(
+                            3,
+                            "response_item",
+                            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]}),
+                        ),
+                        row(3, "token_usage_record", json!({"usage":usage(4)})),
+                        row(
+                            3,
+                            "event_msg",
+                            json!({"type":"token_count","info":{
+                                "total_token_usage":{"input_tokens":200,"output_tokens":104},
+                                "last_token_usage":usage(4)
+                            }}),
+                        ),
+                    ];
+                    writeln!(file, "{}", rows.join("\n")).unwrap();
+                    let messages = parse_codex_file(file.path());
+                    assert_eq!(messages.len(), 2);
+                    assert_eq!(messages[1].tokens.output, 4);
+                    assert_eq!(
+                        messages[1].performance_duration_ms(),
+                        Some(990),
+                        "gap {gap}"
+                    );
+                    let entry = &aggregate_model_usage_entries(messages, &GroupBy::ClientModel)[0];
+                    assert_eq!(entry.output, 104);
+                    assert_eq!(entry.performance.timed_output_tokens, 104);
+                    assert_eq!(entry.performance.total_duration_ms, 2990);
+                    assert_incremental_matches(&file);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_flush_without_new_turn_does_not_supply_output_evidence() {
+        for terminal in [
+            None,
+            Some(row_millis(
+                2010,
+                "event_msg",
+                json!({"type":"turn_aborted"}),
+            )),
+            Some(row_millis(
+                2010,
+                "event_msg",
+                json!({"type":"task_complete"}),
+            )),
+        ] {
+            for gap in [0, 20, 100] {
+                let mut file = NamedTempFile::new().unwrap();
+                let mut rows = vec![
+                    row(0, "turn_context", json!({"model":"gpt-5.4"})),
+                    call(1, "first"),
+                    row(2, "token_usage_record", json!({"usage":usage(100)})),
+                    count(2, 100, 100),
+                ];
+                rows.extend(terminal.clone());
+                rows.extend([
+                    row_millis(2000 + gap, "response_item", json!({"type":"function_call","call_id":"old"})),
+                    row(3, "response_item", json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]})),
+                    row(3, "token_usage_record", json!({"usage":usage(4)})),
+                    row(3, "event_msg", json!({"type":"token_count","info":{
+                        "total_token_usage":{"input_tokens":200,"output_tokens":104},
+                        "last_token_usage":usage(4)
+                    }})),
+                ]);
+                writeln!(file, "{}", rows.join("\n")).unwrap();
+                let messages = parse_codex_file(file.path());
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[1].tokens.output, 4);
+                assert_eq!(messages[1].performance_duration_ms(), None);
+                let entry = &aggregate_model_usage_entries(messages, &GroupBy::ClientModel)[0];
+                assert_eq!(entry.output, 104);
+                assert_eq!(entry.performance.timed_output_tokens, 100);
+                assert_eq!(entry.performance.total_duration_ms, 2000);
+                assert_incremental_matches(&file);
+            }
+        }
+    }
+
     fn call(seconds: i64, id: &str) -> String {
         row(
             seconds,
@@ -288,30 +437,7 @@ mod tests {
 
     #[test]
     fn incremental_timing_survives_serialized_state_before_tool_completion() {
-        let file = fixture(15, true);
-        let raw = std::fs::read_to_string(file.path()).unwrap();
-        for split in 1..raw.lines().count() {
-            let mut partial = NamedTempFile::new().unwrap();
-            let first = raw.lines().take(split).collect::<Vec<_>>().join("\n") + "\n";
-            write!(partial, "{first}").unwrap();
-            let initial =
-                parse_codex_file_incremental(partial.path(), 0, CodexParseState::default());
-            let state = bincode::deserialize(&bincode::serialize(&initial.state).unwrap()).unwrap();
-            writeln!(
-                partial,
-                "{}",
-                raw.lines().skip(split).collect::<Vec<_>>().join("\n")
-            )
-            .unwrap();
-            let appended = parse_codex_file_incremental(partial.path(), first.len() as u64, state);
-            let mut combined = initial.messages;
-            combined.extend(appended.messages);
-            assert_eq!(
-                combined,
-                parse_codex_file(partial.path()),
-                "split at line {split}"
-            );
-        }
+        assert_incremental_matches(&fixture(15, true));
     }
 
     #[test]
