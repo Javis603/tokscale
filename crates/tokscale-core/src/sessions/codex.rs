@@ -1771,8 +1771,11 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         .clone()
                         .or_else(|| state.thread_service_tier.clone());
                     message.duration_ms = duration_ms;
-                    message.performance_timing =
-                        Some(state.request_timing.finish(parsed_timestamp, last_usage));
+                    message.performance_timing = Some(state.request_timing.finish(
+                        parsed_timestamp,
+                        last_usage,
+                        emitted_usage,
+                    ));
                     // The raw parent thread id; reports and the TUI resolve it
                     // to a surviving parent rollout after their own filtering.
                     message.parent_session_id = state.session_parent_thread_id.clone();

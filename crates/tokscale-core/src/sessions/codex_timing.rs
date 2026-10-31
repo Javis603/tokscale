@@ -128,6 +128,7 @@ impl CodexRequestTiming {
         &mut self,
         count_ms: Option<i64>,
         last_usage: Option<CodexTotals>,
+        emitted_usage: CodexTotals,
     ) -> PerformanceTiming {
         let start = self.request_start_ms.or(self.boundary_ms);
         let end = match self.usage_record {
@@ -161,8 +162,8 @@ impl CodexRequestTiming {
         // Keep that accounting, but do not replace a useful generation-speed
         // sample with its mostly-waiting request. Reasoning and tool-only
         // responses remain generation even without visible assistant text.
-        let empty_completion = self.only_empty_messages == Some(true)
-            && last_usage.is_some_and(|usage| !usage.has_reasoning());
+        let empty_completion =
+            self.only_empty_messages == Some(true) && !emitted_usage.has_reasoning();
         self.reset(next_boundary);
         self.last_count_ms = self.last_count_ms.max(count_ms);
         if empty_completion {
@@ -515,6 +516,95 @@ mod tests {
     }
 
     #[test]
+    fn total_only_empty_completion_uses_emitted_reasoning() {
+        for prior_reasoning in [0, 25] {
+            for emitted_reasoning in [0, 2] {
+                for content in [json!([]), json!([{"type":"output_text","text":""}])] {
+                    let mut file = NamedTempFile::new().unwrap();
+                    let rows = [
+                        row(0, "turn_context", json!({"model":"gpt-5.4"})),
+                        call(2, "first"),
+                        row(
+                            2,
+                            "event_msg",
+                            json!({"type":"token_count","info":{
+                                "total_token_usage":{"input_tokens":100,"output_tokens":100,"reasoning_output_tokens":prior_reasoning}
+                            }}),
+                        ),
+                        row(
+                            8,
+                            "response_item",
+                            json!({"type":"message","role":"assistant","content":content}),
+                        ),
+                        row(
+                            8,
+                            "event_msg",
+                            json!({"type":"token_count","info":{
+                                "total_token_usage":{"input_tokens":200,"output_tokens":104,"reasoning_output_tokens":prior_reasoning + emitted_reasoning}
+                            }}),
+                        ),
+                    ];
+                    writeln!(file, "{}", rows.join("\n")).unwrap();
+                    let messages = parse_codex_file(file.path());
+                    assert_eq!(messages.len(), 2);
+                    assert_eq!(messages[1].tokens.output, 4 - emitted_reasoning);
+                    assert_eq!(messages[1].tokens.reasoning, emitted_reasoning);
+                    assert_eq!(
+                        messages[1].performance_duration_ms(),
+                        (emitted_reasoning > 0).then_some(6000)
+                    );
+                    let entry = &aggregate_model_usage_entries(messages, &GroupBy::ClientModel)[0];
+                    assert_eq!(entry.output + entry.reasoning, 104);
+                    assert_eq!(
+                        entry.performance.sample_count,
+                        if emitted_reasoning > 0 { 2 } else { 1 }
+                    );
+                    assert_eq!(
+                        entry.performance.timed_reasoning_tokens,
+                        prior_reasoning + emitted_reasoning
+                    );
+                    assert_incremental_matches(&file);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn total_only_delta_does_not_pair_an_unmatched_usage_record() {
+        let mut file = NamedTempFile::new().unwrap();
+        let rows = [
+            row(0, "turn_context", json!({"model":"gpt-5.4"})),
+            call(2, "first"),
+            row(
+                2,
+                "event_msg",
+                json!({"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":100,"output_tokens":100}
+                }}),
+            ),
+            row(
+                8,
+                "response_item",
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}),
+            ),
+            row(8, "token_usage_record", json!({"usage":usage(4)})),
+            row(
+                8,
+                "event_msg",
+                json!({"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":200,"output_tokens":104}
+                }}),
+            ),
+        ];
+        writeln!(file, "{}", rows.join("\n")).unwrap();
+        let messages = parse_codex_file(file.path());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].tokens.output, 4);
+        assert_eq!(messages[1].performance_duration_ms(), None);
+        assert_incremental_matches(&file);
+    }
+
+    #[test]
     fn short_or_nontext_generation_is_not_filtered_by_its_rate() {
         let empty = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]});
         let cases = [
@@ -641,7 +731,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                timing.finish(Some(1000 + end), None),
+                timing.finish(Some(1000 + end), None, CodexTotals::default()),
                 PerformanceTiming::Unavailable
             );
         }
@@ -658,7 +748,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                timing.finish(Some(3000), Some(usage)),
+                timing.finish(Some(3000), Some(usage), usage),
                 PerformanceTiming::Unavailable
             );
         }
