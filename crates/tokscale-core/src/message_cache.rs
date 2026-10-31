@@ -1957,9 +1957,9 @@ fn parser_version(client: ClientId) -> u32 {
         // v20->v21 (downstream): request completion timing and parent-link
         // state join the upstream review-mode state; every older layout reparses.
         // v21->v22: explicit empty completions retain usage but no longer
-        // contribute generation performance; request timing tracks content evidence.
-        // v22->v23: output-content evidence survives missing/invalid timestamps.
-        ClientId::Codex => 23,
+        // contribute generation performance; request timing tracks content evidence
+        // independently of missing/invalid timestamps.
+        ClientId::Codex => 22,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -5326,7 +5326,7 @@ mod tests {
     #[test]
     fn historical_codex_cache_is_stale_before_decoding_old_state() {
         let identity = CacheIdentity::for_client(ClientId::Codex);
-        assert_eq!(identity.parser_version, 23);
+        assert_eq!(identity.parser_version, 22);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("old.bin");
         for bytes in [
@@ -6298,7 +6298,7 @@ mod tests {
         // v21->v22 excludes explicit empty completions from performance.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 23);
+        assert_eq!(parser_version(ClientId::Codex), 22);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -7421,7 +7421,7 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         let cached = warm.get(identity, &source).unwrap();
-        assert_eq!(cached.parser_version, 23);
+        assert_eq!(cached.parser_version, 22);
         assert_eq!(cached.messages, parsed);
     }
 
@@ -7529,8 +7529,8 @@ mod tests {
         let fresh_cache = SourceMessageCache::load();
         let fresh_entry = fresh_cache
             .get(identity, &source)
-            .expect("the production scan must persist a v23 replacement");
-        assert_eq!(fresh_entry.parser_version, 23);
+            .expect("the production scan must persist a v22 replacement");
+        assert_eq!(fresh_entry.parser_version, 22);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
             "the v19 replacement must carry valid incremental metadata"
@@ -7649,8 +7649,8 @@ mod tests {
         let fresh_cache = SourceMessageCache::load();
         let fresh_entry = fresh_cache
             .get(identity, &source)
-            .expect("the production scan must persist a v23 replacement");
-        assert_eq!(fresh_entry.parser_version, 23);
+            .expect("the production scan must persist a v22 replacement");
+        assert_eq!(fresh_entry.parser_version, 22);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
             "the v19 replacement must carry valid incremental metadata"
@@ -7736,13 +7736,13 @@ mod tests {
                 .count()
         };
 
-        // Cold (stale v19 entry rejected) and warm (fresh v23 entry).
+        // Cold (stale v19 entry rejected) and warm (fresh v22 entry).
         for _ in 0..2 {
             assert!(scan().is_empty());
             assert_eq!(missing_usage_warnings(), 0);
         }
         let entry = SourceMessageCache::load().get(identity, &source).unwrap();
-        assert_eq!(entry.parser_version, 23);
+        assert_eq!(entry.parser_version, 22);
         let state = &entry.codex_incremental.as_ref().unwrap().state;
         assert!(state.has_entered_review_mode);
         assert!(!state.has_own_turn_context);
