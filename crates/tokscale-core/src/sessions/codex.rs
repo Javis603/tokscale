@@ -69,6 +69,9 @@ pub struct CodexPayload {
     #[serde(rename = "type")]
     pub payload_type: Option<String>,
     pub role: Option<Value>,
+    /// Response-message content, used to distinguish explicit empty completions
+    /// from generation samples. Missing legacy content stays unknown.
+    pub content: Option<Value>,
     pub model: Option<String>,
     pub model_name: Option<String>,
     pub model_info: Option<CodexModelInfo>,
@@ -194,6 +197,10 @@ pub(crate) struct CodexTotals {
 }
 
 impl CodexTotals {
+    pub(super) fn has_reasoning(self) -> bool {
+        self.reasoning > 0
+    }
+
     pub(super) fn from_usage(usage: &CodexTokenUsage) -> Self {
         Self {
             input: usage.input_tokens.unwrap_or(0).max(0),

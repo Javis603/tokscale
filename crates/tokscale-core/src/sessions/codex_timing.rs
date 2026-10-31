@@ -18,6 +18,7 @@ pub(crate) struct CodexRequestTiming {
     model_end_ms: Option<i64>,
     tool_result_after_output_ms: Option<i64>,
     usage_record: Option<(i64, CodexTotals)>,
+    only_empty_messages: Option<bool>,
 }
 
 impl CodexRequestTiming {
@@ -27,10 +28,21 @@ impl CodexRequestTiming {
         timestamp: Option<&str>,
         payload: &CodexPayload,
     ) {
+        let kind = payload.payload_type.as_deref().unwrap_or("");
+        let model_output = entry_type == "response_item"
+            && (kind == "reasoning"
+                || kind.ends_with("_call")
+                || kind == "message"
+                    && payload.role.as_ref().and_then(serde_json::Value::as_str)
+                        == Some("assistant"));
         let Some(at) = super::codex::parse_codex_entry_timestamp(timestamp) else {
+            // Content evidence does not require a clock. An untimed tool call
+            // must still prevent a later empty message from hiding its sample.
+            if model_output {
+                self.observe_output_content(kind, payload);
+            }
             return;
         };
-        let kind = payload.payload_type.as_deref().unwrap_or("");
         match entry_type {
             "turn_context" => self.reset(Some(at)),
             "token_usage_record" => {
@@ -55,13 +67,7 @@ impl CodexRequestTiming {
                     self.tool_result_after_output_ms = Some(at);
                 }
             }
-            "response_item"
-                if kind == "reasoning"
-                    || kind.ends_with("_call")
-                    || kind == "message"
-                        && payload.role.as_ref().and_then(serde_json::Value::as_str)
-                            == Some("assistant") =>
-            {
+            "response_item" if model_output => {
                 // Some old versions flush the previous response's items just
                 // after token_count. They cannot anchor the next request.
                 if self.request_start_ms.is_none()
@@ -75,6 +81,7 @@ impl CodexRequestTiming {
                 if self.request_start_ms.is_none() {
                     self.request_start_ms = self.boundary_ms;
                 }
+                self.observe_output_content(kind, payload);
                 self.model_end_ms = Some(at);
                 self.tool_result_after_output_ms = None;
             }
@@ -83,6 +90,24 @@ impl CodexRequestTiming {
             }
             _ => {}
         }
+    }
+
+    fn observe_output_content(&mut self, kind: &str, payload: &CodexPayload) {
+        let empty_message = kind == "message"
+            && payload
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().all(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("output_text")
+                            && part
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(str::is_empty)
+                    })
+                });
+        self.only_empty_messages = Some(self.only_empty_messages.unwrap_or(true) && empty_message);
     }
 
     fn reset(&mut self, boundary_ms: Option<i64>) {
@@ -126,8 +151,17 @@ impl CodexRequestTiming {
             }
         };
         let next_boundary = self.boundary_ms.max(count_ms);
+        // Codex can bill a few output tokens for an explicitly empty completion.
+        // Keep that accounting, but do not replace a useful generation-speed
+        // sample with its mostly-waiting request. Reasoning and tool-only
+        // responses remain generation even without visible assistant text.
+        let empty_completion = self.only_empty_messages == Some(true)
+            && last_usage.is_some_and(|usage| !usage.has_reasoning());
         self.reset(next_boundary);
         self.last_count_ms = self.last_count_ms.max(count_ms);
+        if empty_completion {
+            return PerformanceTiming::Unavailable;
+        }
         match start
             .zip(end)
             .and_then(|(start, end)| end.checked_sub(start))
@@ -307,6 +341,132 @@ mod tests {
         assert_eq!(entry.output, 100);
         assert_eq!(entry.performance.timed_output_tokens, 0);
         assert_eq!(entry.performance.total_duration_ms, 0);
+    }
+
+    #[test]
+    fn empty_completion_keeps_usage_but_not_generation_performance() {
+        for content in [json!([]), json!([{"type":"output_text","text":""}])] {
+            let mut file = NamedTempFile::new().unwrap();
+            let rows = [
+                row(0, "turn_context", json!({"model":"gpt-5.4"})),
+                call(2, "a"),
+                count(2, 100, 100),
+                row(
+                    8,
+                    "response_item",
+                    json!({"type":"message","role":"assistant","content":content}),
+                ),
+                row(8, "token_usage_record", json!({"usage":usage(4)})),
+                count(8, 104, 4),
+                call(10, "b"),
+                count(10, 124, 20),
+            ];
+            writeln!(file, "{}", rows.join("\n")).unwrap();
+            let messages = parse_codex_file(file.path());
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[1].tokens.output, 4);
+            assert_eq!(messages[1].duration_ms, Some(6_000));
+            assert_eq!(messages[1].performance_duration_ms(), None);
+            assert_eq!(messages[2].performance_duration_ms(), Some(2_000));
+            let entry = &aggregate_model_usage_entries(messages.clone(), &GroupBy::ClientModel)[0];
+            assert_eq!(entry.output, 124);
+            assert_eq!(entry.performance.timed_output_tokens, 120);
+            assert_eq!(entry.performance.total_duration_ms, 4_000);
+
+            // A watch scan may stop after the empty message, before its usage arrives.
+            let split = rows[..4].join("\n") + "\n";
+            let mut partial = NamedTempFile::new().unwrap();
+            write!(partial, "{split}").unwrap();
+            let initial =
+                parse_codex_file_incremental(partial.path(), 0, CodexParseState::default());
+            let state = bincode::deserialize(&bincode::serialize(&initial.state).unwrap()).unwrap();
+            writeln!(partial, "{}", rows[4..].join("\n")).unwrap();
+            let appended = parse_codex_file_incremental(partial.path(), split.len() as u64, state);
+            let mut combined = initial.messages;
+            combined.extend(appended.messages);
+            assert_eq!(combined, parse_codex_file(partial.path()));
+        }
+    }
+
+    #[test]
+    fn short_or_nontext_generation_is_not_filtered_by_its_rate() {
+        let empty = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]});
+        let cases = [
+            (
+                vec![
+                    json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":" "}]}),
+                ],
+                0,
+            ),
+            (vec![json!({"type":"message","role":"assistant"})], 0),
+            (
+                vec![
+                    json!({"type":"message","role":"assistant","content":[{"type":"output_image"}]}),
+                ],
+                0,
+            ),
+            (
+                vec![json!({"type":"function_call","call_id":"a"}), empty.clone()],
+                0,
+            ),
+            (vec![json!({"type":"reasoning"}), empty.clone()], 0),
+            (vec![empty], 2),
+        ];
+        for (items, reasoning) in cases {
+            let mut file = NamedTempFile::new().unwrap();
+            let mut rows = vec![row(0, "turn_context", json!({"model":"gpt-5.4"}))];
+            for item in items {
+                rows.push(row(7, "response_item", item));
+            }
+            let mut recorded = usage(4);
+            recorded["reasoning_output_tokens"] = json!(reasoning);
+            rows.push(row(7, "token_usage_record", json!({"usage":recorded})));
+            rows.push(row(
+                7,
+                "event_msg",
+                json!({"type":"token_count","info":{
+                    "total_token_usage":recorded,"last_token_usage":recorded
+                }}),
+            ));
+            writeln!(file, "{}", rows.join("\n")).unwrap();
+            let messages = parse_codex_file(file.path());
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].performance_duration_ms(), Some(7_000));
+        }
+    }
+
+    #[test]
+    fn output_without_timestamp_is_not_misclassified_as_an_empty_completion() {
+        for timestamp in [None, Some("invalid")] {
+            for item in [
+                json!({"type":"function_call","call_id":"a"}),
+                json!({"type":"reasoning"}),
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}),
+            ] {
+                let mut untimed = json!({"type":"response_item","payload":item});
+                if let Some(timestamp) = timestamp {
+                    untimed["timestamp"] = json!(timestamp);
+                }
+                let mut file = NamedTempFile::new().unwrap();
+                writeln!(file, "{}", [
+                    row(0, "turn_context", json!({"model":"gpt-5.4"})),
+                    untimed.to_string(),
+                    row(7, "response_item", json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]})),
+                    row(7, "token_usage_record", json!({"usage":usage(4)})),
+                    count(7, 4, 4),
+                ].join("\n")).unwrap();
+                let messages = parse_codex_file(file.path());
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].tokens.output, 4);
+                assert_eq!(messages[0].performance_duration_ms(), Some(7_000));
+            }
+        }
     }
 
     #[test]
