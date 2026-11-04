@@ -10,18 +10,23 @@
 //! calendar days would otherwise land its whole lifetime on its start day
 //! (junhoyeo/tokscale#993). The rotated agent logs beside the database DO carry
 //! one line per API call with a timestamp and the call's token figures, so the
-//! parser splits each row's buckets across the days its logged calls fall in,
+//! parser emits each logged call as its own message on the day it falls in,
 //! grouped in the scan's bucket timezone. The database stays authoritative for
 //! totals: the logs only say WHEN, never HOW MUCH. Only the portion the logs
 //! actually account for is distributed — whatever they cannot account for
 //! (rotated-away calls, or turns that never reach the log) stays on the
-//! session's start day — and a row whose logs over-report its buckets keeps
-//! its whole total on the start day.
+//! session's start day as one residual message — and a row whose logs
+//! over-report its buckets keeps its whole total on the start day.
 //!
-//! The same log lines carry each call's request `latency`, so a day's logged
-//! share reports the sum of its calls' latencies as performance timing. The
-//! residual is never timed and is therefore always its own share, even on a
-//! logged day: merging it would count untimed tokens as timed.
+//! The same log lines carry each call's request `latency`, which times that
+//! call's message. The residual is never timed.
+//!
+//! Estimated cost follows the same split. Full-request tiers (OpenAI 272K,
+//! xAI 200K, Haiku 5.5 100K) are selected per request, so a logged call prices
+//! from its own prompt. The residual and an unsplit row sum an unknown number
+//! of calls, so they price at the base rates like any other multi-call
+//! aggregate (see `UnifiedMessage::pricing_context`). A row Hermes recorded a
+//! non-zero cost for keeps that cost, split by tokens, and is never repriced.
 
 use super::utils::{
     lossy_lines, open_readonly_sqlite, resolved_provider, sqlite_for_each_row_on,
@@ -32,7 +37,7 @@ use crate::bucket_tz::BucketTimezone;
 use crate::TokenBreakdown;
 use chrono::{Local, TimeZone};
 use rusqlite::Connection;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -383,7 +388,8 @@ fn load_logged_calls(
     index
 }
 
-/// One day's share of a usage row's buckets.
+/// One share of a usage row's buckets: a single logged call on its day, or the
+/// residual the logs cannot account for on the session's start day.
 struct DayShare {
     day_key: String,
     timestamp_ms: i64,
@@ -394,9 +400,8 @@ struct DayShare {
     cache_write: i64,
     reasoning: i64,
     cost: f64,
-    /// Sum of the share's logged latencies. `None` for the residual and for a
-    /// logged share any of whose calls logged no latency: its tokens would
-    /// otherwise count as timed over a duration that leaves them out.
+    /// The call's logged latency. `None` for the residual and for a call that
+    /// logged no latency.
     duration_ms: Option<i64>,
 }
 
@@ -451,14 +456,13 @@ fn split_proportionally(total: i64, weights: &[i64], total_weight: i64) -> Vec<i
     parts
 }
 
-/// Allocate one usage row's buckets across the days its logged calls fall in,
-/// grouped in `bucket_timezone`.
+/// Allocate one usage row's buckets to its logged calls, each on its day in
+/// `bucket_timezone`.
 ///
 /// Only the portion the logs actually account for is distributed: each logged
-/// call's exact buckets stay on its day, and the remainder — rotated-away
-/// calls, or turns that never reach the log — stays on the
-/// session's start day, so partial evidence can never pull a lifetime total
-/// onto one recent day.
+/// call keeps its exact buckets, and the remainder — rotated-away calls, or
+/// turns that never reach the log — stays on the session's start day, so
+/// partial evidence can never pull a lifetime total onto one recent day.
 ///
 /// `None` — the caller then keeps the whole row on the session's start day —
 /// when the logs cannot speak for the row at all: no matching calls, a bucket
@@ -484,45 +488,33 @@ fn allocate_row_by_days(
         return None;
     }
 
-    // Keep each logged bucket on the day that produced it. The database is
+    // Keep each logged call's exact buckets as its own share. The database is
     // still authoritative for the row totals, but an accepted log line carries
     // exact per-call bucket counts, not merely an undifferentiated weight. Using
     // one combined token ratio for every bucket would move cache-read tokens to
-    // output-heavy days (and output tokens to cache-heavy days).
-    //
-    // Keyed by (day, is_residual): a day's logged share sorts before the
-    // residual that may share its day.
-    let mut shares: BTreeMap<(String, bool), DayShare> = BTreeMap::new();
+    // output-heavy days (and output tokens to cache-heavy days), and summing
+    // calls would let pricing select a full-request tier from the sum.
+    let mut shares: Vec<DayShare> = Vec::with_capacity(calls.len() + 1);
     for call in calls {
         let day_key = bucket_timezone.day_key(call.timestamp_ms);
         if day_key.is_empty() {
             return None;
         }
-        let day = shares.entry((day_key.clone(), false)).or_insert(DayShare {
-            day_key,
-            timestamp_ms: call.timestamp_ms,
-            has_logged_evidence: true,
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: 0,
-            cost: 0.0,
-            duration_ms: Some(0),
-        });
-        day.timestamp_ms = day.timestamp_ms.min(call.timestamp_ms);
-        day.input += call.input;
-        day.output += call.output;
-        day.cache_read += call.cache_read;
-        day.cache_write += call.cache_write;
-        day.duration_ms = day
-            .duration_ms
-            .zip(call.duration_ms)
-            .map(|(sum, duration)| sum.saturating_add(duration));
+        if call.input > 0 || call.output > 0 || call.cache_read > 0 || call.cache_write > 0 {
+            shares.push(DayShare {
+                day_key,
+                timestamp_ms: call.timestamp_ms,
+                has_logged_evidence: true,
+                input: call.input,
+                output: call.output,
+                cache_read: call.cache_read,
+                cache_write: call.cache_write,
+                reasoning: 0,
+                cost: 0.0,
+                duration_ms: call.duration_ms,
+            });
+        }
     }
-    shares.retain(|_, share| {
-        share.input > 0 || share.output > 0 || share.cache_read > 0 || share.cache_write > 0
-    });
     if shares.is_empty() {
         return None;
     }
@@ -545,27 +537,28 @@ fn allocate_row_by_days(
         || residual_cache_read != 0
         || residual_cache_write != 0
     {
-        shares.insert(
-            (start_day_key.clone(), true),
-            DayShare {
-                day_key: start_day_key.clone(),
-                timestamp_ms: start_ms,
-                has_logged_evidence: false,
-                input: residual_input,
-                output: residual_output,
-                cache_read: residual_cache_read,
-                cache_write: residual_cache_write,
-                reasoning: 0,
-                cost: 0.0,
-                duration_ms: None,
-            },
-        );
+        shares.push(DayShare {
+            day_key: start_day_key.clone(),
+            timestamp_ms: start_ms,
+            has_logged_evidence: false,
+            input: residual_input,
+            output: residual_output,
+            cache_read: residual_cache_read,
+            cache_write: residual_cache_write,
+            reasoning: 0,
+            cost: 0.0,
+            duration_ms: None,
+        });
     }
+    // Rotated logs are read newest file first; emit in time order. The sort is
+    // stable, so same-instant shares keep log order with the residual last.
+    shares.sort_by_key(|share| share.timestamp_ms);
 
     // `reasoning_tokens` is a subset of `output_tokens`, so it follows the
-    // emitted output shares; `DayShare::tokens` keeps the per-day relationship
-    // intact even where largest-remainder rounding leaves a remainder.
-    let output_weights: Vec<i64> = shares.values().map(|share| share.output.max(0)).collect();
+    // emitted output shares; `DayShare::tokens` keeps the per-share
+    // relationship intact even where largest-remainder rounding leaves a
+    // remainder.
+    let output_weights: Vec<i64> = shares.iter().map(|share| share.output.max(0)).collect();
     let total_output: i64 = output_weights.iter().sum();
     let reasoning = row.reasoning.clamp(0, total_output);
     let reasoning_parts = if total_output > 0 {
@@ -573,16 +566,16 @@ fn allocate_row_by_days(
     } else {
         vec![0; shares.len()]
     };
-    for (share, reasoning) in shares.values_mut().zip(reasoning_parts) {
+    for (share, reasoning) in shares.iter_mut().zip(reasoning_parts) {
         share.reasoning = reasoning;
     }
 
-    // Cost rides the emitted tokens, so a day pays for what it is shown to
-    // have spent; the last day absorbs the float residual. The weights are
+    // Cost rides the emitted tokens, so a share pays for what it is shown to
+    // have spent; the last share absorbs the float residual. The weights are
     // i128 for the same reason `split_proportionally` uses it: a cache-heavy
     // session can hold buckets large enough to overflow an i64 sum.
     let token_weights: Vec<i128> = shares
-        .values()
+        .iter()
         .map(|share| {
             share.input.max(0) as i128
                 + share.output.max(0) as i128
@@ -595,7 +588,7 @@ fn allocate_row_by_days(
     let share_count = shares.len();
     if total_tokens > 0 {
         let mut cost_left = row_cost;
-        for (i, share) in shares.values_mut().enumerate() {
+        for (i, share) in shares.iter_mut().enumerate() {
             share.cost = if i + 1 == share_count {
                 cost_left
             } else {
@@ -606,8 +599,7 @@ fn allocate_row_by_days(
         }
     } else if let Some(share) = shares
         .iter_mut()
-        .find(|((day, _), _)| *day == start_day_key)
-        .map(|(_, share)| share)
+        .find(|share| share.day_key == start_day_key)
     {
         // Degenerate row with cost but no tokens to weigh it by: keep the
         // cost with the start day rather than dropping it.
@@ -620,7 +612,7 @@ fn allocate_row_by_days(
     // row's totals are unaffected because it held none of them.
     Some(
         shares
-            .into_values()
+            .into_iter()
             .filter(|share| share.tokens().total() > 0 || share.cost != 0.0)
             .collect(),
     )
@@ -726,30 +718,25 @@ fn push_row_messages(
     let shares = calls.and_then(|calls| allocate_row_by_days(row, calls, bucket_timezone));
     match shares {
         Some(shares) => {
-            let mut first = true;
-            for share in shares {
+            for (index, share) in shares.into_iter().enumerate() {
+                // Shares of one group must not share a dedup key, or the
+                // caller's dedup pass drops every share but the first. A day
+                // holds many calls, so a call's key also carries its position
+                // in the row; the day stays last for `message_logged_day`.
+                let dedup_key = if share.has_logged_evidence {
+                    format!("{base_key}:{index}{LOGGED_DAY_KEY_MARKER}{}", share.day_key)
+                } else {
+                    format!("{base_key}{RESIDUAL_DAY_KEY_MARKER}{}", share.day_key)
+                };
                 let mut msg = message_from_parts(
                     row,
-                    // The day is part of the identity: two days of one group
-                    // must not share a dedup key, or the caller's dedup pass
-                    // drops every day but the first.
-                    format!(
-                        "{}{}{}",
-                        base_key,
-                        if share.has_logged_evidence {
-                            LOGGED_DAY_KEY_MARKER
-                        } else {
-                            RESIDUAL_DAY_KEY_MARKER
-                        },
-                        share.day_key
-                    ),
+                    dedup_key,
                     share.timestamp_ms,
                     share.tokens(),
                     share.cost,
                 );
                 msg.performance_timing = share.duration_ms.map(PerformanceTiming::Duration);
-                msg.message_count = if first { message_count } else { 0 };
-                first = false;
+                msg.message_count = if index == 0 { message_count } else { 0 };
                 out.push(msg);
             }
         }
