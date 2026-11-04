@@ -110,7 +110,8 @@
 | <img width="48px" src="https://github.com/zai-org.png" alt="ZCode" /> | [ZCode](https://zcode.z.ai/) | `~/.zcode/cli/db/db.sqlite`（v2 用量数据库）和 `~/.zcode/projects/**/*.jsonl`（旧版记录） |
 | <img width="48px" src="https://github.com/alibaba.png" alt="OpenCodeReview" /> | [OpenCodeReview](https://github.com/alibaba/open-code-review) | `~/.opencodereview/sessions/**/*.jsonl` |
 | <img width="48px" src="https://pc3.gtimg.com/softmgr/logo/48/43068_48_1764842447.png" alt="CodeBuddy" /> | [CodeBuddy](https://www.codebuddy.cn/docs/cli/overview)（CLI、IDE、VS Code 插件） | `~/.codebuddy/projects/**/*.jsonl` + 扩展日志 |
-| <img width="48px" src="https://static.workbuddy.cn/web/agents/008054d6beaaf4a83e2d049e982e1244560726dc/assets/share-logo.png" alt="WorkBuddy" /> | WorkBuddy | `~/.workbuddy/projects/**/*.jsonl`（5.5+ 也会扫描 `~/.workbuddy-ai/`） + SQLite 回退 |
+| <img width="48px" src="https://static.workbuddy.cn/web/agents/008054d6beaaf4a83e2d049e982e1244560726dc/assets/share-logo.png" alt="WorkBuddy" /> | WorkBuddy | `~/.workbuddy/projects/**/*.jsonl` + SQLite 回退 (`~/.workbuddy/workbuddy.db`) |
+| | WorkBuddy AI | `~/.workbuddy-ai/projects/**/*.jsonl` + `~/.workbuddy-ai/workbuddy.db`; 需显式指定 `--client workbuddy-ai`；不包含在无筛选扫描中 |
 | <img width="48px" src=".github/assets/client-devin.jpg" alt="Devin CLI" /> | [Devin CLI](https://devin.ai/) | `~/.local/share/devin/cli/sessions.db`（SQLite） |
 | <img width="48px" src=".github/assets/client-devin.jpg" alt="Devin Desktop" /> | [Devin Desktop](https://devin.ai/) | ACP 事件：macOS `~/Library/Application Support/Devin/User/acp-events/`；Linux `~/.config/Devin/User/acp-events/`；Windows `%APPDATA%\Devin\User\acp-events\` |
 | <img width="48px" src="https://github.com/augmentcode.png" alt="Augment Code" /> | [Augment Code](https://www.augmentcode.com/)（Auggie CLI） | `~/.augment/sessions/*.json` |
@@ -1578,7 +1579,8 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | ZCode | `~/.zcode/cli/db/db.sqlite` 和 `~/.zcode/projects/` | `%USERPROFILE%\.zcode\cli\db\db.sqlite` 和 `%USERPROFILE%\.zcode\projects\` | 解析 v2 SQLite 模型用量和旧版 `*.jsonl` 会话记录；Z.ai 的 GLM 模型专用 ADE |
 | OpenCodeReview | `~/.opencodereview/sessions/` | `%USERPROFILE%\.opencodereview\sessions\` | 解析 `*.jsonl` 会话记录；阿里巴巴的 AI 代码审查工具 |
 | CodeBuddy | `~/.codebuddy/projects/` + 扩展日志 | `%USERPROFILE%\.codebuddy\projects\` + CodeBuddy / VS Code 扩展日志 | 解析 CodeBuddy CLI、IDE 和 VS Code 插件的 token 用量 |
-| WorkBuddy | `~/.workbuddy/projects/` + `~/.workbuddy/workbuddy.db`（5.5+ 位于 `~/.workbuddy-ai/`） | `%USERPROFILE%\.workbuddy\projects\` + `%USERPROFILE%\.workbuddy\workbuddy.db`（5.5+ 位于 `%USERPROFILE%\.workbuddy-ai\`） | 解析 WorkBuddy token 用量，以聚合 SQLite 数据库作为回退 |
+| WorkBuddy | `~/.workbuddy/projects/` + `~/.workbuddy/workbuddy.db` | `%USERPROFILE%\.workbuddy\projects\` + `%USERPROFILE%\.workbuddy\workbuddy.db` | 解析 WorkBuddy token 用量，以聚合 SQLite 数据库作为回退 |
+| WorkBuddy AI | `~/.workbuddy-ai/projects/` + `~/.workbuddy-ai/workbuddy.db` | `%USERPROFILE%\.workbuddy-ai\projects\` + `%USERPROFILE%\.workbuddy-ai\workbuddy.db` | 需显式指定 `--client workbuddy-ai`；不包含在无筛选扫描中 |
 | Devin CLI | `~/.local/share/devin/cli/sessions.db` | `%USERPROFILE%\.local\share\devin\cli\sessions.db` | 读取权威的本地 SQLite 用量数据库 |
 | Devin Desktop | Linux：`~/.config/Devin/User/acp-events/`；macOS：`~/Library/Application Support/Devin/User/acp-events/` | `%APPDATA%\Devin\User\acp-events\` | 解析 ACP 用量事件；存在 CLI 数据库时会解析匹配的会话标题 |
 | Augment Code | `~/.augment/sessions/` | `%USERPROFILE%\.augment\sessions\` | 解析 Auggie CLI 会话 JSON 快照（`*.json`）；关联键为顶层 `sessionId` |

@@ -109,7 +109,8 @@
 | <img width="48px" src="https://github.com/zai-org.png" alt="ZCode" /> | [ZCode](https://zcode.z.ai/) | `~/.zcode/cli/db/db.sqlite`（v2 使用量データベース）および `~/.zcode/projects/**/*.jsonl`（従来の記録） |
 | <img width="48px" src="https://github.com/alibaba.png" alt="OpenCodeReview" /> | [OpenCodeReview](https://github.com/alibaba/open-code-review) | `~/.opencodereview/sessions/**/*.jsonl` |
 | <img width="48px" src="https://pc3.gtimg.com/softmgr/logo/48/43068_48_1764842447.png" alt="CodeBuddy" /> | [CodeBuddy](https://www.codebuddy.cn/docs/cli/overview)（CLI・IDE・VS Code プラグイン） | `~/.codebuddy/projects/**/*.jsonl` + 拡張機能ログ |
-| <img width="48px" src="https://static.workbuddy.cn/web/agents/008054d6beaaf4a83e2d049e982e1244560726dc/assets/share-logo.png" alt="WorkBuddy" /> | WorkBuddy | `~/.workbuddy/projects/**/*.jsonl`（5.5+ は `~/.workbuddy-ai/` もスキャン） + SQLite フォールバック |
+| <img width="48px" src="https://static.workbuddy.cn/web/agents/008054d6beaaf4a83e2d049e982e1244560726dc/assets/share-logo.png" alt="WorkBuddy" /> | WorkBuddy | `~/.workbuddy/projects/**/*.jsonl` + SQLite フォールバック (`~/.workbuddy/workbuddy.db`) |
+| | WorkBuddy AI | `~/.workbuddy-ai/projects/**/*.jsonl` + `~/.workbuddy-ai/workbuddy.db`; `--client workbuddy-ai` の明示指定が必要。未指定のスキャンには含まれません |
 | <img width="48px" src=".github/assets/client-devin.jpg" alt="Devin CLI" /> | [Devin CLI](https://devin.ai/) | `~/.local/share/devin/cli/sessions.db`（SQLite） |
 | <img width="48px" src=".github/assets/client-devin.jpg" alt="Devin Desktop" /> | [Devin Desktop](https://devin.ai/) | ACP イベント：macOS `~/Library/Application Support/Devin/User/acp-events/`、Linux `~/.config/Devin/User/acp-events/`、Windows `%APPDATA%\Devin\User\acp-events\` |
 | <img width="48px" src="https://github.com/augmentcode.png" alt="Augment Code" /> | [Augment Code](https://www.augmentcode.com/)（Auggie CLI） | `~/.augment/sessions/*.json` |
@@ -1579,7 +1580,8 @@ AIコーディングツールはクロスプラットフォームの場所にセ
 | ZCode | `~/.zcode/cli/db/db.sqlite` および `~/.zcode/projects/` | `%USERPROFILE%\.zcode\cli\db\db.sqlite` および `%USERPROFILE%\.zcode\projects\` | v2 SQLite モデル使用量と従来の `*.jsonl` セッショントランスクリプトを解析；Z.ai の GLM モデル向け ADE |
 | OpenCodeReview | `~/.opencodereview/sessions/` | `%USERPROFILE%\.opencodereview\sessions\` | `*.jsonl` セッショントランスクリプトを解析；Alibaba の AI コードレビューツール |
 | CodeBuddy | `~/.codebuddy/projects/` + 拡張機能ログ | `%USERPROFILE%\.codebuddy\projects\` + CodeBuddy / VS Code 拡張機能ログ | CodeBuddy CLI・IDE・VS Code プラグインのトークン使用量を解析 |
-| WorkBuddy | `~/.workbuddy/projects/` + `~/.workbuddy/workbuddy.db`（5.5+ は `~/.workbuddy-ai/`） | `%USERPROFILE%\.workbuddy\projects\` + `%USERPROFILE%\.workbuddy\workbuddy.db`（5.5+ は `%USERPROFILE%\.workbuddy-ai\`） | WorkBuddy のトークン使用量を解析し、集約 SQLite データベースをフォールバックとして使用 |
+| WorkBuddy | `~/.workbuddy/projects/` + `~/.workbuddy/workbuddy.db` | `%USERPROFILE%\.workbuddy\projects\` + `%USERPROFILE%\.workbuddy\workbuddy.db` | WorkBuddy のトークン使用量を解析し、集約 SQLite データベースをフォールバックとして使用 |
+| WorkBuddy AI | `~/.workbuddy-ai/projects/` + `~/.workbuddy-ai/workbuddy.db` | `%USERPROFILE%\.workbuddy-ai\projects\` + `%USERPROFILE%\.workbuddy-ai\workbuddy.db` | `--client workbuddy-ai` の明示指定が必要。未指定のスキャンには含まれません |
 | Devin CLI | `~/.local/share/devin/cli/sessions.db` | `%USERPROFILE%\.local\share\devin\cli\sessions.db` | 信頼できるローカル SQLite 使用量データベースを読み取る |
 | Devin Desktop | Linux: `~/.config/Devin/User/acp-events/`; macOS: `~/Library/Application Support/Devin/User/acp-events/` | `%APPDATA%\Devin\User\acp-events\` | ACP 使用量イベントを解析し、CLI データベースが存在する場合は一致するセッションタイトルを解決する |
 | Augment Code | `~/.augment/sessions/` | `%USERPROFILE%\.augment\sessions\` | Auggie CLI のセッション JSON スナップショット（`*.json`）を解析。結合キーはトップレベルの `sessionId` |

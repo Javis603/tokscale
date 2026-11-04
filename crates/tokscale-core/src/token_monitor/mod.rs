@@ -188,6 +188,18 @@ mod tests {
     }
 
     #[test]
+    fn workbuddy_ai_requires_an_explicit_filter() {
+        assert_eq!(requested(&[]).count(), 0);
+        assert_eq!(requested(&["workbuddy".to_string()]).count(), 0);
+        assert_eq!(
+            requested(&["workbuddy-ai".to_string()])
+                .map(|client| client.id)
+                .collect::<Vec<_>>(),
+            vec!["workbuddy-ai"]
+        );
+    }
+
+    #[test]
     fn supplements_are_requested_by_their_upstream_id_but_never_stripped() {
         assert_eq!(
             requested_supplements(&["mcode".to_string()])
