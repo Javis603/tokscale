@@ -109,7 +109,8 @@
 | <img width="48px" src="https://github.com/zai-org.png" alt="ZCode" /> | [ZCode](https://zcode.z.ai/) | `~/.zcode/cli/db/db.sqlite`(v2 사용량 데이터베이스) 및 `~/.zcode/projects/**/*.jsonl`(레거시 기록) |
 | <img width="48px" src="https://github.com/alibaba.png" alt="OpenCodeReview" /> | [OpenCodeReview](https://github.com/alibaba/open-code-review) | `~/.opencodereview/sessions/**/*.jsonl` |
 | <img width="48px" src="https://pc3.gtimg.com/softmgr/logo/48/43068_48_1764842447.png" alt="CodeBuddy" /> | [CodeBuddy](https://www.codebuddy.cn/docs/cli/overview) (CLI, IDE, VS Code 플러그인) | `~/.codebuddy/projects/**/*.jsonl` + 확장 프로그램 로그 |
-| <img width="48px" src="https://static.workbuddy.cn/web/agents/008054d6beaaf4a83e2d049e982e1244560726dc/assets/share-logo.png" alt="WorkBuddy" /> | WorkBuddy | `~/.workbuddy/projects/**/*.jsonl` (5.5+는 `~/.workbuddy-ai/`도 스캔) + SQLite 폴백 |
+| <img width="48px" src="https://static.workbuddy.cn/web/agents/008054d6beaaf4a83e2d049e982e1244560726dc/assets/share-logo.png" alt="WorkBuddy" /> | WorkBuddy | `~/.workbuddy/projects/**/*.jsonl` + SQLite 폴백 (`~/.workbuddy/workbuddy.db`) |
+| | WorkBuddy AI | `~/.workbuddy-ai/projects/**/*.jsonl` + `~/.workbuddy-ai/workbuddy.db`; `--client workbuddy-ai`를 명시해야 하며 필터 없는 스캔에는 포함되지 않음 |
 | <img width="48px" src=".github/assets/client-devin.jpg" alt="Devin CLI" /> | [Devin CLI](https://devin.ai/) | `~/.local/share/devin/cli/sessions.db` (SQLite) |
 | <img width="48px" src=".github/assets/client-devin.jpg" alt="Devin Desktop" /> | [Devin Desktop](https://devin.ai/) | ACP 이벤트: macOS `~/Library/Application Support/Devin/User/acp-events/`; Linux `~/.config/Devin/User/acp-events/`; Windows `%APPDATA%\Devin\User\acp-events\` |
 | <img width="48px" src="https://github.com/augmentcode.png" alt="Augment Code" /> | [Augment Code](https://www.augmentcode.com/) (Auggie CLI) | `~/.augment/sessions/*.json` |
@@ -1578,7 +1579,8 @@ AI 코딩 도구들은 크로스 플랫폼 위치에 세션 데이터를 저장�
 | ZCode | `~/.zcode/cli/db/db.sqlite` 및 `~/.zcode/projects/` | `%USERPROFILE%\.zcode\cli\db\db.sqlite` 및 `%USERPROFILE%\.zcode\projects\` | v2 SQLite 모델 사용량과 레거시 `*.jsonl` 세션 트랜스크립트 파싱; Z.ai의 GLM 모델용 ADE |
 | OpenCodeReview | `~/.opencodereview/sessions/` | `%USERPROFILE%\.opencodereview\sessions\` | `*.jsonl` 세션 트랜스크립트 파싱; Alibaba의 AI 코드 리뷰 도구 |
 | CodeBuddy | `~/.codebuddy/projects/` + 확장 프로그램 로그 | `%USERPROFILE%\.codebuddy\projects\` + CodeBuddy / VS Code 확장 프로그램 로그 | CodeBuddy CLI, IDE, VS Code 플러그인 토큰 사용량 파싱 |
-| WorkBuddy | `~/.workbuddy/projects/` + `~/.workbuddy/workbuddy.db` (5.5+는 `~/.workbuddy-ai/`) | `%USERPROFILE%\.workbuddy\projects\` + `%USERPROFILE%\.workbuddy\workbuddy.db` (5.5+는 `%USERPROFILE%\.workbuddy-ai\`) | WorkBuddy 토큰 사용량 파싱, 집계 SQLite 데이터베이스를 폴백으로 사용 |
+| WorkBuddy | `~/.workbuddy/projects/` + `~/.workbuddy/workbuddy.db` | `%USERPROFILE%\.workbuddy\projects\` + `%USERPROFILE%\.workbuddy\workbuddy.db` | WorkBuddy 토큰 사용량 파싱, 집계 SQLite 데이터베이스를 폴백으로 사용 |
+| WorkBuddy AI | `~/.workbuddy-ai/projects/` + `~/.workbuddy-ai/workbuddy.db` | `%USERPROFILE%\.workbuddy-ai\projects\` + `%USERPROFILE%\.workbuddy-ai\workbuddy.db` | `--client workbuddy-ai`를 명시해야 하며 필터 없는 스캔에는 포함되지 않음 |
 | Devin CLI | `~/.local/share/devin/cli/sessions.db` | `%USERPROFILE%\.local\share\devin\cli\sessions.db` | 신뢰할 수 있는 로컬 SQLite 사용량 데이터베이스 읽기 |
 | Devin Desktop | Linux: `~/.config/Devin/User/acp-events/`; macOS: `~/Library/Application Support/Devin/User/acp-events/` | `%APPDATA%\Devin\User\acp-events\` | ACP 사용량 이벤트를 파싱하고, CLI 데이터베이스가 있으면 일치하는 세션 제목을 확인 |
 | Augment Code | `~/.augment/sessions/` | `%USERPROFILE%\.augment\sessions\` | Auggie CLI 세션 JSON 스냅샷(`*.json`) 파싱; 조인 키는 최상위 `sessionId` |

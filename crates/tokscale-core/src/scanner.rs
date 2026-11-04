@@ -2384,24 +2384,14 @@ fn scan_all_clients_with_env_strategy_inner(
             PathBuf::from(home_dir).join(".workbuddy/projects"),
             "*.jsonl",
         );
-        // WorkBuddy 5.5 ("WorkBuddy AI") moved sessions and `workbuddy.db` to
-        // `~/.workbuddy-ai` (#1334). The legacy tree stays scanned above and
-        // through the client's own root so upgraded installs keep counting the
-        // sessions that never moved.
-        push_unique_scan_task_with_pattern(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::WorkBuddy,
-            PathBuf::from(home_dir).join(".workbuddy-ai/projects"),
-            "*.jsonl",
-        );
-        push_unique_scan_task_with_pattern(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::WorkBuddy,
-            PathBuf::from(home_dir).join(".workbuddy-ai"),
-            "workbuddy.db",
-        );
+        // The `~/.workbuddy-ai` roots (jsonl and `workbuddy.db`, added for
+        // #1334 back when "WorkBuddy 5.5" and "WorkBuddy AI" were thought to
+        // share the home move) now belong to the Token Monitor-owned
+        // `workbuddy-ai` client (token_monitor::workbuddy_ai): current builds
+        // keep separate homes — CN WorkBuddy here, the international WorkBuddy
+        // AI in `~/.workbuddy-ai` — and the shared root landed both editions'
+        // usage on one client. Scanning the AI root here again would double
+        // every AI session across the two ids.
     }
 
     // Extra scan directories are part of the caller's environment, so they are
@@ -4451,15 +4441,16 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_all_clients_discovers_workbuddy_ai_project_jsonl() {
+    fn test_scan_all_clients_leaves_workbuddy_ai_roots_to_the_owned_client() {
         let dir = TempDir::new().unwrap();
-        // WorkBuddy 5.5 ("WorkBuddy AI") keeps sessions and `workbuddy.db`
-        // under `~/.workbuddy-ai` (#1334); the legacy `~/.workbuddy` tree is
-        // still scanned, so both trees contribute on upgraded installs.
-        let new_project_dir = dir.path().join(".workbuddy-ai/projects/project-a");
-        fs::create_dir_all(&new_project_dir).unwrap();
-        let session = new_project_dir.join("session.jsonl");
-        File::create(&session).unwrap();
+        // The `~/.workbuddy-ai` tree belongs to the Token Monitor-owned
+        // `workbuddy-ai` client (token_monitor::workbuddy_ai); the upstream
+        // WorkBuddy lane scans only the CN build's `~/.workbuddy` tree, so a
+        // session under the AI root must not appear here.
+        let ai_project_dir = dir.path().join(".workbuddy-ai/projects/project-a");
+        fs::create_dir_all(&ai_project_dir).unwrap();
+        let ai_session = ai_project_dir.join("session.jsonl");
+        File::create(&ai_session).unwrap();
         File::create(dir.path().join(".workbuddy-ai/workbuddy.db")).unwrap();
 
         let legacy_project_dir = dir.path().join(".workbuddy/projects/project-b");
@@ -4474,10 +4465,7 @@ mod tests {
         );
 
         let files = result.get(ClientId::WorkBuddy);
-        assert_eq!(files.len(), 3);
-        assert!(files.contains(&session));
-        assert!(files.contains(&legacy_session));
-        assert!(files.contains(&dir.path().join(".workbuddy-ai/workbuddy.db")));
+        assert_eq!(files.as_slice(), std::slice::from_ref(&legacy_session));
     }
 
     #[test]

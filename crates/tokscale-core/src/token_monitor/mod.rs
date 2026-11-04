@@ -27,6 +27,7 @@ mod catpaw;
 mod js;
 mod mcode;
 mod qodercn;
+mod workbuddy_ai;
 
 use crate::sessions::UnifiedMessage;
 use crate::{ClientCounts, ClientId};
@@ -48,6 +49,10 @@ const CLIENTS: &[Client] = &[
     Client {
         id: qodercn::CLIENT_ID,
         parse: |scope| qodercn::parse(scope.home_dir),
+    },
+    Client {
+        id: workbuddy_ai::CLIENT_ID,
+        parse: |scope| workbuddy_ai::parse(scope.home_dir),
     },
 ];
 
@@ -179,6 +184,18 @@ mod tests {
                 .map(|client| client.id)
                 .collect::<Vec<_>>(),
             vec!["qodercn"]
+        );
+    }
+
+    #[test]
+    fn workbuddy_ai_requires_an_explicit_filter() {
+        assert_eq!(requested(&[]).count(), 0);
+        assert_eq!(requested(&["workbuddy".to_string()]).count(), 0);
+        assert_eq!(
+            requested(&["workbuddy-ai".to_string()])
+                .map(|client| client.id)
+                .collect::<Vec<_>>(),
+            vec!["workbuddy-ai"]
         );
     }
 
