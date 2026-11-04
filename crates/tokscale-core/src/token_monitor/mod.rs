@@ -27,6 +27,7 @@ mod catpaw;
 mod js;
 mod mcode;
 mod qodercn;
+mod workbuddy_ai;
 
 use crate::sessions::UnifiedMessage;
 use crate::{ClientCounts, ClientId};
@@ -48,6 +49,10 @@ const CLIENTS: &[Client] = &[
     Client {
         id: qodercn::CLIENT_ID,
         parse: |scope| qodercn::parse(scope.home_dir),
+    },
+    Client {
+        id: workbuddy_ai::CLIENT_ID,
+        parse: |scope| workbuddy_ai::parse(scope.home_dir),
     },
 ];
 
