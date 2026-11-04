@@ -19,3 +19,7 @@ Codex parser generation 23 adds world_state model attribution, tracks empty-comp
 Generation 23 invalidates the shipped generation-22 incremental state so world_state-only model identities are reparsed; parent links and request timing remain preserved.
 
 The timer consumes events during the existing parse pass and is serialized with incremental state. It adds no second transcript scan or provider request. Upgrading invalidates old Codex shards once; subsequent scans retain the existing cache and append behavior. Per-event bookkeeping adds some CPU and state overhead; its runtime cost has not been benchmarked.
+
+## Hermes
+
+Hermes stores usage as per-session aggregates; the per-call evidence is the `agent.conversation_loop: API call #N` lines in `logs/agent.log*`, which the parser already uses to split a row across days. Each line's `latency=%.1fs` is the request duration from request start to response end, so it includes first-output waiting on long prompts. A logged day share reports the sum of its calls' latencies; a share with any call that logged no latency stays untimed. A logged `0.0s` is a measured call below the log's rounding, not a missing value. The residual the logs cannot account for (rotated-away calls, task-variant calls that never reach the log) is never timed and is always its own share, including on a logged day. Rows whose logs over-report keep their start-day fallback without timing. Hermes parser version 5 invalidates version-4 shares, whose start-day residual could be merged into a logged share.

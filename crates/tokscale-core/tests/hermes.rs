@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use tempfile::TempDir;
 use tokscale_core::bucket_tz::BucketTimezone;
 use tokscale_core::sessions::hermes::{
-    message_is_day_split, parse_hermes_sqlite, parse_hermes_sqlite_in,
+    message_is_day_split, message_logged_day, parse_hermes_sqlite, parse_hermes_sqlite_in,
 };
 
 #[test]
@@ -1842,6 +1842,139 @@ fn test_parse_hermes_sqlite_leaves_unlogged_residual_on_start_day() {
     assert!((start.cost - (2.0 - 2.0 * 2200.0 / 11900.0)).abs() < 1e-9);
     assert!((messages.iter().map(|m| m.cost).sum::<f64>() - 2.0).abs() < 1e-9);
     assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 12);
+}
+
+/// Each logged day's share is timed by the sum of its calls' request
+/// latencies. A day with a call that logged no latency stays untimed rather
+/// than counting that call's tokens over a duration that leaves it out.
+#[test]
+fn test_parse_hermes_sqlite_times_logged_days_by_request_latency() {
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params!["session-timed", "desktop", "glm-5.2", 1_775_100_000.0_f64, 6_i64],
+    )
+    .unwrap();
+    insert_usage_row(&conn, "session-timed", 600, 300, 2400, 0.6);
+    let day_a = log_stamp(2, 9);
+    let day_b = log_stamp(1, 9);
+    write_agent_log(
+        &dir,
+        &[
+            log_call("session-timed", 1, &day_a, 1000, 100, 800)
+                .replace("latency=1.0s", "latency=2.5s"),
+            log_call("session-timed", 2, &day_a, 1000, 100, 800)
+                .replace("latency=1.0s", "latency=0.0s"),
+            log_call("session-timed", 3, &day_b, 1000, 100, 800).replace(" latency=1.0s", ""),
+        ],
+    );
+
+    let mut messages = parse_hermes_sqlite(&db_path);
+    messages.sort_by_key(|m| m.timestamp);
+    assert_eq!(messages.len(), 2);
+    // A logged 0.0s is a measured sub-rounding call, so day A stays timed.
+    assert_eq!(messages[0].performance_duration_ms(), Some(2_500));
+    assert_eq!(messages[0].tokens.output, 200);
+    assert_eq!(messages[1].performance_duration_ms(), None);
+    // Timing never changes the split itself.
+    assert_eq!(messages[1].tokens.input, 200);
+    assert_eq!(messages[1].tokens.output, 100);
+}
+
+/// Most sessions start on a day their calls are logged, and their task-variant
+/// calls (titles, compression) never reach the log. That residual stays on the
+/// start day as its own untimed share: merged into the logged share, its
+/// tokens would count as timed over a duration that leaves them out.
+#[test]
+fn test_parse_hermes_sqlite_keeps_residual_untimed_on_a_logged_start_day() {
+    use chrono::TimeZone;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+
+    let stamp = log_stamp(1, 15);
+    let day_key = &stamp[..10];
+    let start = chrono::Local
+        .from_local_datetime(
+            &chrono::NaiveDateTime::parse_from_str(
+                &format!("{day_key} 09:00:00"),
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .unwrap(),
+        )
+        .earliest()
+        .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params!["session-same-day", "desktop", "glm-5.2", start.timestamp() as f64, 9_i64],
+    )
+    .unwrap();
+    // The logs account for 400/200/1600 of the row's 500/260/1700.
+    insert_usage_row(&conn, "session-same-day", 500, 260, 1700, 1.0);
+    write_agent_log(
+        &dir,
+        &[
+            log_call("session-same-day", 1, &stamp, 1000, 100, 800),
+            log_call("session-same-day", 2, &stamp, 1000, 100, 800),
+        ],
+    );
+
+    let messages = parse_hermes_sqlite(&db_path);
+    assert_eq!(
+        messages.len(),
+        2,
+        "a logged share and a residual share on one day"
+    );
+    let logged = messages
+        .iter()
+        .find(|m| message_logged_day(m) == Some(day_key))
+        .unwrap();
+    let residual = messages
+        .iter()
+        .find(|m| message_logged_day(m).is_none())
+        .unwrap();
+    assert_eq!(
+        logged.dedup_key.as_deref(),
+        Some(
+            format!("hermes:session-same-day:glm-5.2:zai:__hermes_logged_day_v1__:{day_key}")
+                .as_str()
+        )
+    );
+    assert_eq!(
+        residual.dedup_key.as_deref(),
+        Some(
+            format!("hermes:session-same-day:glm-5.2:zai:__hermes_residual_day_v1__:{day_key}")
+                .as_str()
+        )
+    );
+    assert!(message_is_day_split(residual));
+
+    assert_eq!(
+        (
+            logged.tokens.input,
+            logged.tokens.output,
+            logged.tokens.cache_read
+        ),
+        (400, 200, 1600)
+    );
+    assert_eq!(logged.performance_duration_ms(), Some(2_000));
+    assert_eq!(
+        (
+            residual.tokens.input,
+            residual.tokens.output,
+            residual.tokens.cache_read
+        ),
+        (100, 60, 100)
+    );
+    assert_eq!(residual.performance_duration_ms(), None);
+    assert_eq!(residual.timestamp, start.timestamp_millis());
+
+    assert!((messages.iter().map(|m| m.cost).sum::<f64>() - 1.0).abs() < 1e-9);
+    assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 9);
 }
 
 /// The split groups the logged calls in the scan's bucket timezone, not the

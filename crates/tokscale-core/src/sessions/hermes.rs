@@ -17,12 +17,17 @@
 //! (rotated-away calls, or turns that never reach the log) stays on the
 //! session's start day — and a row whose logs over-report its buckets keeps
 //! its whole total on the start day.
+//!
+//! The same log lines carry each call's request `latency`, so a day's logged
+//! share reports the sum of its calls' latencies as performance timing. The
+//! residual is never timed and is therefore always its own share, even on a
+//! logged day: merging it would count untimed tokens as timed.
 
 use super::utils::{
     lossy_lines, open_readonly_sqlite, resolved_provider, sqlite_for_each_row_on,
     timestamp_secs_to_ms,
 };
-use super::UnifiedMessage;
+use super::{PerformanceTiming, UnifiedMessage};
 use crate::bucket_tz::BucketTimezone;
 use crate::TokenBreakdown;
 use chrono::{Local, TimeZone};
@@ -211,7 +216,8 @@ fn query_usage_rows(db_path: &Path, conn: &Connection, query: &str) -> Option<Ve
 /// One `API call #N` line from a Hermes agent log: the timestamped evidence a
 /// cross-day session's buckets are split over. `input` is the fresh prompt
 /// share (`in` minus cache reads and writes), matching what Hermes stores in
-/// `session_model_usage.input_tokens`.
+/// `session_model_usage.input_tokens`. `duration_ms` is the logged request
+/// latency (request start to response end), `None` when the line has none.
 struct LoggedCall {
     call_number: i64,
     timestamp_ms: i64,
@@ -219,6 +225,14 @@ struct LoggedCall {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    duration_ms: Option<i64>,
+}
+
+/// Hermes logs `latency=%.1fs`. Zero is a measured sub-rounding call, not a
+/// missing value; anything unparseable leaves the call untimed.
+fn parse_latency_ms(value: &str) -> Option<i64> {
+    let seconds: f64 = value.strip_suffix('s')?.parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1000.0).round() as i64)
 }
 
 type LoggedCallFingerprint = (String, String, String, i64, i64, i64, i64, i64, i64);
@@ -239,6 +253,7 @@ fn parse_logged_call(line: &str) -> Option<(String, String, String, LoggedCall)>
     let mut output = 0_i64;
     let mut cache_read = 0_i64;
     let mut cache_write = 0_i64;
+    let mut duration_ms = None;
     for token in fields.split_whitespace() {
         let Some((key, value)) = token.split_once('=') else {
             continue;
@@ -252,7 +267,10 @@ fn parse_logged_call(line: &str) -> Option<(String, String, String, LoggedCall)>
             // cache reads and writes have separate stored buckets.
             "cache" => cache_read = value.split('/').next()?.parse().ok()?,
             "write" => cache_write = value.parse().ok()?,
-            // total, latency, id, upstream: not needed for the split.
+            // Timing only: a malformed latency must not discard the call's
+            // token evidence for the day split.
+            "latency" => duration_ms = parse_latency_ms(value),
+            // total, id, upstream: not needed.
             _ => {}
         }
     }
@@ -290,6 +308,7 @@ fn parse_logged_call(line: &str) -> Option<(String, String, String, LoggedCall)>
             output,
             cache_read,
             cache_write,
+            duration_ms,
         },
     ))
 }
@@ -375,6 +394,10 @@ struct DayShare {
     cache_write: i64,
     reasoning: i64,
     cost: f64,
+    /// Sum of the share's logged latencies. `None` for the residual and for a
+    /// logged share any of whose calls logged no latency: its tokens would
+    /// otherwise count as timed over a duration that leaves them out.
+    duration_ms: Option<i64>,
 }
 
 impl DayShare {
@@ -466,13 +489,16 @@ fn allocate_row_by_days(
     // exact per-call bucket counts, not merely an undifferentiated weight. Using
     // one combined token ratio for every bucket would move cache-read tokens to
     // output-heavy days (and output tokens to cache-heavy days).
-    let mut shares: BTreeMap<String, DayShare> = BTreeMap::new();
+    //
+    // Keyed by (day, is_residual): a day's logged share sorts before the
+    // residual that may share its day.
+    let mut shares: BTreeMap<(String, bool), DayShare> = BTreeMap::new();
     for call in calls {
         let day_key = bucket_timezone.day_key(call.timestamp_ms);
         if day_key.is_empty() {
             return None;
         }
-        let day = shares.entry(day_key.clone()).or_insert(DayShare {
+        let day = shares.entry((day_key.clone(), false)).or_insert(DayShare {
             day_key,
             timestamp_ms: call.timestamp_ms,
             has_logged_evidence: true,
@@ -482,12 +508,17 @@ fn allocate_row_by_days(
             cache_write: 0,
             reasoning: 0,
             cost: 0.0,
+            duration_ms: Some(0),
         });
         day.timestamp_ms = day.timestamp_ms.min(call.timestamp_ms);
         day.input += call.input;
         day.output += call.output;
         day.cache_read += call.cache_read;
         day.cache_write += call.cache_write;
+        day.duration_ms = day
+            .duration_ms
+            .zip(call.duration_ms)
+            .map(|(sum, duration)| sum.saturating_add(duration));
     }
     shares.retain(|_, share| {
         share.input > 0 || share.output > 0 || share.cache_read > 0 || share.cache_write > 0
@@ -496,8 +527,8 @@ fn allocate_row_by_days(
         return None;
     }
 
-    // Whatever the logs could not account for stays on the start day, merged
-    // into that day's share when the start day is itself a logged day. A row
+    // Whatever the logs could not account for stays on the start day as its
+    // own untimed share, even when the start day is itself a logged day. A row
     // the logs account for exactly gets no start-day share at all: inventing a
     // zero-token one would emit a phantom day.
     let start_ms = timestamp_secs_to_ms(row.started_at);
@@ -514,23 +545,21 @@ fn allocate_row_by_days(
         || residual_cache_read != 0
         || residual_cache_write != 0
     {
-        let start_day = shares
-            .entry(start_day_key.clone())
-            .or_insert_with(|| DayShare {
+        shares.insert(
+            (start_day_key.clone(), true),
+            DayShare {
                 day_key: start_day_key.clone(),
                 timestamp_ms: start_ms,
                 has_logged_evidence: false,
-                input: 0,
-                output: 0,
-                cache_read: 0,
-                cache_write: 0,
+                input: residual_input,
+                output: residual_output,
+                cache_read: residual_cache_read,
+                cache_write: residual_cache_write,
                 reasoning: 0,
                 cost: 0.0,
-            });
-        start_day.input += residual_input;
-        start_day.output += residual_output;
-        start_day.cache_read += residual_cache_read;
-        start_day.cache_write += residual_cache_write;
+                duration_ms: None,
+            },
+        );
     }
 
     // `reasoning_tokens` is a subset of `output_tokens`, so it follows the
@@ -575,7 +604,11 @@ fn allocate_row_by_days(
                 part
             };
         }
-    } else if let Some(share) = shares.get_mut(&start_day_key) {
+    } else if let Some(share) = shares
+        .iter_mut()
+        .find(|((day, _), _)| *day == start_day_key)
+        .map(|(_, share)| share)
+    {
         // Degenerate row with cost but no tokens to weigh it by: keep the
         // cost with the start day rather than dropping it.
         share.cost = row_cost;
@@ -714,6 +747,7 @@ fn push_row_messages(
                     share.tokens(),
                     share.cost,
                 );
+                msg.performance_timing = share.duration_ms.map(PerformanceTiming::Duration);
                 msg.message_count = if first { message_count } else { 0 };
                 first = false;
                 out.push(msg);
