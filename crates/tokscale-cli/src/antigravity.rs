@@ -2109,7 +2109,10 @@ fn scan_filesystem_session_candidates() -> Result<Vec<SessionCandidate>> {
                 }
 
                 let session_id = entry.file_name().to_string_lossy().to_string();
-                if session_id.trim().is_empty() {
+                if session_id.trim().is_empty()
+                    || session_id.starts_with('.')
+                    || session_id == "tempmediaStorage"
+                {
                     continue;
                 }
 
@@ -3194,6 +3197,10 @@ fn try_fetch_session_artifact(
                 "Warning: failed to fetch Antigravity metadata for session {}: {err:#}",
                 summary.session_id
             );
+            let err_text = format!("{err:#}");
+            if err_text.contains("not_found") || err_text.contains("404") {
+                return Ok(None);
+            }
             return Err(err);
         }
     };
