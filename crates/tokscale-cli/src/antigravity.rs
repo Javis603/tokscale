@@ -3166,6 +3166,12 @@ fn fetch_usage_timestamps(
     }
 }
 
+fn is_session_not_found_error(err: &anyhow::Error) -> bool {
+    let err_text = format!("{err:#}");
+    err_text.contains("failed with status 404")
+        || (err_text.contains(r#""code":"not_found""#) && err_text.contains("trajectory not found"))
+}
+
 fn try_fetch_session_artifact(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
@@ -3192,15 +3198,18 @@ fn try_fetch_session_artifact(
             value
         }
         Err(err) => {
+            if is_session_not_found_error(&err) {
+                eprintln!(
+                    "Warning: Antigravity session {} not found; skipping: {err:#}",
+                    summary.session_id
+                );
+                return Ok(None);
+            }
             budget.record_metadata_failure(&connection.fingerprint, metadata_started.elapsed());
             eprintln!(
                 "Warning: failed to fetch Antigravity metadata for session {}: {err:#}",
                 summary.session_id
             );
-            let err_text = format!("{err:#}");
-            if err_text.contains("not_found") || err_text.contains("404") {
-                return Ok(None);
-            }
             return Err(err);
         }
     };
