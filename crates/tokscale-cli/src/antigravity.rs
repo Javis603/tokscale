@@ -2109,10 +2109,7 @@ fn scan_filesystem_session_candidates() -> Result<Vec<SessionCandidate>> {
                 }
 
                 let session_id = entry.file_name().to_string_lossy().to_string();
-                if session_id.trim().is_empty()
-                    || session_id.starts_with('.')
-                    || session_id == "tempmediaStorage"
-                {
+                if session_id.trim().is_empty() || session_id == "tempmediaStorage" {
                     continue;
                 }
 
@@ -2322,7 +2319,7 @@ fn rpc_request_with_deadline(
             Ok(value)
         }
         Err(http_err) => {
-            if is_rpc_cap_error(&http_err) || is_session_not_found_error(&http_err) {
+            if is_rpc_cap_error(&http_err) {
                 remember_rpc_transport(connection.port, RpcTransport::PlainHttp);
                 return Err(http_err);
             }
@@ -2586,13 +2583,12 @@ fn https_rpc_request(
             )
         })?;
         if !(200..300).contains(&status) {
-            return Err(RpcStatusError {
-                method: method.to_string(),
+            anyhow::bail!(
+                "Antigravity HTTPS RPC {} failed with status {}: {}",
+                method,
                 status,
-                response_body: response_body.to_string(),
-                https: true,
-            }
-            .into());
+                response_body
+            );
         }
 
         serde_json::from_str(response_body).with_context(|| {
@@ -2660,13 +2656,12 @@ async fn https_rpc_once(
     let status = response.status();
     let response_body = read_reqwest_response_with_cap(response, max_rpc_body_bytes()).await?;
     if !status.is_success() {
-        return Err(RpcStatusError {
-            method: method.to_string(),
-            status: status.as_u16(),
-            response_body,
-            https: true,
-        }
-        .into());
+        anyhow::bail!(
+            "Antigravity HTTPS RPC {} failed with status {}: {}",
+            method,
+            status,
+            response_body
+        );
     }
     Ok(serde_json::from_str(&response_body)?)
 }
@@ -2822,13 +2817,12 @@ fn rpc_request_plain_http(
     };
 
     if status_code != 200 {
-        return Err(RpcStatusError {
-            method: method.to_string(),
-            status: status_code,
-            response_body,
-            https: false,
-        }
-        .into());
+        return Err(anyhow::anyhow!(
+            "Antigravity RPC {} failed with status {}: {}",
+            method,
+            status_code,
+            response_body
+        ));
     }
 
     Ok(serde_json::from_str(&response_body)?)
@@ -3169,47 +3163,6 @@ fn fetch_usage_timestamps(
     }
 }
 
-#[derive(Debug)]
-struct RpcStatusError {
-    method: String,
-    status: u16,
-    response_body: String,
-    https: bool,
-}
-
-impl std::fmt::Display for RpcStatusError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Antigravity {}RPC {} failed with status {}: {}",
-            if self.https { "HTTPS " } else { "" },
-            self.method,
-            self.status,
-            self.response_body
-        )
-    }
-}
-
-impl std::error::Error for RpcStatusError {}
-
-fn is_session_not_found_error(err: &anyhow::Error) -> bool {
-    let Some(status_error) = err.downcast_ref::<RpcStatusError>() else {
-        return false;
-    };
-    if status_error.status != 404 || status_error.method != "GetCascadeTrajectoryGeneratorMetadata"
-    {
-        return false;
-    }
-    let Ok(response) = serde_json::from_str::<Value>(&status_error.response_body) else {
-        return false;
-    };
-    response.get("code").and_then(Value::as_str) == Some("not_found")
-        && response
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("trajectory not found"))
-}
-
 fn try_fetch_session_artifact(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
@@ -3236,13 +3189,6 @@ fn try_fetch_session_artifact(
             value
         }
         Err(err) => {
-            if is_session_not_found_error(&err) {
-                eprintln!(
-                    "Warning: Antigravity session {} not found; skipping: {err:#}",
-                    summary.session_id
-                );
-                return Ok(None);
-            }
             budget.record_metadata_failure(&connection.fingerprint, metadata_started.elapsed());
             eprintln!(
                 "Warning: failed to fetch Antigravity metadata for session {}: {err:#}",
@@ -4499,7 +4445,6 @@ mod tests {
         std::fs::create_dir_all(legacy_root.join("brain/session-a")).unwrap();
         std::fs::create_dir_all(legacy_root.join("brain/session-b")).unwrap();
         std::fs::create_dir_all(legacy_root.join("brain/tempmediaStorage")).unwrap();
-        std::fs::create_dir_all(legacy_root.join("brain/.hidden-session")).unwrap();
         std::fs::create_dir_all(legacy_root.join("conversations")).unwrap();
         std::fs::write(legacy_root.join("conversations/session-c.pb"), b"pb").unwrap();
 
@@ -4524,7 +4469,6 @@ mod tests {
         assert!(ids.contains(&"session-e".to_string()));
         assert!(ids.contains(&"session-f".to_string()));
         assert!(!ids.contains(&"tempmediaStorage".to_string()));
-        assert!(!ids.contains(&".hidden-session".to_string()));
     }
 
     #[test]
@@ -4762,13 +4706,6 @@ mod tests {
     where
         F: Fn(&str) -> Option<String> + Send + 'static,
     {
-        serve_rpc_responses(move |method| handler(method).map(|body| (200, body)))
-    }
-
-    fn serve_rpc_responses<F>(handler: F) -> (u16, Arc<Mutex<Vec<String>>>)
-    where
-        F: Fn(&str) -> Option<(u16, String)> + Send + 'static,
-    {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let methods = Arc::new(Mutex::new(Vec::new()));
@@ -4794,11 +4731,11 @@ mod tests {
                 if let Ok(mut log) = seen.lock() {
                     log.push(method.clone());
                 }
-                let Some((status, body)) = handler(&method) else {
+                let Some(body) = handler(&method) else {
                     continue;
                 };
                 let response = format!(
-                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -4839,181 +4776,56 @@ mod tests {
     }
 
     #[test]
-    fn session_not_found_requires_metadata_status_and_structured_trajectory_error() {
-        for (status, body, expected) in [
-            (
-                404,
-                r#"{"code":"not_found","message":"not_found: trajectory not found"}"#,
-                true,
-            ),
-            (
-                404,
-                r#"{ "message": "trajectory not found", "code": "not_found" }"#,
-                true,
-            ),
-            (404, "<html>Not Found</html>", false),
-            (
-                404,
-                r#"{"code":"not_found","message":"RPC route not found"}"#,
-                false,
-            ),
-            (
-                404,
-                r#"{"code":"internal","message":"trajectory not found"}"#,
-                false,
-            ),
-            (404, r#"{"code":"not_found","message":null}"#, false),
-            (404, "invalid JSON: trajectory not found", false),
-            (
-                401,
-                r#"{"code":"not_found","message":"trajectory not found"}"#,
-                false,
-            ),
-            (
-                403,
-                r#"{"code":"not_found","message":"trajectory not found"}"#,
-                false,
-            ),
-            (
-                429,
-                r#"{"code":"not_found","message":"trajectory not found"}"#,
-                false,
-            ),
-            (
-                500,
-                r#"{"code":"not_found","message":"trajectory not found"}"#,
-                false,
-            ),
-            (503, "upstream failed with status 404", false),
-        ] {
-            for https in [false, true] {
-                let err = anyhow::Error::new(RpcStatusError {
-                    method: "GetCascadeTrajectoryGeneratorMetadata".to_string(),
-                    status,
-                    response_body: body.to_string(),
-                    https,
-                })
-                .context("metadata RPC failed");
-                assert_eq!(is_session_not_found_error(&err), expected, "{err:#}");
-            }
-        }
-
-        let err = anyhow::anyhow!("TLS handshake failed").context(
-            r#"HTTP RPC failed with status 404: {"code":"not_found","message":"trajectory not found"}; HTTPS fallback failed"#,
-        );
-        assert!(!is_session_not_found_error(&err));
-        let err = anyhow::Error::new(RpcStatusError {
-            method: "GetAllCascadeTrajectories".to_string(),
-            status: 404,
-            response_body: r#"{"code":"not_found","message":"trajectory not found"}"#.to_string(),
-            https: false,
-        });
-        assert!(!is_session_not_found_error(&err));
-    }
-
-    #[test]
     #[serial]
-    fn metadata_status_errors_preserve_cache_and_report_partial_unless_session_is_missing() {
-        for (status, body, missing) in [
-            (
-                404,
-                r#"{"code":"not_found","message":"trajectory not found"}"#,
-                true,
-            ),
-            (
-                404,
-                r#"{"code":"not_found","message":"RPC route not found"}"#,
-                false,
-            ),
-            (
-                500,
-                r#"{"code":"not_found","message":"trajectory not found"}"#,
-                false,
-            ),
-            (429, "upstream failed with status 404", false),
-        ] {
+    fn sync_ignores_tempmedia_storage_and_exports_normal_sessions() {
+        for with_tempmedia in [false, true] {
             let temp_dir = tempfile::tempdir().unwrap();
             let _env = TestEnvGuard::redirect_to(temp_dir.path());
-            let contents = "{\"type\":\"usage\",\"inputTokens\":10}\n";
-            let path = write_session_artifact("session-1", contents).unwrap();
-            let mut manifest = sample_manifest();
-            manifest.sessions[0].artifact_path = to_relative_artifact_path(&path).unwrap();
-            save_antigravity_manifest(&manifest).unwrap();
-            let summaries = serde_json::json!({
-                "cascadeTrajectories": [
-                    {"cascadeId": "session-1", "lastModifiedTime": 2},
-                    {"cascadeId": "session-2", "lastModifiedTime": 1}
-                ]
-            })
-            .to_string();
-            let (port, _) = serve_rpc_responses(move |method| match method {
-                "GetAllCascadeTrajectories" => Some((200, summaries.clone())),
-                "GetCascadeTrajectoryGeneratorMetadata" => Some((status, body.to_string())),
+            let brain = temp_dir.path().join(".gemini/antigravity/brain");
+            fs::create_dir_all(brain.join("session-a")).unwrap();
+            if with_tempmedia {
+                fs::create_dir_all(brain.join("tempmediaStorage")).unwrap();
+            }
+
+            let metadata = metadata_needing_enrichment();
+            let (port, seen) = serve_rpc_methods(move |method| match method {
+                "GetAllCascadeTrajectories" => Some(r#"{"cascadeTrajectories":[]}"#.to_string()),
+                "GetCascadeTrajectoryGeneratorMetadata" => Some(metadata.clone()),
+                "GetCascadeTrajectory" => Some(r#"{"trajectory":{"steps":[]}}"#.to_string()),
                 _ => None,
             });
             let connection = enrichment_test_connection(port);
             let result = sync_antigravity_cache_with_connections(&[connection], true);
-            assert_eq!(result.synced, missing, "{status}: {result:?}");
-            assert_eq!(result.partial, !missing, "{status}: {result:?}");
-            assert_eq!(result.failed_sessions, if missing { 0 } else { 2 });
-            assert_eq!(result.retained_sessions, 1);
-            assert_eq!(result.sessions, 0);
-            assert_eq!(result.error.is_none(), missing);
-            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
-            let saved = load_antigravity_manifest().unwrap();
-            assert_eq!(saved.sessions.len(), 1);
-            assert_eq!(saved.sessions[0].session_id, "session-1");
-        }
-    }
+            assert!(result.synced, "with_tempmedia={with_tempmedia}: {result:?}");
+            assert!(!result.partial);
+            assert_eq!(result.failed_sessions, 0);
+            assert_eq!(result.sessions, 1);
+            assert!(result.error.is_none());
 
-    #[test]
-    #[serial]
-    fn missing_metadata_sessions_do_not_block_a_later_healthy_session() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let _env = TestEnvGuard::redirect_to(temp_dir.path());
-        let summaries = serde_json::json!({
-            "cascadeTrajectories": [
-                {"cascadeId": "session-1", "lastModifiedTime": 3},
-                {"cascadeId": "session-2", "lastModifiedTime": 2},
-                {"cascadeId": "session-3", "lastModifiedTime": 1}
-            ]
-        })
-        .to_string();
-        let requests = AtomicUsize::new(0);
-        let metadata = metadata_needing_enrichment();
-        let (port, seen) = serve_rpc_responses(move |method| match method {
-            "GetAllCascadeTrajectories" => Some((200, summaries.clone())),
-            "GetCascadeTrajectoryGeneratorMetadata" => {
-                if requests.fetch_add(1, Ordering::SeqCst) < 2 {
-                    Some((
-                        404,
-                        r#"{"code":"not_found","message":"trajectory not found"}"#.to_string(),
-                    ))
-                } else {
-                    Some((200, metadata.clone()))
-                }
-            }
-            "GetCascadeTrajectory" => Some((200, r#"{"trajectory":{"steps":[]}}"#.to_string())),
-            _ => None,
-        });
-        let connection = enrichment_test_connection(port);
-        let result = sync_antigravity_cache_with_connections(&[connection], true);
-        assert!(result.synced, "{result:?}");
-        assert!(!result.partial);
-        assert_eq!(result.failed_sessions, 0);
-        assert_eq!(result.sessions, 1);
-        assert!(result.error.is_none());
-        let manifest = load_antigravity_manifest().unwrap();
-        assert_eq!(manifest.sessions.len(), 1);
-        assert_eq!(manifest.sessions[0].session_id, "session-3");
-        assert_eq!(
-            seen.lock()
+            let manifest = load_antigravity_manifest().unwrap();
+            assert_eq!(manifest.sessions.len(), 1);
+            assert_eq!(manifest.sessions[0].session_id, "session-a");
+            let artifact_path = get_antigravity_cache_dir()
                 .unwrap()
-                .iter()
-                .filter(|method| *method == "GetCascadeTrajectoryGeneratorMetadata")
-                .count(),
-            3
-        );
+                .join(&manifest.sessions[0].artifact_path);
+            let contents = fs::read_to_string(artifact_path).unwrap();
+            let usage = contents
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|row| row["type"] == "usage")
+                .expect("the normal session must retain its usage");
+            assert_eq!(usage["input"], 10);
+            assert_eq!(usage["output"], 5);
+            assert_eq!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|method| *method == "GetCascadeTrajectoryGeneratorMetadata")
+                    .count(),
+                1,
+                "tempmediaStorage must not trigger a metadata request"
+            );
+        }
     }
 
     #[test]
