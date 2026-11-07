@@ -500,6 +500,55 @@ pub(crate) struct CodexPendingUsageRecord {
     /// marked yet, so if it is emitted it is the turn's first reply.
     #[serde(default)]
     turn_start: bool,
+    /// Frozen when this response ends, before later model/tool events arrive.
+    #[serde(default)]
+    performance_timing: Option<super::PerformanceTiming>,
+}
+
+// Parser 19 stores this nested record positionally. Keep its released
+// layout independent of the current request-timing state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LegacyCodexPendingUsageRecordV19 {
+    usage: CodexTotals,
+    timestamp_ms: Option<i64>,
+    turn_id: Option<String>,
+    response_id: Option<String>,
+    service_tier: Option<String>,
+    model: Option<String>,
+    after_compacted: bool,
+    turn_start: bool,
+}
+
+impl From<LegacyCodexPendingUsageRecordV19> for CodexPendingUsageRecord {
+    fn from(record: LegacyCodexPendingUsageRecordV19) -> Self {
+        Self {
+            usage: record.usage,
+            timestamp_ms: record.timestamp_ms,
+            turn_id: record.turn_id,
+            response_id: record.response_id,
+            service_tier: record.service_tier,
+            model: record.model,
+            after_compacted: record.after_compacted,
+            turn_start: record.turn_start,
+            performance_timing: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<CodexPendingUsageRecord> for LegacyCodexPendingUsageRecordV19 {
+    fn from(record: CodexPendingUsageRecord) -> Self {
+        Self {
+            usage: record.usage,
+            timestamp_ms: record.timestamp_ms,
+            turn_id: record.turn_id,
+            response_id: record.response_id,
+            service_tier: record.service_tier,
+            model: record.model,
+            after_compacted: record.after_compacted,
+            turn_start: record.turn_start,
+        }
+    }
 }
 
 impl CodexPendingUsageRecord {
@@ -1168,20 +1217,25 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                             .usage
                             .as_ref()
                             .filter(|usage| usage.has_supported_counters())
-                            .map(|usage| CodexPendingUsageRecord {
-                                usage: CodexTotals::from_usage(usage),
-                                timestamp_ms: parse_codex_entry_timestamp(
-                                    entry.timestamp.as_deref(),
-                                ),
-                                turn_id: payload
-                                    .turn_id
-                                    .clone()
-                                    .or_else(|| state.current_turn_id.clone()),
-                                response_id: payload.response_id.clone(),
-                                service_tier,
-                                model: extract_model(&payload),
-                                after_compacted: false,
-                                turn_start: state.pending_turn_start,
+                            .map(|usage| {
+                                let totals = CodexTotals::from_usage(usage);
+                                let at = parse_codex_entry_timestamp(entry.timestamp.as_deref());
+                                let performance_timing =
+                                    Some(state.request_timing.finish(at, Some(totals), totals));
+                                CodexPendingUsageRecord {
+                                    usage: totals,
+                                    timestamp_ms: at,
+                                    turn_id: payload
+                                        .turn_id
+                                        .clone()
+                                        .or_else(|| state.current_turn_id.clone()),
+                                    response_id: payload.response_id.clone(),
+                                    service_tier,
+                                    model: extract_model(&payload),
+                                    after_compacted: false,
+                                    turn_start: state.pending_turn_start,
+                                    performance_timing,
+                                }
                             });
                         // A held record is a usage ledger even before it is
                         // settled, so the rollout is not reported as unmetered.
@@ -1720,6 +1774,19 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         .pending_usage_record
                         .as_ref()
                         .is_some_and(|record| record.reported_by(emitted_usage));
+                    let pending_timing = state
+                        .pending_usage_record
+                        .as_ref()
+                        .filter(|record| reports_pending || !record.after_compacted)
+                        .and_then(|record| {
+                            record.performance_timing.map(|timing| {
+                                if Some(record.usage) == last_usage {
+                                    timing
+                                } else {
+                                    super::PerformanceTiming::Unavailable
+                                }
+                            })
+                        });
                     if reports_pending {
                         // The same response: counted once, from here.
                         state.pending_usage_record = None;
@@ -1771,11 +1838,11 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         .or_else(|| state.thread_service_tier.clone())
                         .map(crate::sessions::SharedStr::from);
                     message.duration_ms = duration_ms;
-                    message.performance_timing = Some(state.request_timing.finish(
-                        parsed_timestamp,
-                        last_usage,
-                        emitted_usage,
-                    ));
+                    message.performance_timing = Some(pending_timing.unwrap_or_else(|| {
+                        state
+                            .request_timing
+                            .finish(parsed_timestamp, last_usage, emitted_usage)
+                    }));
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under
                     // way: a `turn_context` without an id that comes later
@@ -2010,6 +2077,7 @@ fn emit_unconfirmed_usage_record(
     let timestamp = record.timestamp_ms.unwrap_or(fallback_timestamp);
     let mut message =
         new_codex_usage_message(state, session_id, model.as_deref(), timestamp, tokens);
+    message.performance_timing = record.performance_timing;
     // The first reply after human input marks the turn start, as on the
     // token_count path; a mark left for a later turn is not taken.
     if record.turn_start && state.pending_turn_start {
