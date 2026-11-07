@@ -1,7 +1,7 @@
 //! Shared parsers for Tencent CodeBuddy / WorkBuddy session formats.
 
 use super::utils::for_each_json_line;
-use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
+use super::{normalize_workspace_key, workspace_label_from_key, PerformanceTiming, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use chrono::TimeZone;
 use serde::Deserialize;
@@ -441,7 +441,9 @@ pub(crate) fn parse_extension_log_file(
         // malformed or empty usage. Leaving the anchor in place would hand the
         // next settlement of the same agent a stale clock and bill the whole
         // gap between two executions as one generation.
-        let prepared = prepared_by_agent.remove(&agent_id);
+        let prepared_at = prepared_by_agent
+            .get_mut(&agent_id)
+            .and_then(|prepared| prepared.prepared_at_ms.take());
         let Some(usage_json) = line.split("Agent execution successful with usage:").nth(1) else {
             return;
         };
@@ -464,22 +466,18 @@ pub(crate) fn parse_extension_log_file(
         // whole lifetime of the file.
         let parsed_settled_at = parse_log_timestamp_ms(line);
         let settled_at = parsed_settled_at.unwrap_or(fallback_timestamp);
-        let model_id = prepared
-            .as_ref()
+        let model_id = prepared_by_agent
+            .get(&agent_id)
             .map(|prepared| prepared.model_id.clone())
             .unwrap_or_else(|| default_model.to_string());
-        // Date the message at the anchor, not at the settlement. `SessionSpan`
-        // projects a message as `[timestamp, timestamp + duration_ms]`, so
-        // stamping the settlement would push the interval forward by one
-        // generation and move the day buckets it lands in.
-        let (timestamp, duration_ms) = match (
-            prepared.and_then(|prepared| prepared.prepared_at_ms),
-            parsed_settled_at,
-        ) {
+        // Keep the released accounting timestamp at settlement. Performance
+        // timing is independent of the activity span, which must not extend
+        // past settlement or move usage into the preparation day's archive.
+        let performance_timing = match (prepared_at, parsed_settled_at) {
             (Some(prepared_at), Some(settled_at)) if settled_at > prepared_at => {
-                (prepared_at, Some(settled_at - prepared_at))
+                Some(PerformanceTiming::Duration(settled_at - prepared_at))
             }
-            _ => (settled_at, None),
+            _ => None,
         };
         let provider_id = provider_identity::inferred_provider_from_model(&model_id)
             .unwrap_or(DEFAULT_PROVIDER)
@@ -489,11 +487,11 @@ pub(crate) fn parse_extension_log_file(
             model_id,
             provider_id,
             agent_id.clone(),
-            timestamp,
+            settled_at,
             tokens,
             0.0,
         );
-        message.duration_ms = duration_ms;
+        message.performance_timing = performance_timing;
         // Key on the SECOND, not the millisecond. The same [AgentReporter] line
         // is written to multiple sinks (the extension's own log AND the host's
         // output-channel log), each prefixed by its own logger a few ms apart, so
@@ -821,20 +819,19 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
-        assert_eq!(message.duration_ms, Some(1_100));
-        // The message is dated at the anchor and the span closes on the
-        // settlement, so the projected interval still ends where the log
-        // reports the execution finishing.
-        let prepared_at = parse_log_timestamp_ms(
-            "[2026/7/1 16:56:01.100] [info] [CraftInvokableAgent] [agent-1] Model prepared: Kimi-K2.7-Code (kimi-k2.7)",
-        )
-        .unwrap();
+        assert_eq!(message.performance_duration_ms(), Some(1_100));
+        assert_eq!(message.duration_ms, None);
         let settled_at = parse_log_timestamp_ms(
             "[2026/7/1 16:56:02.200] [info] [AgentReporter] [agent-1] Agent execution successful with usage: {}",
         )
         .unwrap();
-        assert_eq!(message.timestamp, prepared_at);
-        assert_eq!(message.timestamp + message.duration_ms.unwrap(), settled_at);
+        assert_eq!(message.timestamp, settled_at);
+        let span = crate::sessionize::SessionSpan::from_message(
+            message,
+            &mut crate::sessionize::SpanInterner::default(),
+        );
+        assert_eq!(span.start_ts, settled_at);
+        assert_eq!(span.end_ts, settled_at);
     }
 
     #[test]
@@ -868,10 +865,34 @@ mod tests {
         let messages = parse_extension_log_file("codebuddy", "codebuddy", &path);
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].duration_ms, Some(1_100));
+        assert_eq!(messages[0].model_id, "glm-5.2");
+        assert_eq!(messages[1].model_id, "glm-5.2");
+        assert_eq!(messages[0].performance_duration_ms(), Some(1_100));
         // Without a fresh `Model prepared:` line the second settlement stays
         // untimed instead of billing the minute between the two executions.
-        assert_eq!(messages[1].duration_ms, None);
+        assert_eq!(messages[1].performance_duration_ms(), None);
+    }
+
+    #[test]
+    fn parse_extension_log_file_preserves_settlement_day_across_midnight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.log");
+        std::fs::write(
+            &path,
+            r#"[2026/7/1 23:59:59.100] [info] [CraftInvokableAgent] [agent-1] Model prepared: GLM-5.2 (glm-5.2)
+[2026/7/2 00:00:00.200] [info] [AgentReporter] [agent-1] Agent execution successful with usage: {"inputTokens":10,"outputTokens":2,"totalTokens":12}"#,
+        )
+        .unwrap();
+
+        let settled_at = parse_log_timestamp_ms("[2026/7/2 00:00:00.200]").unwrap();
+        for client in ["codebuddy", "workbuddy"] {
+            let messages = parse_extension_log_file(client, client, &path);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].timestamp, settled_at);
+            assert_eq!(messages[0].date, "2026-07-02");
+            assert_eq!(messages[0].tokens.total(), 12);
+            assert_eq!(messages[0].performance_duration_ms(), Some(1_100));
+        }
     }
 
     #[test]
@@ -893,6 +914,8 @@ mod tests {
         // time and bill the minute between the two lines as one generation.
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].duration_ms, None);
+        assert_eq!(messages[0].performance_duration_ms(), None);
+        assert_eq!(messages[0].model_id, "glm-5.2");
     }
 
     #[test]
