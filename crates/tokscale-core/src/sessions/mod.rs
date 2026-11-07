@@ -542,10 +542,14 @@ impl UnifiedMessage {
             billing_provider: self.billing_identity.id(),
             upstream_hint: Some(&self.provider_id),
             service_tier: self.service_tier.as_deref(),
-            // A Grok turn row aggregates every call of the turn, so
+            // A Grok turn row aggregates every call of the turn, and a Hermes
+            // row other than a logged call (its residual, or a row its agent
+            // log could not split) aggregates an unknown number of calls, so
             // per-request full-request tier boundaries cannot be inferred
-            // from its token sums (#1410).
-            multi_call_aggregate: self.client == "grok" && self.message_count > 1,
+            // from their token sums (#1410). A parsed-message round trip
+            // drops the Hermes key, so such a copy prices as an aggregate.
+            multi_call_aggregate: (self.client == "grok" && self.message_count > 1)
+                || (self.client == "hermes" && hermes::message_logged_day(self).is_none()),
         }
     }
 

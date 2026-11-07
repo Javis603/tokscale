@@ -2122,7 +2122,12 @@ fn parser_version(client: ClientId) -> u32 {
         // change shape; cached aggregates from before the split must miss.
         // v3->v4: parser-owned key markers distinguish logged evidence from a
         // residual start-day share and from user-controlled date-like suffixes.
-        ClientId::Hermes => 4,
+        // v4->v5: logged day shares carry the summed request latency as
+        // performance timing, and a residual on a logged day is its own share
+        // instead of merging into the timed one.
+        // v5->v6: each logged call is its own message instead of summing into
+        // its day's share, so estimates select full-request tiers per call.
+        ClientId::Hermes => 6,
         // v1->v2: Unsloth Studio now reads the responding model and provider
         // route from scalar responseDetails fields. Reparse cached rows so
         // local usage stays authoritatively free, metered providers receive
@@ -6982,22 +6987,22 @@ mod tests {
     }
 
     #[test]
-    fn test_hermes_parser_version_invalidates_ambiguous_day_keys() {
-        assert_eq!(parser_version(ClientId::Hermes), 4);
+    fn test_hermes_per_call_parser_version_invalidates_v5_entries() {
+        assert_eq!(parser_version(ClientId::Hermes), 6);
     }
 
     #[test]
     #[serial_test::serial]
-    fn hermes_v3_shard_misses_and_is_rebuilt_under_v4_identity() {
+    fn hermes_v5_shard_misses_and_is_rebuilt_under_v6_identity() {
         let cache_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(cache_home.path());
         let source = write_temp_file(b"unchanged Hermes source");
         let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
         let current_identity = CacheIdentity::for_client(ClientId::Hermes);
-        assert_eq!(current_identity.parser_version, 4);
+        assert_eq!(current_identity.parser_version, 6);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
-            parser_version: 3,
+            parser_version: 5,
         };
         let stale_message = UnifiedMessage::new(
             "hermes",
@@ -7011,8 +7016,8 @@ mod tests {
             },
             0.99,
         );
-        // Fabricate the shard exactly as a v3-era writer left it: a v3
-        // envelope holding v3 entries. Routing a stale-identity entry through
+        // Fabricate the shard exactly as a v5-era writer left it: a v5
+        // envelope holding v5 entries. Routing a stale-identity entry through
         // the current save pipeline would instead write a current envelope
         // with a mismatched entry, which shard validation rejects as corrupt.
         let stale_entry = CachedSourceEntry::new(
@@ -7040,7 +7045,7 @@ mod tests {
         let mut current_cache = SourceMessageCache::load();
         assert!(
             current_cache.get(current_identity, source.path()).is_none(),
-            "an unchanged v3 Hermes shard must miss under the v4 identity"
+            "an unchanged v5 Hermes shard must miss under the v6 identity"
         );
 
         let mut rebuilt = UnifiedMessage::new(
@@ -7069,7 +7074,7 @@ mod tests {
 
         let warm = SourceMessageCache::load();
         let entry = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(entry.parser_version, 4);
+        assert_eq!(entry.parser_version, 6);
         assert_eq!(entry.messages, vec![rebuilt]);
     }
 
