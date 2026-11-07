@@ -761,6 +761,8 @@ tokscale antigravity purge-cache
 
 **How it works**: `tokscale antigravity sync` discovers local Antigravity session candidates, fetches confirmed usage data from the local language server RPC, and stores normalized JSONL artifacts for tokscale-core to parse later. Run sync before reports if you want the freshest Antigravity data.
 
+A server-confirmed missing trajectory is skipped without discarding its cached usage. Other RPC or connection failures still report an incomplete sync, even when some sessions update successfully.
+
 ### Trae Commands
 
 Trae ([ByteDance's AI IDE](https://www.trae.ai/)) ships in two international product lines — Trae IDE and Trae Solo. They share the same account-level usage data (same backend, same JWT), so tokscale reports them as a single `trae` client. You can install either or both desktop apps; tokscale auto-discovers credentials from whichever is present.

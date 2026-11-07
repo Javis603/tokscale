@@ -2319,7 +2319,7 @@ fn rpc_request_with_deadline(
             Ok(value)
         }
         Err(http_err) => {
-            if is_rpc_cap_error(&http_err) {
+            if is_rpc_cap_error(&http_err) || http_err.is::<SessionNotFoundError>() {
                 remember_rpc_transport(connection.port, RpcTransport::PlainHttp);
                 return Err(http_err);
             }
@@ -2583,12 +2583,7 @@ fn https_rpc_request(
             )
         })?;
         if !(200..300).contains(&status) {
-            anyhow::bail!(
-                "Antigravity HTTPS RPC {} failed with status {}: {}",
-                method,
-                status,
-                response_body
-            );
+            return Err(rpc_status_error(method, status, response_body, true));
         }
 
         serde_json::from_str(response_body).with_context(|| {
@@ -2656,12 +2651,12 @@ async fn https_rpc_once(
     let status = response.status();
     let response_body = read_reqwest_response_with_cap(response, max_rpc_body_bytes()).await?;
     if !status.is_success() {
-        anyhow::bail!(
-            "Antigravity HTTPS RPC {} failed with status {}: {}",
+        return Err(rpc_status_error(
             method,
-            status,
-            response_body
-        );
+            status.as_u16(),
+            &response_body,
+            true,
+        ));
     }
     Ok(serde_json::from_str(&response_body)?)
 }
@@ -2817,12 +2812,7 @@ fn rpc_request_plain_http(
     };
 
     if status_code != 200 {
-        return Err(anyhow::anyhow!(
-            "Antigravity RPC {} failed with status {}: {}",
-            method,
-            status_code,
-            response_body
-        ));
+        return Err(rpc_status_error(method, status_code, &response_body, false));
     }
 
     Ok(serde_json::from_str(&response_body)?)
@@ -3163,6 +3153,37 @@ fn fetch_usage_timestamps(
     }
 }
 
+#[derive(Debug)]
+struct SessionNotFoundError(String);
+
+impl std::fmt::Display for SessionNotFoundError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionNotFoundError {}
+
+fn rpc_status_error(method: &str, status: u16, body: &str, https: bool) -> anyhow::Error {
+    let message = format!(
+        "Antigravity {}RPC {method} failed with status {status}: {body}",
+        if https { "HTTPS " } else { "" }
+    );
+    if method == "GetCascadeTrajectoryGeneratorMetadata" && status == 404 {
+        if let Ok(response) = serde_json::from_str::<Value>(body) {
+            if response.get("code").and_then(Value::as_str) == Some("not_found")
+                && matches!(
+                    response.get("message").and_then(Value::as_str),
+                    Some("trajectory not found" | "not_found: trajectory not found")
+                )
+            {
+                return SessionNotFoundError(message).into();
+            }
+        }
+    }
+    anyhow::anyhow!(message)
+}
+
 fn try_fetch_session_artifact(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
@@ -3189,6 +3210,14 @@ fn try_fetch_session_artifact(
             value
         }
         Err(err) => {
+            if err.is::<SessionNotFoundError>() {
+                budget.record_metadata_success(&connection.fingerprint);
+                eprintln!(
+                    "Warning: Antigravity session {} not found; skipping this connection: {err:#}",
+                    summary.session_id
+                );
+                return Ok(None);
+            }
             budget.record_metadata_failure(&connection.fingerprint, metadata_started.elapsed());
             eprintln!(
                 "Warning: failed to fetch Antigravity metadata for session {}: {err:#}",
@@ -4706,6 +4735,13 @@ mod tests {
     where
         F: Fn(&str) -> Option<String> + Send + 'static,
     {
+        serve_rpc_requests(move |method, _body| handler(method).map(|body| (200, body)))
+    }
+
+    fn serve_rpc_requests<F>(handler: F) -> (u16, Arc<Mutex<Vec<String>>>)
+    where
+        F: Fn(&str, &Value) -> Option<(u16, String)> + Send + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let methods = Arc::new(Mutex::new(Vec::new()));
@@ -4714,28 +4750,49 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                let mut buf = [0_u8; 4096];
-                let Ok(read) = std::io::Read::read(&mut stream, &mut buf) else {
+                let mut prefix = [0_u8; 5];
+                if stream.read_exact(&mut prefix).is_err() || &prefix != b"POST " {
                     continue;
-                };
-                let request = String::from_utf8_lossy(&buf[..read]).to_string();
-                if !request.starts_with("POST ") {
+                }
+                let mut reader = BufReader::new(&stream);
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() {
                     continue;
                 }
                 let method = request
                     .split_whitespace()
-                    .nth(1)
+                    .next()
                     .and_then(|path| path.rsplit('/').next())
                     .unwrap_or_default()
                     .to_string();
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                }
+                let mut bytes = vec![0_u8; content_length];
+                if reader.read_exact(&mut bytes).is_err() {
+                    continue;
+                }
+                let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
+                    continue;
+                };
+                drop(reader);
                 if let Ok(mut log) = seen.lock() {
                     log.push(method.clone());
                 }
-                let Some(body) = handler(&method) else {
+                let Some((status, body)) = handler(&method, &body) else {
                     continue;
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -4772,6 +4829,302 @@ mod tests {
             port,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn deleted_sessions_keep_cached_usage_without_failing_sync_or_blocking_live_sessions() {
+        for deleted_still_listed in [false, true] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let _env = TestEnvGuard::redirect_to(temp_dir.path());
+            let mut manifest = sample_manifest();
+            manifest.sessions.clear();
+            let mut cached = Vec::new();
+            for (session_id, modified) in [("deleted-a", 3), ("deleted-b", 2), ("active", 1)] {
+                let metadata: Value =
+                    serde_json::from_str(&timestamped_test_metadata(10, 5)).unwrap();
+                let lines = normalize_session_metadata(
+                    session_id,
+                    metadata["generatorMetadata"].as_array().unwrap(),
+                )
+                .unwrap();
+                let contents = format!("{}\n", lines.join("\n"));
+                let path = write_session_artifact(session_id, &contents).unwrap();
+                if session_id.starts_with("deleted-") {
+                    cached.push((path.clone(), contents));
+                }
+                manifest.sessions.push(ManifestSessionEntry {
+                    session_id: session_id.to_string(),
+                    artifact_path: to_relative_artifact_path(&path).unwrap(),
+                    last_modified_ms: Some(modified),
+                    step_count: Some(1),
+                    connection_fingerprint: String::new(),
+                    artifact_hash: None,
+                });
+            }
+            save_antigravity_manifest(&manifest).unwrap();
+            let mut summaries = vec![serde_json::json!({
+                "cascadeId": "active", "lastModifiedTime": 1
+            })];
+            if deleted_still_listed {
+                for (session_id, modified) in [("deleted-a", 3), ("deleted-b", 2)] {
+                    summaries.push(serde_json::json!({
+                        "cascadeId": session_id, "lastModifiedTime": modified
+                    }));
+                }
+            }
+            let summaries = serde_json::json!({ "cascadeTrajectories": summaries }).to_string();
+            let (port, seen) = serve_rpc_requests(move |method, body| match method {
+                "GetAllCascadeTrajectories" => Some((200, summaries.clone())),
+                "GetCascadeTrajectoryGeneratorMetadata" if body["cascadeId"] == "active" => {
+                    Some((200, timestamped_test_metadata(22, 8)))
+                }
+                "GetCascadeTrajectoryGeneratorMetadata" => Some((
+                    404,
+                    r#"{ "code": "not_found", "message": "not_found: trajectory not found" }"#
+                        .to_string(),
+                )),
+                _ => None,
+            });
+            let connection = enrichment_test_connection(port);
+            let result = sync_antigravity_cache_with_connections(&[connection], true);
+            assert!(result.synced, "listed={deleted_still_listed}: {result:?}");
+            assert!(!result.partial);
+            assert!(result.error.is_none());
+            assert_eq!(result.failed_sessions, 0);
+            assert_eq!(result.sessions, 1);
+            assert_eq!(result.retained_sessions, 2);
+            for (path, contents) in cached {
+                assert_eq!(fs::read_to_string(path).unwrap(), contents);
+            }
+            let saved = load_antigravity_manifest().unwrap();
+            assert_eq!(saved.sessions.len(), 3);
+            let mut input = 0;
+            let mut output = 0;
+            for session in &saved.sessions {
+                let path = get_antigravity_cache_dir()
+                    .unwrap()
+                    .join(&session.artifact_path);
+                for line in fs::read_to_string(path).unwrap().lines() {
+                    let row: Value = serde_json::from_str(line).unwrap();
+                    if row["type"] == "usage" {
+                        input += row["input"].as_i64().unwrap();
+                        output += row["output"].as_i64().unwrap();
+                    }
+                }
+            }
+            assert_eq!((input, output), (42, 18));
+            assert_eq!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|method| *method == "GetCascadeTrajectoryGeneratorMetadata")
+                    .count(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn missing_session_classification_uses_the_actual_status_and_json_body() {
+        for https in [false, true] {
+            for body in [
+                r#"{"code":"not_found","message":"trajectory not found"}"#,
+                r#"{ "message": "not_found: trajectory not found", "code": "not_found" }"#,
+            ] {
+                let err =
+                    rpc_status_error("GetCascadeTrajectoryGeneratorMetadata", 404, body, https)
+                        .context("metadata request failed");
+                assert!(err.is::<SessionNotFoundError>(), "{err:#}");
+                for status in [400, 401, 403, 429, 500, 503] {
+                    let err = rpc_status_error(
+                        "GetCascadeTrajectoryGeneratorMetadata",
+                        status,
+                        body,
+                        https,
+                    );
+                    assert!(!err.is::<SessionNotFoundError>(), "{err:#}");
+                }
+                for method in ["GetAllCascadeTrajectories", "GetCascadeTrajectory"] {
+                    let err = rpc_status_error(method, 404, body, https);
+                    assert!(!err.is::<SessionNotFoundError>(), "{err:#}");
+                }
+            }
+            for body in [
+                "<html>Not Found</html>",
+                "trajectory not found",
+                r#"{"code":"not_found","message":"RPC route not found"}"#,
+                r#"{"code":"internal","message":"trajectory not found"}"#,
+                r#"{"code":"not_found","message":null}"#,
+            ] {
+                let err =
+                    rpc_status_error("GetCascadeTrajectoryGeneratorMetadata", 404, body, https);
+                assert!(!err.is::<SessionNotFoundError>(), "{err:#}");
+            }
+        }
+        for failure in [
+            "TLS handshake failed",
+            "connection refused",
+            "request timed out",
+        ] {
+            let err = anyhow::anyhow!(failure).context(
+                r#"HTTP RPC failed with status 404: {"code":"not_found","message":"trajectory not found"}; HTTPS fallback failed"#,
+            );
+            assert!(!err.is::<SessionNotFoundError>(), "{err:#}");
+        }
+        let err = rpc_status_error("GetCascadeTrajectoryGeneratorMetadata", 500, "internal error", true)
+            .context(r#"HTTP RPC failed with status 404: {"code":"not_found","message":"trajectory not found"}"#);
+        assert!(!err.is::<SessionNotFoundError>(), "{err:#}");
+    }
+
+    #[test]
+    #[serial]
+    fn missing_session_response_breaks_consecutive_metadata_failures() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+        let (port, _) = serve_rpc_requests(|_, _| {
+            Some((
+                404,
+                r#"{"code":"not_found","message":"trajectory not found"}"#.to_string(),
+            ))
+        });
+        let connection = enrichment_test_connection(port);
+        let summary = TrajectorySummary {
+            session_id: "deleted".to_string(),
+            last_modified_ms: None,
+            step_count: None,
+            connection_fingerprint: connection.fingerprint.clone(),
+        };
+        let mut budget = TrajectoryEnrichmentBudget::with_limits(Duration::from_secs(60), 2);
+        budget.record_metadata_failure(&connection.fingerprint, Duration::ZERO);
+        assert!(
+            try_fetch_session_artifact(&summary, &connection, &mut budget, None)
+                .unwrap()
+                .is_none()
+        );
+        budget.record_metadata_failure(&connection.fingerprint, Duration::ZERO);
+        assert!(budget.metadata_should_attempt(&connection.fingerprint));
+        assert_eq!(cached_rpc_transport(port), Some(RpcTransport::PlainHttp));
+    }
+
+    fn timestamped_test_metadata(input: u64, output: u64) -> String {
+        serde_json::json!({
+            "generatorMetadata": [{
+                "chatModel": {
+                    "responseModel": "gemini-3.7-flash",
+                    "retryInfos": [{"usage": {
+                        "inputTokens": input,
+                        "outputTokens": output,
+                        "createdAt": 1700000000000_i64,
+                        "responseId": "response-1"
+                    }}]
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    #[serial]
+    fn missing_session_does_not_hide_another_connections_failure_or_usage() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+        let (missing_port, _) = serve_rpc_requests(|_, _| {
+            Some((
+                404,
+                r#"{"code":"not_found","message":"trajectory not found"}"#.to_string(),
+            ))
+        });
+        let missing = enrichment_test_connection(missing_port);
+        let summary = TrajectorySummary {
+            session_id: "session-a".to_string(),
+            last_modified_ms: Some(1),
+            step_count: Some(1),
+            connection_fingerprint: missing.fingerprint.clone(),
+        };
+        let (broken_port, _) = serve_rpc_methods(|_| None);
+        let broken = enrichment_test_connection(broken_port);
+        let result = fetch_session_artifact(
+            &summary,
+            &[missing.clone(), broken],
+            &mut TrajectoryEnrichmentBudget::new(),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "a missing session must not mask a broken connection"
+        );
+
+        let (healthy_port, _) = serve_rpc_methods(|_| Some(timestamped_test_metadata(22, 8)));
+        let healthy = enrichment_test_connection(healthy_port);
+        let artifact = fetch_session_artifact(
+            &summary,
+            &[missing, healthy],
+            &mut TrajectoryEnrichmentBudget::new(),
+            None,
+        )
+        .unwrap()
+        .expect("another connection can still hold this session");
+        let usage: Value = artifact
+            .contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|row| row["type"] == "usage")
+            .unwrap();
+        assert_eq!(usage["input"], 22);
+        assert_eq!(usage["output"], 8);
+    }
+
+    #[test]
+    #[serial]
+    fn routing_and_server_errors_remain_failures_while_other_sessions_sync() {
+        for (status, body) in [
+            (404, "<html>Not Found</html>"),
+            (
+                404,
+                r#"{"code":"not_found","message":"RPC route not found"}"#,
+            ),
+            (
+                401,
+                r#"{"code":"not_found","message":"trajectory not found"}"#,
+            ),
+            (403, "Forbidden"),
+            (429, "upstream failed with status 404"),
+            (
+                500,
+                r#"{"code":"not_found","message":"trajectory not found"}"#,
+            ),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let _env = TestEnvGuard::redirect_to(temp_dir.path());
+            let (port, _) = serve_rpc_requests(move |method, request| match method {
+                "GetAllCascadeTrajectories" => Some((
+                    200,
+                    serde_json::json!({
+                        "cascadeTrajectories": [
+                            {"cascadeId": "unavailable", "lastModifiedTime": 2},
+                            {"cascadeId": "active", "lastModifiedTime": 1}
+                        ]
+                    })
+                    .to_string(),
+                )),
+                "GetCascadeTrajectoryGeneratorMetadata" if request["cascadeId"] == "active" => {
+                    Some((200, timestamped_test_metadata(22, 8)))
+                }
+                "GetCascadeTrajectoryGeneratorMetadata" => Some((status, body.to_string())),
+                _ => None,
+            });
+            let connection = enrichment_test_connection(port);
+            let result = sync_antigravity_cache_with_connections(&[connection], true);
+            assert!(!result.synced, "{status}: {result:?}");
+            assert!(result.partial);
+            assert!(result.error.is_some());
+            assert_eq!(result.failed_sessions, 1);
+            assert_eq!(result.sessions, 1);
+            let manifest = load_antigravity_manifest().unwrap();
+            assert_eq!(manifest.sessions.len(), 1);
+            assert_eq!(manifest.sessions[0].session_id, "active");
         }
     }
 
