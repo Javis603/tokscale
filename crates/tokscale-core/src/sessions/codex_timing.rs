@@ -245,6 +245,60 @@ mod tests {
     }
 
     #[test]
+    fn pending_record_timing_excludes_tool_waits_with_missing_and_late_counts() {
+        for tool_wait in [0, 15] {
+            for first_count in ["missing", "late", "normal"] {
+                let mut file = NamedTempFile::new().unwrap();
+                let second_usage = json!({"input_tokens":100,"output_tokens":50,"cached_input_tokens":0,"reasoning_output_tokens":0});
+                let mut rows = vec![
+                    row(0, "turn_context", json!({"model":"gpt-5.4"})),
+                    row(
+                        10,
+                        "response_item",
+                        json!({"type":"function_call","call_id":"a"}),
+                    ),
+                    row(
+                        10,
+                        "token_usage_record",
+                        json!({"response_id":"a","usage":usage(100)}),
+                    ),
+                ];
+                if first_count == "normal" {
+                    rows.push(count(10, 100, 100));
+                }
+                rows.extend([
+                    row(10 + tool_wait, "response_item", json!({"type":"function_call_output","call_id":"a"})),
+                    row(20 + tool_wait, "response_item", json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]})),
+                    row(20 + tool_wait, "token_usage_record", json!({"response_id":"b","usage":second_usage})),
+                ]);
+                if first_count == "late" {
+                    rows.push(count(20 + tool_wait, 100, 100));
+                }
+                rows.push(row(20 + tool_wait, "event_msg", json!({"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":200,"output_tokens":150},"last_token_usage":second_usage
+                }})));
+                writeln!(file, "{}", rows.join("\n")).unwrap();
+                let messages = parse_codex_file(file.path());
+                assert_eq!(messages.len(), 2, "{tool_wait} {first_count}");
+                assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 200);
+                assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 150);
+                for message in &messages {
+                    assert_eq!(
+                        message.performance_duration_ms(),
+                        Some(10_000),
+                        "{tool_wait} {first_count}"
+                    );
+                }
+                let entries = aggregate_model_usage_entries(messages, &GroupBy::ClientModel);
+                assert_eq!(entries[0].performance.total_duration_ms, 20_000);
+                assert_eq!(entries[0].performance.timed_output_tokens, 150);
+                assert_eq!(entries[0].performance.sample_count, 2);
+                assert_incremental_matches(&file);
+            }
+        }
+    }
+
+    #[test]
     fn new_turn_keeps_output_inside_previous_counts_flush_window() {
         for boundary in [
             row_millis(2010, "turn_context", json!({"model":"gpt-5.4"})),
