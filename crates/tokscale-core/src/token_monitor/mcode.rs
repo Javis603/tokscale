@@ -436,14 +436,14 @@ fn session_messages(
             CLIENT_ID,
             row.model,
             row.provider,
-            session_id.to_string(),
+            session_id,
             row.timestamp,
             tokens,
             0.0,
             Some(format!("mcode:store:{session_id}:{}", row.message_id)),
         );
         message.is_turn_start = started_turns.insert(row.turn_id);
-        message.session_title = session.title.clone();
+        message.session_title = session.title.clone().map(Into::into);
         if workspace_key.is_some() {
             message.set_workspace(workspace_key.clone(), workspace_label.clone());
         }

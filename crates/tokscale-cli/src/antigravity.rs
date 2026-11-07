@@ -2109,7 +2109,7 @@ fn scan_filesystem_session_candidates() -> Result<Vec<SessionCandidate>> {
                 }
 
                 let session_id = entry.file_name().to_string_lossy().to_string();
-                if session_id.trim().is_empty() {
+                if session_id.trim().is_empty() || session_id == "tempmediaStorage" {
                     continue;
                 }
 
@@ -4444,6 +4444,7 @@ mod tests {
         let legacy_root = temp_dir.path().join(".gemini/antigravity");
         std::fs::create_dir_all(legacy_root.join("brain/session-a")).unwrap();
         std::fs::create_dir_all(legacy_root.join("brain/session-b")).unwrap();
+        std::fs::create_dir_all(legacy_root.join("brain/tempmediaStorage")).unwrap();
         std::fs::create_dir_all(legacy_root.join("conversations")).unwrap();
         std::fs::write(legacy_root.join("conversations/session-c.pb"), b"pb").unwrap();
 
@@ -4467,6 +4468,7 @@ mod tests {
         assert!(ids.contains(&"session-d".to_string()));
         assert!(ids.contains(&"session-e".to_string()));
         assert!(ids.contains(&"session-f".to_string()));
+        assert!(!ids.contains(&"tempmediaStorage".to_string()));
     }
 
     #[test]
@@ -4770,6 +4772,59 @@ mod tests {
             port,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn sync_ignores_tempmedia_storage_and_exports_normal_sessions() {
+        for with_tempmedia in [false, true] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let _env = TestEnvGuard::redirect_to(temp_dir.path());
+            let brain = temp_dir.path().join(".gemini/antigravity/brain");
+            fs::create_dir_all(brain.join("session-a")).unwrap();
+            if with_tempmedia {
+                fs::create_dir_all(brain.join("tempmediaStorage")).unwrap();
+            }
+
+            let metadata = metadata_needing_enrichment();
+            let (port, seen) = serve_rpc_methods(move |method| match method {
+                "GetAllCascadeTrajectories" => Some(r#"{"cascadeTrajectories":[]}"#.to_string()),
+                "GetCascadeTrajectoryGeneratorMetadata" => Some(metadata.clone()),
+                "GetCascadeTrajectory" => Some(r#"{"trajectory":{"steps":[]}}"#.to_string()),
+                _ => None,
+            });
+            let connection = enrichment_test_connection(port);
+            let result = sync_antigravity_cache_with_connections(&[connection], true);
+            assert!(result.synced, "with_tempmedia={with_tempmedia}: {result:?}");
+            assert!(!result.partial);
+            assert_eq!(result.failed_sessions, 0);
+            assert_eq!(result.sessions, 1);
+            assert!(result.error.is_none());
+
+            let manifest = load_antigravity_manifest().unwrap();
+            assert_eq!(manifest.sessions.len(), 1);
+            assert_eq!(manifest.sessions[0].session_id, "session-a");
+            let artifact_path = get_antigravity_cache_dir()
+                .unwrap()
+                .join(&manifest.sessions[0].artifact_path);
+            let contents = fs::read_to_string(artifact_path).unwrap();
+            let usage = contents
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|row| row["type"] == "usage")
+                .expect("the normal session must retain its usage");
+            assert_eq!(usage["input"], 10);
+            assert_eq!(usage["output"], 5);
+            assert_eq!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|method| *method == "GetCascadeTrajectoryGeneratorMetadata")
+                    .count(),
+                1,
+                "tempmediaStorage must not trigger a metadata request"
+            );
         }
     }
 

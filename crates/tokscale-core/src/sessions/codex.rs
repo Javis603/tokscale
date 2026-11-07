@@ -510,6 +510,55 @@ pub(crate) struct CodexPendingUsageRecord {
     /// marked yet, so if it is emitted it is the turn's first reply.
     #[serde(default)]
     turn_start: bool,
+    /// Frozen when this response ends, before later model/tool events arrive.
+    #[serde(default)]
+    performance_timing: Option<super::PerformanceTiming>,
+}
+
+// Parser 19 stores this nested record positionally. Keep its released
+// layout independent of the current request-timing state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LegacyCodexPendingUsageRecordV19 {
+    usage: CodexTotals,
+    timestamp_ms: Option<i64>,
+    turn_id: Option<String>,
+    response_id: Option<String>,
+    service_tier: Option<String>,
+    model: Option<String>,
+    after_compacted: bool,
+    turn_start: bool,
+}
+
+impl From<LegacyCodexPendingUsageRecordV19> for CodexPendingUsageRecord {
+    fn from(record: LegacyCodexPendingUsageRecordV19) -> Self {
+        Self {
+            usage: record.usage,
+            timestamp_ms: record.timestamp_ms,
+            turn_id: record.turn_id,
+            response_id: record.response_id,
+            service_tier: record.service_tier,
+            model: record.model,
+            after_compacted: record.after_compacted,
+            turn_start: record.turn_start,
+            performance_timing: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<CodexPendingUsageRecord> for LegacyCodexPendingUsageRecordV19 {
+    fn from(record: CodexPendingUsageRecord) -> Self {
+        Self {
+            usage: record.usage,
+            timestamp_ms: record.timestamp_ms,
+            turn_id: record.turn_id,
+            response_id: record.response_id,
+            service_tier: record.service_tier,
+            model: record.model,
+            after_compacted: record.after_compacted,
+            turn_start: record.turn_start,
+        }
+    }
 }
 
 impl CodexPendingUsageRecord {
@@ -1178,20 +1227,25 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                             .usage
                             .as_ref()
                             .filter(|usage| usage.has_supported_counters())
-                            .map(|usage| CodexPendingUsageRecord {
-                                usage: CodexTotals::from_usage(usage),
-                                timestamp_ms: parse_codex_entry_timestamp(
-                                    entry.timestamp.as_deref(),
-                                ),
-                                turn_id: payload
-                                    .turn_id
-                                    .clone()
-                                    .or_else(|| state.current_turn_id.clone()),
-                                response_id: payload.response_id.clone(),
-                                service_tier,
-                                model: extract_model(&payload),
-                                after_compacted: false,
-                                turn_start: state.pending_turn_start,
+                            .map(|usage| {
+                                let totals = CodexTotals::from_usage(usage);
+                                let at = parse_codex_entry_timestamp(entry.timestamp.as_deref());
+                                let performance_timing =
+                                    Some(state.request_timing.finish(at, Some(totals), totals));
+                                CodexPendingUsageRecord {
+                                    usage: totals,
+                                    timestamp_ms: at,
+                                    turn_id: payload
+                                        .turn_id
+                                        .clone()
+                                        .or_else(|| state.current_turn_id.clone()),
+                                    response_id: payload.response_id.clone(),
+                                    service_tier,
+                                    model: extract_model(&payload),
+                                    after_compacted: false,
+                                    turn_start: state.pending_turn_start,
+                                    performance_timing,
+                                }
                             });
                         // A held record is a usage ledger even before it is
                         // settled, so the rollout is not reported as unmetered.
@@ -1741,6 +1795,19 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         .pending_usage_record
                         .as_ref()
                         .is_some_and(|record| record.reported_by(emitted_usage));
+                    let pending_timing = state
+                        .pending_usage_record
+                        .as_ref()
+                        .filter(|record| reports_pending || !record.after_compacted)
+                        .and_then(|record| {
+                            record.performance_timing.map(|timing| {
+                                if Some(record.usage) == last_usage {
+                                    timing
+                                } else {
+                                    super::PerformanceTiming::Unavailable
+                                }
+                            })
+                        });
                     if reports_pending {
                         // The same response: counted once, from here.
                         state.pending_usage_record = None;
@@ -1789,15 +1856,17 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                     message.service_tier = state
                         .request_service_tier
                         .clone()
-                        .or_else(|| state.thread_service_tier.clone());
+                        .or_else(|| state.thread_service_tier.clone())
+                        .map(crate::sessions::SharedStr::from);
                     message.duration_ms = duration_ms;
-                    message.performance_timing = Some(state.request_timing.finish(
-                        parsed_timestamp,
-                        last_usage,
-                        emitted_usage,
-                    ));
+                    message.performance_timing = Some(pending_timing.unwrap_or_else(|| {
+                        state
+                            .request_timing
+                            .finish(parsed_timestamp, last_usage, emitted_usage)
+                    }));
                     // Reports resolve the raw parent id after filtering.
-                    message.parent_session_id = state.session_parent_thread_id.clone();
+                    message.parent_session_id =
+                        state.session_parent_thread_id.clone().map(Into::into);
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under
                     // way: a `turn_context` without an id that comes later
@@ -1970,9 +2039,9 @@ fn new_codex_usage_message(
     tokens: TokenBreakdown,
 ) -> UnifiedMessage {
     let agent = if state.session_is_headless {
-        Some(CODEX_HEADLESS_AGENT.to_string())
+        Some(CODEX_HEADLESS_AGENT)
     } else {
-        state.session_agent.clone()
+        state.session_agent.as_deref()
     };
 
     let provider = state
@@ -1994,9 +2063,9 @@ fn new_codex_usage_message(
     };
     UnifiedMessage::new_with_agent(
         client,
-        model.unwrap_or("unknown").to_string(),
+        model.unwrap_or("unknown"),
         provider,
-        message_session_id.to_string(),
+        message_session_id,
         timestamp,
         tokens,
         0.0,
@@ -2032,7 +2101,8 @@ fn emit_unconfirmed_usage_record(
     let timestamp = record.timestamp_ms.unwrap_or(fallback_timestamp);
     let mut message =
         new_codex_usage_message(state, session_id, model.as_deref(), timestamp, tokens);
-    message.parent_session_id = state.session_parent_thread_id.clone();
+    message.parent_session_id = state.session_parent_thread_id.clone().map(Into::into);
+    message.performance_timing = record.performance_timing;
     // The first reply after human input marks the turn start, as on the
     // token_count path; a mark left for a later turn is not taken.
     if record.turn_start && state.pending_turn_start {
@@ -2043,7 +2113,8 @@ fn emit_unconfirmed_usage_record(
         .service_tier
         .clone()
         .or_else(|| state.request_service_tier.clone())
-        .or_else(|| state.thread_service_tier.clone());
+        .or_else(|| state.thread_service_tier.clone())
+        .map(crate::sessions::SharedStr::from);
     // The record names its response, which is the identity sibling fork
     // replays share; without one, the record's time and counters stand in.
     let dedup_scope_id = state
@@ -2361,7 +2432,7 @@ fn flush_pending_model_messages(
             let upstream_session_id = message.session_id.clone();
             set_codex_dedup_key(&mut message, model, &upstream_session_id, None);
         }
-        message.model_id = model.to_string();
+        message.model_id = model.into();
         messages.push(message);
         if used_fallback_timestamp {
             fallback_timestamp_indices.push(messages.len() - 1);
@@ -2679,9 +2750,9 @@ fn parse_codex_headless_line(
         .or_else(|| inferred_provider_from_model(&model))
         .unwrap_or("openai");
     let agent = if state.session_is_headless {
-        Some(CODEX_HEADLESS_AGENT.to_string())
+        Some(CODEX_HEADLESS_AGENT)
     } else {
-        state.session_agent.clone()
+        state.session_agent.as_deref()
     };
 
     let used_fallback_timestamp = usage.timestamp_ms.is_none();
@@ -2689,7 +2760,7 @@ fn parse_codex_headless_line(
         "codex",
         model.clone(),
         provider,
-        session_id.to_string(),
+        session_id,
         timestamp,
         TokenBreakdown {
             input: usage.input.max(0),
@@ -4548,7 +4619,7 @@ mod tests {
         let messages = parse_codex_file(file.path());
 
         assert_eq!(messages.len(), 1);
-        messages[0].agent.clone()
+        messages[0].agent.as_ref().map(ToString::to_string)
     }
 
     #[test]
@@ -4601,7 +4672,7 @@ mod tests {
         let messages = parse_codex_file(file.path());
 
         assert_eq!(messages.len(), 1);
-        messages[0].parent_session_id.clone()
+        messages[0].parent_session_id.as_deref().map(str::to_string)
     }
 
     #[test]

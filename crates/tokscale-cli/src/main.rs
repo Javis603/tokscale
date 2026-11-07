@@ -1239,6 +1239,7 @@ pub enum ClientFilter {
     Aside,
     Vibe,
     Proma,
+    Bb,
     Synthetic,
 }
 
@@ -1308,6 +1309,7 @@ impl ClientFilter {
             Self::Aside => "aside",
             Self::Vibe => "vibe",
             Self::Proma => "proma",
+            Self::Bb => "bb",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1380,6 +1382,7 @@ impl ClientFilter {
             Self::Aside => Some(ClientId::Aside),
             Self::Vibe => Some(ClientId::Vibe),
             Self::Proma => Some(ClientId::Proma),
+            Self::Bb => Some(ClientId::Bb),
             Self::Synthetic => None,
         }
     }
@@ -1448,6 +1451,7 @@ impl ClientFilter {
             ClientId::Aside => Self::Aside,
             ClientId::Vibe => Self::Vibe,
             ClientId::Proma => Self::Proma,
+            ClientId::Bb => Self::Bb,
         }
     }
 
@@ -2118,25 +2122,38 @@ impl LightSpinner {
     const FRAME_MS: u64 = 40;
 
     fn start(message: &'static str) -> Self {
+        Self::start_with_ready(message, None)
+    }
+
+    fn start_with_ready(message: &'static str, ready: Option<std::sync::mpsc::Sender<()>>) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
         let message = message.to_string();
 
         let handle = thread::spawn(move || {
             let mut frame = 0usize;
-            let mut stderr = io::stderr().lock();
-
-            let _ = write!(stderr, "\x1b[?25l");
-            let _ = stderr.flush();
+            let mut ready = ready;
+            {
+                let mut stderr = io::stderr().lock();
+                let _ = write!(stderr, "\x1b[?25l");
+                let _ = stderr.flush();
+            }
 
             while running_thread.load(Ordering::Relaxed) {
                 let spinner = Self::frame(frame);
-                let _ = write!(stderr, "\r\x1b[K  {} {}", spinner, message);
-                let _ = stderr.flush();
+                {
+                    let mut stderr = io::stderr().lock();
+                    let _ = write!(stderr, "\r\x1b[K  {} {}", spinner, message);
+                    let _ = stderr.flush();
+                }
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
                 frame = frame.wrapping_add(1);
                 thread::sleep(Duration::from_millis(Self::FRAME_MS));
             }
 
+            let mut stderr = io::stderr().lock();
             let _ = write!(stderr, "\r\x1b[K\x1b[?25h");
             let _ = stderr.flush();
         });
@@ -4091,6 +4108,9 @@ fn run_pricing_lookup(
                 if !row.coverage && !row.uncovered_buckets.is_empty() {
                     print!(" uncovered={}", row.uncovered_buckets.join(","));
                 }
+                if let Some(gap) = row.submission_safety_gap {
+                    print!(" submission_safety_gap={}", gap.as_str());
+                }
                 println!();
             }
         }
@@ -4844,6 +4864,18 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                 additional_paths.push(AdditionalPath {
                     path: roots[1].to_string_lossy().into_owned(),
                     exists: roots[1].exists(),
+                });
+            }
+            if client == ClientId::Copilot {
+                let session_state = home_dir.join(".copilot/session-state");
+                additional_paths.push(AdditionalPath {
+                    path: session_state.to_string_lossy().to_string(),
+                    exists: session_state.exists(),
+                });
+                let session_store = home_dir.join(".copilot/session-store.db");
+                additional_paths.push(AdditionalPath {
+                    path: session_store.to_string_lossy().to_string(),
+                    exists: session_store.exists(),
                 });
             }
             if client == ClientId::Zcode {
@@ -10002,6 +10034,30 @@ mod tests {
     }
 
     #[test]
+    fn test_light_spinner_releases_stderr_between_frames() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let spinner = LightSpinner::start_with_ready("Testing stderr locking...", Some(ready_tx));
+        assert!(
+            ready_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "spinner must render a frame before testing stderr access"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            let _stderr = io::stderr().lock();
+            tx.send(()).unwrap();
+        });
+
+        let acquired_while_running = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        spinner.stop();
+        writer.join().unwrap();
+        assert!(
+            acquired_while_running,
+            "spinner must not hold stderr locked while idle"
+        );
+    }
+
+    #[test]
     fn test_light_spinner_frame_0() {
         let frame = LightSpinner::frame(0);
         assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
@@ -11064,6 +11120,174 @@ mod tests {
         withhold_coverage_for_clients(&mut intact, &std::collections::BTreeSet::new());
         assert!(intact.full_history);
         assert_eq!(intact.full_history_clients.len(), 2);
+    }
+
+    /// A readable SQLite COUNT is not proof that every Devin row decoded.
+    /// Exercise the real source graph, then the same authority filtering and
+    /// serializer as submit; a partial graph must not authorize history repair.
+    #[test]
+    #[serial_test::serial]
+    fn partial_devin_graph_withholds_serialized_submission_authority() {
+        struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (key, previous) in self.0.drain(..).rev() {
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+
+        let home = tempfile::TempDir::new().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let values = [
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("TOKSCALE_CONFIG_DIR", config.path().as_os_str().to_owned()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", "1".into()),
+            ("TOKSCALE_EXTRA_DIRS", "".into()),
+            ("TOKSCALE_HEADLESS_DIR", "".into()),
+        ];
+        let _restore = EnvRestore(
+            values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for (key, value) in values {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let db = home.path().join(".local/share/devin/cli/sessions.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, working_directory TEXT, title TEXT);
+             CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY, session_id TEXT, chat_message TEXT, created_at INTEGER);
+             INSERT INTO sessions VALUES ('sess', 'gpt-5', '/tmp/project', 'Task');",
+        ).unwrap();
+        // The duplicate supplies a genuine recount proof on a complete read.
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO message_nodes (session_id, chat_message, created_at) VALUES ('sess', ?1, 1700000000)",
+                [r#"{"role":"assistant","metadata":{"request_id":"req-1","metrics":{"input_tokens":67,"output_tokens":103}}}"#],
+            ).unwrap();
+        }
+        let cursor_dir = home.path().join("imports/cursor");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(
+            cursor_dir.join("usage.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "usageEventsDisplay": [{
+                    "timestamp": "1700000000000",
+                    "model": "gpt-5",
+                    "chargedCents": 1.0,
+                    "tokenUsage": {"inputTokens": 11, "outputTokens": 7, "totalCents": 1.0},
+                    "conversationId": "complete-sibling",
+                    "usageEventId": "cursor-event"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let clients = vec!["cursor".to_string(), "devin-cli".to_string()];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let scan = || {
+            // This public source-only graph uses the same streaming parser and
+            // SourceReadSummary as submission, without remote pricing fetches.
+            runtime
+                .block_on(tokscale_core::generate_source_graph_report_v2(
+                    tokscale_core::ReportOptions {
+                        home_dir: Some(home.path().to_str().unwrap().to_string()),
+                        use_env_roots: false,
+                        clients: Some(clients.clone()),
+                        scanner_settings: tokscale_core::scanner::ScannerSettings {
+                            extra_scan_paths: [("cursor".to_string(), vec![cursor_dir.clone()])]
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ))
+                .unwrap()
+        };
+        let payload = |graph: &tokscale_core::GraphResultV2, full_history| {
+            let mut scope = submit_scan_scope(Some(&clients), full_history, true).unwrap();
+            withhold_coverage_for_clients(
+                &mut scope,
+                &incompletely_read_clients(&graph.source_reads),
+            );
+            serde_json::to_value(to_ts_token_contribution_data(graph, None, Some(scope))).unwrap()
+        };
+
+        let complete = scan();
+        assert!(complete.source_reads["devin-cli"].complete());
+        assert!(complete.source_reads["cursor"].complete());
+        assert_eq!(complete.source_reads["cursor"].discovered, 1);
+        let full = payload(&complete, true);
+        assert_eq!(full["scanScope"]["fullHistory"], true);
+        assert!(full["scanScope"]["recountProofs"]["devin-cli"].is_object());
+        let bounded = payload(&complete, false);
+        assert_eq!(
+            bounded["scanScope"]["completeDayClients"],
+            serde_json::json!(["cursor", "devin-cli"])
+        );
+
+        for broken_row in ["X'FF'", "'{invalid json'"] {
+            conn.execute_batch(&format!(
+                "DELETE FROM message_nodes WHERE row_id = 3;
+                 INSERT INTO message_nodes VALUES (3, 'sess', {broken_row}, 1700000000);"
+            ))
+            .unwrap();
+            let partial = scan();
+            assert!(
+                partial.contributions.iter().any(|day| {
+                    day.clients
+                        .iter()
+                        .any(|client| client.client == "devin-cli")
+                }),
+                "readable Devin usage must remain available for local display"
+            );
+            for full_history in [true, false] {
+                let json = payload(&partial, full_history);
+                let scope = &json["scanScope"];
+                assert_eq!(
+                    scope["fullHistory"], false,
+                    "{broken_row}: partial history must not be authoritative"
+                );
+                for field in ["fullHistoryClients", "completeDayClients"] {
+                    assert!(
+                        scope[field].as_array().is_none_or(|clients| {
+                            !clients.iter().any(|client| client == "devin-cli")
+                        }),
+                        "{broken_row}: Devin must be absent from {field}: {scope}"
+                    );
+                }
+                assert!(scope["recountProofs"].get("devin-cli").is_none());
+                assert_eq!(scope["parserVersions"]["devin-cli"], 2);
+                if full_history {
+                    assert_eq!(scope["fullHistoryClients"], serde_json::json!(["cursor"]));
+                    assert!(scope["recountProofs"]["cursor"].is_object());
+                } else {
+                    assert_eq!(scope["completeDayClients"], serde_json::json!(["cursor"]));
+                }
+            }
+            assert!(!partial.source_reads["devin-cli"].complete());
+            assert!(partial.source_reads["cursor"].complete());
+        }
+
+        // Repairing the unreadable row restores authority; no partial warm
+        // cache may keep serving an incomplete snapshot after the repair.
+        conn.execute("DELETE FROM message_nodes WHERE row_id = 3", [])
+            .unwrap();
+        let repaired = payload(&scan(), true);
+        assert_eq!(repaired["scanScope"]["fullHistory"], true);
+        assert!(repaired["scanScope"]["recountProofs"]["devin-cli"].is_object());
     }
 
     /// The tip is advice for a person at a prompt. Autosubmit's stdout is the

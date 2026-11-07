@@ -39,7 +39,7 @@ pub use sessionize::{
     compute_daily_active_time, compute_daily_active_time_in, compute_time_metrics, sessionize,
     SessionInterval, TimeMetrics, DEFAULT_IDLE_GAP_MS,
 };
-pub use sessions::{CostSource, UnifiedMessage};
+pub use sessions::{CostSource, SharedStr, UnifiedMessage};
 
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -113,8 +113,8 @@ pub(crate) fn strip_parenthesized_reasoning_tier(model_id: &str) -> Option<&str>
 /// This is `normalize_syntactic` with **no alias folding**: purely structural
 /// canonicalization (lowercase, strip a `(reasoning-tier)` suffix, strip a
 /// trailing `-YYYYMMDD` date, rewrite `.`→`-` inside claude version numbers, and
-/// fold an `anthropic/claude-…` prefix). It never consults the user's
-/// machine-local `modelAliases`.
+/// fold a first-party `<provider>/` prefix such as `anthropic/claude-…`). It
+/// never consults the user's machine-local `modelAliases`.
 ///
 /// Every path that submits, uploads, exports as raw data, or persists a model id
 /// MUST use this, not [`normalize_model_for_grouping`]. A machine-local alias
@@ -155,7 +155,8 @@ pub fn model_name_for_grouping(client: &str, provider_id: &str, model_id: &str) 
 
 /// Structural-only model-name normalization: lowercase, strip a
 /// `(reasoning-tier)` suffix, strip a trailing `-YYYYMMDD` date, rewrite `.`→`-`
-/// inside claude version numbers, and fold an `anthropic/claude-…` prefix.
+/// inside claude version numbers, and fold a first-party `<provider>/` prefix
+/// (see [`strip_first_party_provider_prefix`]).
 ///
 /// This is the syntactic half of [`normalize_model_for_grouping`] /
 /// [`canonical_model_id`]. It is also used by [`model_alias::ModelAliasResolver`]
@@ -197,6 +198,8 @@ pub(crate) fn normalize_syntactic(model_id: &str) -> String {
 
     if let Some(canonical) = normalize_anthropic_prefixed_claude_model(&name) {
         name = canonical;
+    } else if let Some(bare) = strip_first_party_provider_prefix(&name) {
+        name = bare.to_string();
     }
 
     name
@@ -217,6 +220,28 @@ fn normalize_anthropic_prefixed_claude_model(model_id: &str) -> Option<String> {
     }
 
     Some(format!("claude-{family}-{major}-{minor}"))
+}
+
+/// Drop a `<provider>/` prefix when the prefix names the vendor that makes the
+/// model after it: `anthropic/claude-opus-5-5`, `openai-codex/gpt-6.1-sol`.
+///
+/// The prefix must canonicalize to the same provider that
+/// [`provider_identity::inferred_provider_from_model_delimited`] reads from the
+/// model family. The delimited form matches a family word only at a word
+/// boundary, so `mistral/demistralized` is not a Mistral model. Gateway
+/// spellings of one vendor (`openai-codex`, `x-ai`) fold while router labels
+/// (`cohere/north-mini-code:free`, `cline-free/…`), resellers (`openrouter/…`,
+/// `azure/gpt-4o`) and nested paths keep their prefix: for those the slash is
+/// part of the model name.
+fn strip_first_party_provider_prefix(model_id: &str) -> Option<&str> {
+    let (prefix, model) = model_id.split_once('/')?;
+    if model.is_empty() || model.contains('/') {
+        return None;
+    }
+    let prefix_provider = provider_identity::canonical_provider(prefix)?;
+    let model_provider = provider_identity::inferred_provider_from_model_delimited(model)
+        .and_then(provider_identity::canonical_provider)?;
+    (prefix_provider == model_provider).then_some(model)
 }
 
 fn retain_for_requested_clients(
@@ -420,17 +445,17 @@ impl ModelPerformance {
 pub struct ParsedMessage {
     pub estimate_status: sessions::EstimateStatus,
     pub billing_identity: sessions::BillingIdentity,
-    pub pricing_model_id: Option<String>,
-    pub client: String,
-    pub model_id: String,
+    pub pricing_model_id: Option<SharedStr>,
+    pub client: SharedStr,
+    pub model_id: SharedStr,
     /// Conflicting source evidence prevents pricing this row by its model id.
     pub model_attribution_conflicted: bool,
-    pub provider_id: String,
-    pub session_id: String,
-    pub workspace_key: Option<String>,
-    pub workspace_label: Option<String>,
+    pub provider_id: SharedStr,
+    pub session_id: SharedStr,
+    pub workspace_key: Option<SharedStr>,
+    pub workspace_label: Option<SharedStr>,
     pub timestamp: i64,
-    pub date: String,
+    pub date: SharedStr,
     pub input: i64,
     pub output: i64,
     pub cache_read: i64,
@@ -442,7 +467,7 @@ pub struct ParsedMessage {
     pub duration_ms: Option<i64>,
     pub performance_timing: Option<sessions::PerformanceTiming>,
     pub message_count: i32,
-    pub agent: Option<String>,
+    pub agent: Option<SharedStr>,
     /// Cost in USD as the parser reported it. This lane applies no pricing, so
     /// the figure is only meaningful when `cost_source` is
     /// [`CostSource::ProviderReported`]; consumers price every other row from
@@ -450,7 +475,7 @@ pub struct ParsedMessage {
     /// authoritative cost.
     pub cost: f64,
     pub cost_source: CostSource,
-    pub service_tier: Option<String>,
+    pub service_tier: Option<SharedStr>,
 }
 
 pub struct ParsedMessages {
@@ -1262,11 +1287,13 @@ fn flushed_message_identity(
     {
         return None;
     }
-    let mut model_id = message.model_id.clone();
-    let mut provider_id = message.provider_id.clone();
-    if context.include_synthetic {
-        sessions::synthetic::normalize_synthetic_gateway_fields(&mut model_id, &mut provider_id);
-    }
+    let normalized_model = context
+        .include_synthetic
+        .then(|| {
+            sessions::synthetic::synthetic_gateway_fields(&message.model_id, &message.provider_id)
+        })
+        .flatten()
+        .map(|fields| fields.model_id);
     let date = match &context.timezone {
         Some(timezone) => {
             let mut rebucketed = message.clone();
@@ -1275,7 +1302,14 @@ fn flushed_message_identity(
         }
         None => message.date.clone(),
     };
-    Some((date, canonical_model_id(&model_id)))
+    Some((
+        date.to_string(),
+        canonical_model_id(
+            normalized_model
+                .as_deref()
+                .unwrap_or(message.model_id.as_str()),
+        ),
+    ))
 }
 
 /// A per-call pricing optimization, never part of a persisted cache entry.
@@ -1581,12 +1615,7 @@ fn flush_retained_message<S: MessageSink>(
     estimate_source: Option<EstimateSource>,
 ) {
     if context.include_synthetic {
-        let raw_model = message.model_id.clone();
-        sessions::synthetic::normalize_synthetic_gateway_fields(
-            &mut message.model_id,
-            &mut message.provider_id,
-        );
-        message.preserve_pricing_model(&raw_model);
+        message.normalize_synthetic_gateway();
     }
 
     if let Some(timezone) = &context.timezone {
@@ -1594,7 +1623,7 @@ fn flush_retained_message<S: MessageSink>(
     }
 
     if let (None, Some(local)) = (&message.machine_label, context.local_machine_label) {
-        message.machine_label = Some(local.to_string());
+        message.machine_label = Some(SharedStr::from(local));
     }
 
     sink.accept_with_estimate_source(message, estimate_source);
@@ -2890,6 +2919,69 @@ fn parse_all_messages_streaming<S: MessageSink>(
         )
     }
 
+    fn load_or_parse_bb_sqlite_source(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+    ) -> CachedParseOutcome {
+        load_or_parse_source_with_fingerprint_and_policy(
+            message_cache::CacheIdentity::for_client(ClientId::Bb),
+            path,
+            source_cache,
+            pricing,
+            None,
+            HistoryRetention::LiveFileOnly,
+            message_cache::SourceFingerprint::check_sqlite_path,
+            |path, _| {
+                let scan = sessions::bb::scan_bb_sqlite(path);
+                (scan.messages, scan.complete)
+            },
+        )
+    }
+
+    /// A request dedup key is not a SQLite row identity. Cached messages do
+    /// not retain row ids, and count/sum watermarks cannot detect in-place
+    /// edits. Reparse changed databases rather than merging an ambiguous
+    /// suffix: the raw recount must retain every persisted request copy.
+    fn load_or_parse_devin_cli_source(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+    ) -> (CachedParseOutcome, bool) {
+        // Only admitted current-generation entries may inherit completeness
+        // without decoding rows. Failed fingerprints and every fresh parse
+        // overwrite this verdict, including legacy-cache fallback returns.
+        let complete = std::cell::Cell::new(false);
+        let outcome = load_or_parse_source_with_fingerprint_and_policy(
+            message_cache::CacheIdentity::for_client(ClientId::DevinCli),
+            path,
+            source_cache,
+            pricing,
+            None,
+            HistoryRetention::LiveFileOnly,
+            |path, cached| {
+                let status = message_cache::SourceFingerprint::check_sqlite_path(path, cached);
+                complete.set(status.is_some());
+                status
+            },
+            |path, before| {
+                let (messages, read_complete) = sessions::devin::scan_devin_cli_sqlite(path);
+                // An internally consistent SELECT is not complete-history
+                // authority if the surrounding database snapshot changed.
+                // Do not let a second probe certify a different read instead.
+                let stable = before.is_some_and(|before| {
+                    matches!(
+                        message_cache::SourceFingerprint::check_sqlite_path(path, Some(before)),
+                        Some(message_cache::FingerprintStatus::Unchanged)
+                    )
+                });
+                complete.set(read_complete && stable);
+                (messages, complete.get())
+            },
+        );
+        (outcome, complete.get())
+    }
+
     /// MiMo rows and exact provenance are one cache payload. A warm hit never
     /// opens SQLite, and a cold read collects both in one reader snapshot.
     fn load_or_parse_micode_source(
@@ -3414,7 +3506,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         for message in messages {
             if let Some(key) = message.dedup_key.as_ref() {
                 opencode_sqlite_locations
-                    .entry(message.session_id.clone())
+                    .entry(message.session_id.to_string())
                     .or_default()
                     .insert(key.clone());
                 if !opencode_seen.insert(key.clone()) {
@@ -3696,7 +3788,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         for message in outcome.messages {
             if message.client == sessions::codex::OPENCLAW_CLIENT_ID {
                 if owned_thread.is_none() {
-                    owned_thread = Some(message.session_id.clone());
+                    owned_thread = Some(message.session_id.to_string());
                 }
                 openclaw_owned_rollouts.push(message);
             } else if should_keep_deduped_message(&mut codex_seen, &message) {
@@ -3734,8 +3826,19 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     // Correlate successful Responses-only OpenCodex combo attempts with
     // physical models. This changes attribution, never token-counted rows.
-    if sessions::opencodex::attribute_codex_messages(home_dir, use_env_roots, &mut all_messages) > 0
-    {
+    let (opencodex_attributed, opencodex_claims) =
+        sessions::opencodex::attribute_codex_messages_with_claims(
+            home_dir,
+            use_env_roots,
+            &mut all_messages,
+        );
+    let magpie_attributed = sessions::magpie::attribute_codex_responses(
+        home_dir,
+        use_env_roots,
+        &mut all_messages,
+        &opencodex_claims,
+    );
+    if opencodex_attributed + magpie_attributed > 0 {
         apply_pricing_to_messages(&mut all_messages, pricing);
     }
 
@@ -3756,11 +3859,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
     );
     merge_copilot_rows_in_place(&mut all_messages);
     refresh_and_price_sieved(&mut all_messages, pricing, price_window);
-    let copilot_otel_sessions: HashSet<String> = all_messages
+    let copilot_otel_sessions: HashSet<SharedStr> = all_messages
         .iter()
         .filter(|message| message.client == "copilot")
         .map(|message| message.session_id.clone())
         .collect();
+    let mut copilot_desktop_sessions: HashSet<SharedStr> = HashSet::new();
     if let Some(db_path) = &scan_result.copilot_desktop_db {
         let mut desktop_msgs = sessions::copilot_desktop::parse_copilot_desktop_db(db_path);
         machine_labeler.label_messages(db_path, &mut desktop_msgs);
@@ -3769,24 +3873,52 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 .into_iter()
                 .filter(|message| !copilot_otel_sessions.contains(&message.session_id))
                 .map(|mut message| {
+                    copilot_desktop_sessions.insert(message.session_id.clone());
                     apply_pricing_if_available(&mut message, pricing);
                     message
                 }),
         );
     }
-    if let Some(db_path) = &scan_result.copilot_session_store_db {
-        let mut session_store_msgs =
-            sessions::copilot_session_store::parse_copilot_session_store_db(db_path);
-        machine_labeler.label_messages(db_path, &mut session_store_msgs);
+    let mut copilot_cli_turn_timestamps: HashMap<SharedStr, Vec<i64>> = HashMap::new();
+    for file_path in &scan_result.copilot_session_state_files {
+        let mut state_msgs =
+            sessions::copilot_session_state::parse_copilot_session_state_file(file_path);
+        machine_labeler.label_messages(file_path, &mut state_msgs);
         all_messages.extend(
-            session_store_msgs
+            state_msgs
                 .into_iter()
-                .filter(|message| !copilot_otel_sessions.contains(&message.session_id))
+                .filter(|message| {
+                    !copilot_otel_sessions.contains(&message.session_id)
+                        && !copilot_desktop_sessions.contains(&message.session_id)
+                })
                 .map(|mut message| {
+                    copilot_cli_turn_timestamps
+                        .entry(message.session_id.clone())
+                        .or_default()
+                        .push(message.timestamp);
                     apply_pricing_if_available(&mut message, pricing);
                     message
                 }),
         );
+    }
+    let copilot_cli_turn_index =
+        sessions::copilot_session_state::SessionStateTurnIndex::new(copilot_cli_turn_timestamps);
+    if let Some(db_path) = &scan_result.copilot_session_store_db {
+        let mut session_store_msgs =
+            sessions::copilot_session_store::parse_copilot_session_store_db(db_path);
+        machine_labeler.label_messages(db_path, &mut session_store_msgs);
+        for mut message in session_store_msgs {
+            if copilot_otel_sessions.contains(&message.session_id)
+                || copilot_desktop_sessions.contains(&message.session_id)
+            {
+                continue;
+            }
+            if copilot_cli_turn_index.overlaps(&message.session_id, message.timestamp) {
+                continue;
+            }
+            apply_pricing_if_available(&mut message, pricing);
+            all_messages.push(message);
+        }
     }
     {
         let existing_dedup_keys: HashSet<String> = all_messages
@@ -3797,7 +3929,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         let mut existing_copilot_session_timestamps: HashMap<String, HashSet<i64>> = HashMap::new();
         for message in all_messages.iter().filter(|m| m.client == "copilot") {
             existing_copilot_session_timestamps
-                .entry(message.session_id.clone())
+                .entry(message.session_id.to_string())
                 .or_default()
                 .insert(message.timestamp);
         }
@@ -3833,7 +3965,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     .get(path)
                     .copied()
                     .flatten()
-                    .map(str::to_string);
+                    .map(SharedStr::from);
                 apply_pricing_if_available(&mut message, pricing);
                 flush_message(message, &flush_context, sink);
             },
@@ -4193,13 +4325,13 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 if message.client != sessions::codex::OPENCLAW_CLIENT_ID {
                     // The location says whose usage this is even when an older
                     // OpenClaw did not announce itself as the originator.
-                    message.client = sessions::codex::OPENCLAW_CLIENT_ID.to_string();
+                    message.client = sessions::codex::OPENCLAW_CLIENT_ID.into();
                     if let Some(thread) = &thread_from_name {
-                        message.session_id = thread.clone();
+                        message.session_id = thread.clone().into();
                     }
                 }
                 if recorded_thread.is_none() {
-                    recorded_thread = Some(message.session_id.clone());
+                    recorded_thread = Some(message.session_id.to_string());
                 }
                 rollout_messages.push(message);
             }
@@ -4271,7 +4403,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 {
                     mirrored_thread_sessions
                         .entry(mirror.thread.to_string())
-                        .or_insert_with(|| message.session_id.clone());
+                        .or_insert_with(|| message.session_id.to_string());
                     if recorded_codex_turns.covers(mirror.thread, mirror.turn) {
                         continue;
                     }
@@ -4638,6 +4770,25 @@ fn parse_all_messages_streaming<S: MessageSink>(
         );
         machine_labeler.label_messages(db_path, &mut messages);
         all_messages.extend(messages);
+        if let Some(entry) = cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    // BB (get-bb/bb) SQLite database sessions.
+    let mut bb_seen: HashSet<String> = HashSet::new();
+    for db_path in &scan_result.bb_dbs {
+        let CachedParseOutcome {
+            mut messages,
+            cache_entry,
+            ..
+        } = load_or_parse_bb_sqlite_source(db_path, &source_cache, pricing);
+        machine_labeler.label_messages(db_path, &mut messages);
+        all_messages.extend(
+            messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut bb_seen, message)),
+        );
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
         }
@@ -5056,30 +5207,22 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // them instead of silently ignoring non-default databases.
     let mut devin_cli_session_ids: HashSet<String> = HashSet::new();
     if include_devin_cli {
-        let devin_cli_outcomes: Vec<CachedParseOutcome> = scan_result
+        let devin_cli_outcomes: Vec<(CachedParseOutcome, bool)> = scan_result
             .devin_dbs
             .par_iter()
             .map(|db_path| {
-                let mut outcome = load_or_parse_sqlite_source(
-                    message_cache::CacheIdentity::for_client(ClientId::DevinCli),
-                    db_path,
-                    &source_cache,
-                    pricing,
-                    sessions::devin::parse_devin_cli_sqlite,
-                );
+                let (mut outcome, complete) =
+                    load_or_parse_devin_cli_source(db_path, &source_cache, pricing);
                 machine_labeler.label_messages(db_path, &mut outcome.messages);
-                outcome
+                (outcome, complete)
             })
             .collect();
-        // The parser cannot report a failed open or query: both yield an
-        // empty row set, which is indistinguishable from a database with no
-        // usage. Probe each discovered database separately (a warm cache
-        // never calls the parser) so submission can withhold full-history
-        // authority instead of letting a half-read history pass as complete.
-        let unreadable = scan_result
-            .devin_dbs
+        // Preserve the verdict of the exact read that supplied these rows;
+        // a separate COUNT(*) probe cannot detect row conversion failures or
+        // prove that it saw the same database snapshot.
+        let unreadable = devin_cli_outcomes
             .iter()
-            .filter(|db_path| !sessions::devin::devin_cli_source_is_readable(db_path))
+            .filter(|(_, complete)| !complete)
             .count();
         source_reads.insert(
             ClientId::DevinCli.as_str().to_string(),
@@ -5094,7 +5237,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         // subtract exactly the over-count instead of trusting a lower total.
         let mut devin_cli_seen = HashSet::new();
         let mut devin_cli_proof = RecountProofBuilder::default();
-        for outcome in devin_cli_outcomes {
+        for (outcome, _) in devin_cli_outcomes {
             for message in outcome.messages {
                 let kept = should_keep_deduped_message(&mut devin_cli_seen, &message);
                 if let Some((date, model_id)) = flushed_message_identity(&message, &flush_context) {
@@ -5121,7 +5264,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 if !kept {
                     continue;
                 }
-                devin_cli_session_ids.insert(message.session_id.clone());
+                devin_cli_session_ids.insert(message.session_id.to_string());
                 all_messages.push(message);
             }
             if let Some(entry) = outcome.cache_entry {
@@ -5322,7 +5465,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 outcome
                     .messages
                     .into_iter()
-                    .filter(|message| !devin_cli_session_ids.contains(&message.session_id)),
+                    .filter(|message| !devin_cli_session_ids.contains(message.session_id.as_str())),
             );
             if let Some(entry) = outcome.cache_entry {
                 source_cache.insert(entry);
@@ -5425,7 +5568,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
 }
 
 fn dedupe_latest_trae_messages(mut messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
-    let mut latest_by_session: HashMap<String, UnifiedMessage> = HashMap::new();
+    let mut latest_by_session: HashMap<SharedStr, UnifiedMessage> = HashMap::new();
 
     for message in messages.drain(..) {
         let session_id = message.session_id.clone();
@@ -5478,7 +5621,7 @@ fn merge_workbuddy_messages(
     // session that merely shares a day with unrelated detailed activity. Both
     // parsers derive `session_id` from the same WorkBuddy session identifier, so
     // the keys are directly comparable.
-    let detailed_sessions: HashSet<String> = detailed_messages
+    let detailed_sessions: HashSet<SharedStr> = detailed_messages
         .iter()
         .filter(|message| !message.session_id.is_empty())
         .map(|message| message.session_id.clone())
@@ -5694,24 +5837,50 @@ pub fn workspace_label_overrides<'a>(
     rollup: WorktreeRollup,
     labeler: &mut WorkspaceLabeler,
 ) -> HashMap<String, String> {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut base: BTreeMap<String, String> = BTreeMap::new();
+    let mut labels = WorkspaceLabelCollector::default();
     for msg in messages {
+        labels.observe(msg, rollup, labeler);
+    }
+    labels.overrides(labeler)
+}
+
+/// [`workspace_label_overrides`] fed one message at a time, for a caller that
+/// folds messages as they arrive and cannot walk them a second time.
+#[derive(Default)]
+struct WorkspaceLabelCollector {
+    /// Workspace keys already bucketed: only the first message of each key
+    /// contributes a label.
+    seen: HashSet<String>,
+    /// Grouping key -> base label of the first message that reached it.
+    base: BTreeMap<String, String>,
+}
+
+impl WorkspaceLabelCollector {
+    fn observe(
+        &mut self,
+        msg: &UnifiedMessage,
+        rollup: WorktreeRollup,
+        labeler: &mut WorkspaceLabeler,
+    ) {
         let Some(key) = msg.workspace_key.as_deref() else {
-            continue;
+            return;
         };
-        if !seen.insert(key) {
-            continue;
+        if self.seen.contains(key) {
+            return;
         }
+        self.seen.insert(key.to_string());
         let (group_key, _, label) = workspace_bucket(msg, rollup, labeler);
-        base.entry(group_key).or_insert(label);
+        self.base.entry(group_key).or_insert(label);
     }
 
-    disambiguate_workspace_labels(
-        base.iter()
-            .map(|(key, label)| (key.as_str(), label.as_str())),
-        labeler,
-    )
+    fn overrides(self, labeler: &mut WorkspaceLabeler) -> HashMap<String, String> {
+        disambiguate_workspace_labels(
+            self.base
+                .iter()
+                .map(|(key, label)| (key.as_str(), label.as_str())),
+            labeler,
+        )
+    }
 }
 
 /// Rewrite `labeled` — (grouping key, base label) pairs — so no two keys share a
@@ -5878,15 +6047,15 @@ fn adopt_openclaw_mirror_session(
     message: &mut UnifiedMessage,
     mirrored_thread_sessions: &HashMap<String, String>,
 ) {
-    if let Some(session_id) = mirrored_thread_sessions.get(&message.session_id) {
-        message.session_id = session_id.clone();
+    if let Some(session_id) = mirrored_thread_sessions.get(message.session_id.as_str()) {
+        message.session_id = session_id.clone().into();
     }
     if let Some(parent) = message
         .parent_session_id
         .as_deref()
         .and_then(|parent| mirrored_thread_sessions.get(parent))
     {
-        message.parent_session_id = Some(parent.clone());
+        message.parent_session_id = Some(parent.clone().into());
     }
 }
 
@@ -5935,7 +6104,7 @@ fn resolve_codex_parent_session_ids(messages: &mut [UnifiedMessage]) {
         if replace {
             by_thread.insert(
                 thread.to_string(),
-                (message.session_id.clone(), continuation),
+                (message.session_id.to_string(), continuation),
             );
         }
     }
@@ -5948,7 +6117,7 @@ fn resolve_codex_parent_session_ids(messages: &mut [UnifiedMessage]) {
         };
         if let Some((session_id, _)) = by_thread.get(parent) {
             if *session_id != message.session_id {
-                message.parent_session_id = Some(session_id.clone());
+                message.parent_session_id = Some(session_id.clone().into());
             }
         }
     }
@@ -5966,11 +6135,11 @@ fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
         if msg.session_id.is_empty() {
             continue;
         }
-        let key = (msg.client.clone(), msg.session_id.clone());
+        let key = (msg.client.to_string(), msg.session_id.to_string());
         let position = *index.entry(key).or_insert_with(|| {
             sessions.push(SessionMeta {
-                client: msg.client.clone(),
-                session_id: msg.session_id.clone(),
+                client: msg.client.to_string(),
+                session_id: msg.session_id.to_string(),
                 title: None,
                 first_active_ms: 0,
                 last_active_ms: 0,
@@ -6017,51 +6186,90 @@ fn aggregate_model_usage_entries(
     aggregate_model_usage_entries_with_rollup(messages, group_by, WorktreeRollup::default())
 }
 
-// Downstream-only (Token Monitor): the report path now threads its own labeler
-// through `aggregate_model_usage_entries_with_labeler`, leaving this signature
-// for the tests that call it. Kept as upstream wrote it so none of them change.
+/// Collecting form of [`ModelUsageFold`], kept as the test surface for its
+/// aggregation rules. The model report folds messages as the parse emits them
+/// and never collects them; see [`ModelReportSink`].
 #[cfg(test)]
 fn aggregate_model_usage_entries_with_rollup(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
     rollup: WorktreeRollup,
 ) -> Vec<ModelUsage> {
-    let mut labeler = WorkspaceLabeler::default();
-    aggregate_model_usage_entries_with_labeler(messages, group_by, rollup, &mut labeler)
+    let mut fold = ModelUsageFold::new(group_by, rollup);
+    for msg in &messages {
+        fold.add(msg);
+    }
+    fold.finish()
 }
 
-// Takes the caller's labeler so its memoized slug decode, the expensive half of
-// every workspace lookup, is reused when that caller resolves the same keys to
-// paths afterwards instead of walking the filesystem for them a second time.
-// Downstream-only (Token Monitor): the rollup signature above stays as upstream
-// wrote it, so its callers and tests need no edit here.
+#[cfg(test)]
 fn aggregate_model_usage_entries_with_labeler(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
     rollup: WorktreeRollup,
     labeler: &mut WorkspaceLabeler,
 ) -> Vec<ModelUsage> {
-    let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
+    let mut fold = ModelUsageFold::new(group_by, rollup);
+    fold.labeler = std::mem::take(labeler);
+    for message in &messages {
+        fold.add(message);
+    }
+    fold.finish_with_labeler(labeler)
+}
 
-    // Bucketing a workspace resolves its label, which reads the filesystem. Every
-    // other grouping discards that label a few lines below, so skip the work rather
-    // than paying it on `tokscale --light`, `monthly`, and every TUI refresh.
-    let needs_workspace = matches!(
-        group_by,
-        GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
-    );
-    let label_overrides = if needs_workspace {
-        workspace_label_overrides(&messages, rollup, labeler)
-    } else {
-        HashMap::new()
-    };
+/// A model-report row while messages are still being folded into it.
+struct ModelUsageRow {
+    usage: ModelUsage,
+    /// Workspace grouping key of the message that opened the row. Its
+    /// disambiguated label is only known once every message has been seen.
+    workspace_group_key: String,
+}
 
-    for msg in messages {
+/// Folds messages into model-report rows one message at a time.
+///
+/// A row only keeps running sums, so a caller fed by the parse can drop each
+/// message as soon as it is folded instead of holding the whole history first.
+/// The one rule that looks across messages, workspace label disambiguation,
+/// depends only on the first message seen for each workspace key. It is
+/// collected on the way and applied in [`Self::finish`], which gives the same
+/// labels as resolving it before the fold: a row's label depends only on its
+/// grouping key.
+///
+/// Messages must arrive in the order the collecting path would have held them.
+/// Costs are `f64` sums, so a different order could change their last bits.
+struct ModelUsageFold {
+    group_by: GroupBy,
+    rollup: WorktreeRollup,
+    labeler: WorkspaceLabeler,
+    workspace_labels: WorkspaceLabelCollector,
+    rows: HashMap<String, ModelUsageRow>,
+}
+
+impl ModelUsageFold {
+    fn new(group_by: &GroupBy, rollup: WorktreeRollup) -> Self {
+        Self {
+            group_by: group_by.clone(),
+            rollup,
+            labeler: WorkspaceLabeler::default(),
+            workspace_labels: WorkspaceLabelCollector::default(),
+            rows: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, msg: &UnifiedMessage) {
+        let group_by = &self.group_by;
+        // Bucketing a workspace resolves its label, which reads the filesystem. Every
+        // other grouping discards that label a few lines below, so skip the work rather
+        // than paying it on `tokscale --light`, `monthly`, and every TUI refresh.
+        let needs_workspace = matches!(
+            group_by,
+            GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+        );
         let normalized = model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
         let (workspace_group_key, workspace_key, workspace_label) = if needs_workspace {
-            let (group_key, key, label) = workspace_bucket(&msg, rollup, labeler);
-            let label = label_overrides.get(&group_key).cloned().unwrap_or(label);
-            (group_key, key, label)
+            self.workspace_labels
+                .observe(msg, self.rollup, &mut self.labeler);
+            workspace_bucket(msg, self.rollup, &mut self.labeler)
         } else {
             (String::new(), None, String::new())
         };
@@ -6077,7 +6285,7 @@ fn aggregate_model_usage_entries_with_labeler(
                 format!("{}:{}:{}", msg.client, msg.session_id, normalized)
             }
             GroupBy::MachineModel => {
-                let machine = message_machine_label(&msg);
+                let machine = message_machine_label(msg);
                 format!("{}:{}:{}", machine.len(), machine, normalized)
             }
             GroupBy::ClientWorkspaceSession => {
@@ -6095,44 +6303,48 @@ fn aggregate_model_usage_entries_with_labeler(
             group_by,
             GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
         );
-        let entry = model_map.entry(key).or_insert_with(|| ModelUsage {
-            client: msg.client.clone(),
-            merged_clients: if merge_clients {
-                Some(msg.client.clone())
-            } else {
-                None
+        let row = self.rows.entry(key).or_insert_with(|| ModelUsageRow {
+            usage: ModelUsage {
+                client: msg.client.to_string(),
+                merged_clients: if merge_clients {
+                    Some(msg.client.to_string())
+                } else {
+                    None
+                },
+                workspace_key: if needs_workspace {
+                    workspace_key.clone()
+                } else {
+                    None
+                },
+                workspace_label: if needs_workspace {
+                    Some(workspace_label.clone())
+                } else {
+                    None
+                },
+                session_id: if session_grouped {
+                    Some(msg.session_id.to_string())
+                } else {
+                    None
+                },
+                machine: if matches!(group_by, GroupBy::MachineModel) {
+                    Some(message_machine_label(msg).to_string())
+                } else {
+                    None
+                },
+                model: normalized.clone(),
+                provider: msg.provider_id.to_string(),
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                message_count: 0,
+                cost: 0.0,
+                performance: ModelPerformance::default(),
             },
-            workspace_key: if needs_workspace {
-                workspace_key.clone()
-            } else {
-                None
-            },
-            workspace_label: if needs_workspace {
-                Some(workspace_label.clone())
-            } else {
-                None
-            },
-            session_id: if session_grouped {
-                Some(msg.session_id.clone())
-            } else {
-                None
-            },
-            machine: if matches!(group_by, GroupBy::MachineModel) {
-                Some(message_machine_label(&msg).to_string())
-            } else {
-                None
-            },
-            model: normalized.clone(),
-            provider: msg.provider_id.clone(),
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: 0,
-            message_count: 0,
-            cost: 0.0,
-            performance: ModelPerformance::default(),
+            workspace_group_key: workspace_group_key.clone(),
         });
+        let entry = &mut row.usage;
 
         if merge_clients {
             if !entry.client.split(", ").any(|s| s == msg.client) {
@@ -6166,35 +6378,56 @@ fn aggregate_model_usage_entries_with_labeler(
             .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
     }
 
-    let mut entries: Vec<ModelUsage> = model_map
-        .into_values()
-        .map(|mut entry| {
-            let total_tokens = entry
-                .input
-                .max(0)
-                .saturating_add(entry.output.max(0))
-                .saturating_add(entry.cache_read.max(0))
-                .saturating_add(entry.cache_write.max(0))
-                .saturating_add(entry.reasoning.max(0));
-            entry.performance.finalize(total_tokens);
-            let mut providers: Vec<&str> = entry.provider.split(", ").collect();
-            providers.sort_unstable();
-            providers.dedup();
-            entry.provider = providers.join(", ");
-            entry
-        })
-        .collect();
-    entries.sort_by(|a, b| match (a.cost.is_nan(), b.cost.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        (false, false) => b
-            .cost
-            .partial_cmp(&a.cost)
-            .unwrap_or(std::cmp::Ordering::Equal),
-    });
+    fn finish(self) -> Vec<ModelUsage> {
+        self.finish_with_labeler(&mut WorkspaceLabeler::default())
+    }
 
-    entries
+    fn finish_with_labeler(mut self, labeler: &mut WorkspaceLabeler) -> Vec<ModelUsage> {
+        let label_overrides = if matches!(
+            self.group_by,
+            GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+        ) {
+            std::mem::take(&mut self.workspace_labels).overrides(&mut self.labeler)
+        } else {
+            HashMap::new()
+        };
+
+        let mut entries: Vec<ModelUsage> = self
+            .rows
+            .into_values()
+            .map(|row| {
+                let mut entry = row.usage;
+                if let Some(label) = label_overrides.get(&row.workspace_group_key) {
+                    entry.workspace_label = Some(label.clone());
+                }
+                let total_tokens = entry
+                    .input
+                    .max(0)
+                    .saturating_add(entry.output.max(0))
+                    .saturating_add(entry.cache_read.max(0))
+                    .saturating_add(entry.cache_write.max(0))
+                    .saturating_add(entry.reasoning.max(0));
+                entry.performance.finalize(total_tokens);
+                let mut providers: Vec<&str> = entry.provider.split(", ").collect();
+                providers.sort_unstable();
+                providers.dedup();
+                entry.provider = providers.join(", ");
+                entry
+            })
+            .collect();
+        entries.sort_by(|a, b| match (a.cost.is_nan(), b.cost.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => b
+                .cost
+                .partial_cmp(&a.cost)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        });
+
+        *labeler = self.labeler;
+        entries
+    }
 }
 
 /// A message's machine label. An unlabeled message is local: either no
@@ -6235,6 +6468,45 @@ fn model_report_token_totals(entries: &[ModelUsage]) -> (i64, i64, i64, i64) {
     )
 }
 
+/// Streams the model report out of the parse.
+///
+/// Collecting the parse before applying the date filter held every message the
+/// selected clients ever recorded, so a one-day report peaked as high as an
+/// all-time one. The report filter and [`ModelUsageFold`] both work one message
+/// at a time, so each message is dropped as soon as it is counted.
+struct ModelReportSink<'a> {
+    options: &'a ReportOptions,
+    fold: ModelUsageFold,
+    undated_tokens: TokenBreakdown,
+}
+
+impl<'a> ModelReportSink<'a> {
+    fn new(options: &'a ReportOptions) -> Self {
+        Self {
+            options,
+            fold: ModelUsageFold::new(&options.group_by, options.worktree_rollup),
+            undated_tokens: TokenBreakdown::default(),
+        }
+    }
+
+    /// The report rows, and the Claude Desktop usage that has no known date.
+    fn finish(self) -> (Vec<ModelUsage>, TokenBreakdown) {
+        (self.fold.finish(), self.undated_tokens)
+    }
+}
+
+impl MessageSink for ModelReportSink<'_> {
+    fn accept(&mut self, message: UnifiedMessage) {
+        if !message_passes_report_filter(&message, self.options) {
+            return;
+        }
+        if claude_desktop::is_undated_balance(&message) {
+            self.undated_tokens.add_assign_saturating(&message.tokens);
+        }
+        self.fold.add(&message);
+    }
+}
+
 pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, String> {
     Ok(get_model_report_v2(options).await?.report)
 }
@@ -6255,42 +6527,50 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
     });
 
     let pricing = load_pricing_for_local_parse().await;
-    let (all_messages, claude_desktop_cache) = parse_all_messages_with_coverage(
-        &home_dir,
-        &clients,
-        pricing.as_deref(),
-        options.use_env_roots,
-        &options.scanner_settings,
-        SourceCachePolicy::Persistent,
-        Some(&options),
-    );
-
-    let mut filtered = filter_messages_for_report(all_messages, &options);
-    let mut undated_tokens = TokenBreakdown::default();
-    for message in &filtered {
-        if claude_desktop::is_undated_balance(message) {
-            undated_tokens.add_assign_saturating(&message.tokens);
-        }
-    }
-    resolve_codex_parent_session_ids(&mut filtered);
-    // Borrowed before the aggregation consumes `filtered`, and only for the
-    // groupings that carry a session id, so every other report path is unchanged.
-    let sessions = if matches!(
+    let session_grouped = matches!(
         options.group_by,
         GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
-    ) {
-        aggregate_session_metadata(&filtered)
-    } else {
-        Vec::new()
-    };
-    let mut labeler = WorkspaceLabeler::default();
-    let entries = aggregate_model_usage_entries_with_labeler(
-        filtered,
-        &options.group_by,
-        options.worktree_rollup,
-        &mut labeler,
     );
-    let workspaces = workspace_metadata_for_entries(&entries, &mut labeler);
+    let mut sink = ModelReportSink::new(&options);
+    let mut sessions = Vec::new();
+    let claude_desktop_cache = if recovery::applicable(&home_dir) || session_grouped {
+        let (messages, coverage) = parse_all_messages_with_coverage(
+            &home_dir,
+            &clients,
+            pricing.as_deref(),
+            options.use_env_roots,
+            &options.scanner_settings,
+            SourceCachePolicy::Persistent,
+            Some(&options),
+        );
+        let mut filtered = filter_messages_for_report(messages, &options);
+        resolve_codex_parent_session_ids(&mut filtered);
+        if session_grouped {
+            sessions = aggregate_session_metadata(&filtered);
+        }
+        for message in filtered {
+            sink.accept(message);
+        }
+        coverage
+    } else {
+        let mut custom_sink = CustomPricingSink {
+            sink: &mut sink,
+            pricing: pricing.as_deref(),
+        };
+        parse_all_messages_streaming(
+            &home_dir,
+            &clients,
+            pricing.as_deref(),
+            options.use_env_roots,
+            &options.scanner_settings,
+            SourceCachePolicy::Persistent,
+            PricingWindow::new(&options, &options.scanner_settings).as_ref(),
+            &mut custom_sink,
+        )
+        .coverage
+    };
+    let (entries, undated_tokens) = sink.finish();
+    let workspaces = workspace_metadata_for_entries(&entries, &mut WorkspaceLabeler::default());
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
         model_report_token_totals(&entries);
@@ -6457,7 +6737,7 @@ fn aggregate_hourly_usage_entries(
         };
 
         let entry = hour_map.entry(hour_key).or_default();
-        entry.clients.insert(msg.client.clone());
+        entry.clients.insert(msg.client.to_string());
         entry.models.insert(model_name_for_grouping(
             &msg.client,
             &msg.provider_id,
@@ -7041,7 +7321,10 @@ fn prepare_submission_pricing(
                 MISSING_MODEL_PRICING_REASON
             };
             let entry = unpriced_usage
-                .entry((message.provider_id.clone(), message.model_id.clone()))
+                .entry((
+                    message.provider_id.to_string(),
+                    message.model_id.to_string(),
+                ))
                 .or_insert((0, 0, reason));
             entry.0 = entry
                 .0
@@ -7050,7 +7333,7 @@ fn prepare_submission_pricing(
             if entry.2 != reason {
                 entry.2 = MULTIPLE_MODEL_PRICING_REASONS;
             }
-            incomplete_cost_dates.insert(message.date.clone());
+            incomplete_cost_dates.insert(message.date.to_string());
             // An unsafe estimate must not cross the submission boundary. Keep
             // the usage, but represent the unknown part honestly as zero and
             // let `costIsComplete: false` make the server preserve any higher
@@ -7252,7 +7535,7 @@ fn validate_priced_messages(
         }
 
         let id = if message.provider_id.is_empty() {
-            message.model_id.clone()
+            message.model_id.to_string()
         } else {
             format!("{}/{}", message.provider_id, message.model_id)
         };
@@ -7340,9 +7623,9 @@ fn apply_headless_agent(message: &mut UnifiedMessage, is_headless: bool) {
         // A capture under the headless root is a `codex exec` run even when its
         // `session_meta` omits `source: "exec"` and the parser bucketed it as
         // an interactive or subagent thread, so the path wins.
-        message.agent = Some(sessions::codex::CODEX_HEADLESS_AGENT.to_string());
+        message.agent = Some(sessions::codex::CODEX_HEADLESS_AGENT.into());
     } else if message.agent.is_none() {
-        message.agent = Some("headless".to_string());
+        message.agent = Some("headless".into());
     }
 }
 
@@ -7612,8 +7895,8 @@ fn hermes_candidate_day_coverage(messages: &[UnifiedMessage]) -> usize {
 /// model differs, so normalize the first database's count onto exactly one of
 /// the selected messages after choosing every group.
 fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec<UnifiedMessage> {
-    let mut group_order: Vec<(String, String, String)> = Vec::new();
-    let mut group_candidates: HashMap<(String, String, String), Vec<Vec<UnifiedMessage>>> =
+    let mut group_order: Vec<(SharedStr, SharedStr, SharedStr)> = Vec::new();
+    let mut group_candidates: HashMap<(SharedStr, SharedStr, SharedStr), Vec<Vec<UnifiedMessage>>> =
         HashMap::new();
     let mut session_message_counts: HashMap<String, i32> = HashMap::new();
 
@@ -7621,7 +7904,7 @@ fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec
         let mut database_session_counts: HashMap<String, i32> = HashMap::new();
         for message in &messages {
             database_session_counts
-                .entry(message.session_id.clone())
+                .entry(message.session_id.to_string())
                 .and_modify(|count| *count = (*count).max(message.message_count))
                 .or_insert(message.message_count);
         }
@@ -7629,9 +7912,9 @@ fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec
             session_message_counts.entry(session_id).or_insert(count);
         }
 
-        let mut database_groups: HashMap<(String, String, String), Vec<UnifiedMessage>> =
+        let mut database_groups: HashMap<(SharedStr, SharedStr, SharedStr), Vec<UnifiedMessage>> =
             HashMap::new();
-        let mut database_group_order: Vec<(String, String, String)> = Vec::new();
+        let mut database_group_order: Vec<(SharedStr, SharedStr, SharedStr)> = Vec::new();
         for message in messages {
             let group = (
                 message.session_id.clone(),
@@ -7682,7 +7965,7 @@ fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec
     for message in &mut selected {
         message.message_count = if counted_sessions.insert(message.session_id.clone()) {
             session_message_counts
-                .get(&message.session_id)
+                .get(message.session_id.as_str())
                 .copied()
                 .unwrap_or(0)
         } else {
@@ -7827,7 +8110,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                         let key = msg.dedup_key.clone().unwrap_or_default();
                         if !key.is_empty() {
                             sqlite_locations
-                                .entry(msg.session_id.clone())
+                                .entry(msg.session_id.to_string())
                                 .or_default()
                                 .insert(key.clone());
                         }
@@ -8017,7 +8300,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         for message in file_messages {
             if message.client == sessions::codex::OPENCLAW_CLIENT_ID {
                 if owned_thread.is_none() {
-                    owned_thread = Some(message.session_id.clone());
+                    owned_thread = Some(message.session_id.to_string());
                 }
                 openclaw_owned_rollouts.push(message);
             } else if should_keep_deduped_message(&mut codex_seen, &message)
@@ -8055,30 +8338,59 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         })
         .collect();
     copilot_unified_msgs = sessions::copilot::merge_copilot_messages(copilot_unified_msgs);
-    let copilot_otel_sessions: HashSet<String> = copilot_unified_msgs
+    let copilot_otel_sessions: HashSet<SharedStr> = copilot_unified_msgs
         .iter()
         .map(|message| message.session_id.clone())
         .collect();
+    let mut copilot_desktop_sessions: HashSet<SharedStr> = HashSet::new();
     if let Some(db_path) = &scan_result.copilot_desktop_db {
-        copilot_unified_msgs.extend(
-            sessions::copilot_desktop::parse_copilot_desktop_db(db_path)
-                .into_iter()
-                .filter(|message| !copilot_otel_sessions.contains(&message.session_id)),
-        );
+        for message in sessions::copilot_desktop::parse_copilot_desktop_db(db_path)
+            .into_iter()
+            .filter(|message| !copilot_otel_sessions.contains(&message.session_id))
+        {
+            copilot_desktop_sessions.insert(message.session_id.clone());
+            copilot_unified_msgs.push(message);
+        }
     }
+    let mut copilot_cli_turn_timestamps: HashMap<SharedStr, Vec<i64>> = HashMap::new();
+    for file_path in &scan_result.copilot_session_state_files {
+        for message in sessions::copilot_session_state::parse_copilot_session_state_file(file_path)
+            .into_iter()
+            .filter(|message| {
+                !copilot_otel_sessions.contains(&message.session_id)
+                    && !copilot_desktop_sessions.contains(&message.session_id)
+            })
+        {
+            copilot_cli_turn_timestamps
+                .entry(message.session_id.clone())
+                .or_default()
+                .push(message.timestamp);
+            copilot_unified_msgs.push(message);
+        }
+    }
+    let copilot_cli_turn_index =
+        sessions::copilot_session_state::SessionStateTurnIndex::new(copilot_cli_turn_timestamps);
     if let Some(db_path) = &scan_result.copilot_session_store_db {
-        copilot_unified_msgs.extend(
-            sessions::copilot_session_store::parse_copilot_session_store_db(db_path)
-                .into_iter()
-                .filter(|message| !copilot_otel_sessions.contains(&message.session_id)),
-        );
+        let session_store_msgs =
+            sessions::copilot_session_store::parse_copilot_session_store_db(db_path);
+        for message in session_store_msgs {
+            if copilot_otel_sessions.contains(&message.session_id)
+                || copilot_desktop_sessions.contains(&message.session_id)
+            {
+                continue;
+            }
+            if copilot_cli_turn_index.overlaps(&message.session_id, message.timestamp) {
+                continue;
+            }
+            copilot_unified_msgs.push(message);
+        }
     }
     {
         let existing_dedup_keys: HashSet<String> = copilot_unified_msgs
             .iter()
             .filter_map(|m| m.dedup_key.clone())
             .collect();
-        let existing_copilot_session_timestamps: HashSet<(String, i64)> = copilot_unified_msgs
+        let existing_copilot_session_timestamps: HashSet<(SharedStr, i64)> = copilot_unified_msgs
             .iter()
             .map(|m| (m.session_id.clone(), m.timestamp))
             .collect();
@@ -8231,9 +8543,9 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                     .into_iter()
                     .map(|mut message| {
                         if message.client != sessions::codex::OPENCLAW_CLIENT_ID {
-                            message.client = sessions::codex::OPENCLAW_CLIENT_ID.to_string();
+                            message.client = sessions::codex::OPENCLAW_CLIENT_ID.into();
                             if let Some(thread) = &thread_from_name {
-                                message.session_id = thread.clone();
+                                message.session_id = thread.clone().into();
                             }
                         }
                         message
@@ -8272,7 +8584,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
             {
                 mirrored_thread_sessions
                     .entry(mirror.thread.to_string())
-                    .or_insert_with(|| message.session_id.clone());
+                    .or_insert_with(|| message.session_id.to_string());
                 if recorded_codex_turns.covers(mirror.thread, mirror.turn) {
                     continue;
                 }
@@ -8554,6 +8866,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let cherrystudio_count = summed_parsed_message_count(&cherrystudio_msgs);
     counts.set(ClientId::CherryStudio, cherrystudio_count);
     messages.extend(cherrystudio_msgs);
+
+    let bb_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .bb_dbs
+        .par_iter()
+        .flat_map(|db_path| sessions::bb::parse_bb_sqlite(db_path))
+        .collect();
+    let mut bb_seen: HashSet<String> = HashSet::new();
+    let bb_msgs: Vec<ParsedMessage> = bb_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut bb_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let bb_count = summed_parsed_message_count(&bb_msgs);
+    counts.set(ClientId::Bb, bb_count);
+    messages.extend(bb_msgs);
 
     // DeepSeek Harness zstd JSONL transcripts. A fork's seeded prefix repeats
     // the parent's rows verbatim in a second file, so dedup across the lane.
@@ -8960,7 +9287,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     } else {
         Vec::new()
     };
-    let cli_session_ids: HashSet<String> = devin_cli_messages
+    let cli_session_ids: HashSet<SharedStr> = devin_cli_messages
         .iter()
         .map(|message| message.session_id.clone())
         .collect();
@@ -9105,14 +9432,11 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
 
     if include_synthetic {
         for msg in &mut messages {
-            let raw_model = msg.model_id.clone();
-            sessions::synthetic::normalize_synthetic_gateway_fields(
+            sessions::synthetic::normalize_synthetic_gateway_identity(
                 &mut msg.model_id,
                 &mut msg.provider_id,
+                &mut msg.pricing_model_id,
             );
-            if raw_model != msg.model_id && msg.pricing_model_id.is_none() {
-                msg.pricing_model_id = Some(raw_model);
-            }
         }
     }
 
@@ -9154,7 +9478,7 @@ fn rebucket_parsed_days(
         }
         let key = timezone.day_key(message.timestamp);
         if !key.is_empty() {
-            message.date = key;
+            message.date = SharedStr::from(key);
         }
     }
 }
@@ -10257,6 +10581,368 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn copilot_store_turns_only_overlap_file_turns_in_both_scan_paths() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let copilot_dir = source_home.path().join(".copilot");
+        let event_dir = copilot_dir.join("session-state/mixed");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        // Deliberately out of timestamp order: the shared index must sort it.
+        std::fs::write(
+            event_dir.join("events.jsonl"),
+            concat!(
+                "{\"type\":\"session.start\",\"data\":{\"sessionId\":\"mixed\"},\"timestamp\":\"2026-11-01T11:59:00.000Z\"}\n",
+                "{\"type\":\"session.usage_record\",\"id\":\"later\",\"data\":{\"usage\":{\"model\":\"gpt-4o\",\"inputTokens\":50}},\"timestamp\":\"2026-11-01T12:01:00.000Z\"}\n",
+                "{\"type\":\"session.usage_record\",\"id\":\"earlier\",\"data\":{\"usage\":{\"model\":\"gpt-4o\",\"inputTokens\":40}},\"timestamp\":\"2026-11-01T12:00:00.000Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(copilot_dir.join("session-store.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, created_at TEXT);
+             CREATE TABLE assistant_usage_events (
+                 id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER,
+                 model TEXT, copilot_usage_model TEXT, input_tokens INTEGER,
+                 output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+                 reasoning_tokens INTEGER, total_nano_aiu INTEGER, duration_ms INTEGER,
+                 created_at TEXT
+             );",
+        )
+        .unwrap();
+        for (session, timestamp, input) in [
+            ("db-only", "2026-11-01T12:00:00.000Z", 100),
+            ("db-only", "2026-11-01T12:00:00.000Z", 100),
+            ("db-only", "2026-11-01T12:00:00.010Z", 100),
+            ("db-only", "2026-11-01T12:00:00.020Z", 100),
+            ("db-only", "2026-11-01T12:00:00.021Z", 100),
+            ("mixed", "2026-11-01T12:00:00.000Z", 999),
+            ("mixed", "2026-11-01T12:00:00.019Z", 999),
+            ("mixed", "2026-11-01T12:00:00.020Z", 999),
+            ("mixed", "2026-11-01T12:00:00.021Z", 30),
+            ("mixed", "2026-11-01T12:00:00.030Z", 31),
+            ("mixed", "2026-11-01T12:01:00.000Z", 999),
+        ] {
+            conn.execute(
+                "INSERT INTO assistant_usage_events
+                 (session_id, turn_index, model, input_tokens, created_at)
+                 VALUES (?1, 0, 'gpt-4o', ?2, ?3)",
+                rusqlite::params![session, input, timestamp],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let clients = ["copilot".to_string()];
+        for pass in ["first", "repeat"] {
+            let messages = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(
+                messages.len(),
+                9,
+                "{pass}: every independent store ID survives"
+            );
+            assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 651);
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.session_id == "db-only")
+                    .count(),
+                5,
+                "a file from another session must not suppress these DB turns"
+            );
+            let mut mixed_inputs = messages
+                .iter()
+                .filter(|m| m.session_id == "mixed")
+                .map(|m| m.tokens.input)
+                .collect::<Vec<_>>();
+            mixed_inputs.sort_unstable();
+            assert_eq!(mixed_inputs, vec![30, 31, 40, 50]);
+            let mut streamed_rows = messages
+                .iter()
+                .map(|m| (m.session_id.clone(), m.timestamp, m.tokens.input))
+                .collect::<Vec<_>>();
+            streamed_rows.sort_unstable();
+            let direct = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+            assert_eq!(direct.counts.get(ClientId::Copilot), 9, "{pass}");
+            let mut direct_rows = direct
+                .messages
+                .iter()
+                .map(|m| (m.session_id.clone(), m.timestamp, m.input))
+                .collect::<Vec<_>>();
+            direct_rows.sort_unstable();
+            assert_eq!(direct_rows, streamed_rows, "{pass}: scan paths agree");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_shutdown_tracker_keys_survive_both_scan_paths() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let event_dir = source_home
+            .path()
+            .join(".copilot/session-state/auto-session");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        std::fs::write(
+            event_dir.join("events.jsonl"),
+            concat!(
+                "{\"type\":\"session.start\",\"data\":{\"sessionId\":\"auto-session\"},\"id\":\"start\",\"timestamp\":\"2026-11-01T12:00:00.000Z\"}\n",
+                "{\"type\":\"session.shutdown\",\"id\":\"shutdown\",\"timestamp\":\"2026-11-01T12:01:00.000Z\",\"data\":{\"currentModel\":\"gpt-5.2\",\"modelMetrics\":{\"auto\":{\"usage\":{\"inputTokens\":100,\"outputTokens\":10}},\"gpt-5.2\":{\"usage\":{\"inputTokens\":200,\"outputTokens\":20}}}}}\n",
+            ),
+        )
+        .unwrap();
+        let clients = ["copilot".to_string()];
+        for pass in ["first", "repeat"] {
+            let messages = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(
+                messages.len(),
+                2,
+                "{pass}: tracker counters are independent"
+            );
+            assert!(messages.iter().all(|m| m.model_id == "gpt-5.2"));
+            assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 300);
+            assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 30);
+            let keys = messages
+                .iter()
+                .map(|m| m.dedup_key.as_deref().unwrap())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                keys,
+                HashSet::from([
+                    "copilot-session-event:auto-session:shutdown:shutdown:auto",
+                    "copilot-session-event:auto-session:shutdown:shutdown:gpt-5.2",
+                ])
+            );
+
+            let direct = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+            assert_eq!(direct.counts.get(ClientId::Copilot), 2, "{pass}");
+            assert!(direct.messages.iter().all(|m| m.model_id == "gpt-5.2"));
+            assert_eq!(direct.messages.iter().map(|m| m.input).sum::<i64>(), 300);
+            assert_eq!(direct.messages.iter().map(|m| m.output).sum::<i64>(), 30);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_session_state_and_store_db_dedup_and_overlap() {
+        use rusqlite::params;
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let copilot_dir = source_home.path().join(".copilot");
+        std::fs::create_dir_all(&copilot_dir).unwrap();
+
+        // 1. Session A: File only (multi-model Sol + Luna, active file with incomplete trailing line, checkpoints/shutdowns)
+        let sess_a_dir = copilot_dir.join("session-state/sess-a");
+        std::fs::create_dir_all(&sess_a_dir).unwrap();
+        let sess_a_content = r#"{"type":"session.start","data":{"sessionId":"sess-a","context":{"cwd":"/repo-a"}},"id":"start-a","timestamp":"2026-11-01T10:00:00.000Z"}
+{"type":"session.usage_record","data":{"usage":{"model":"gpt-6.1-sol","inputTokens":1000,"outputTokens":100,"cacheReadTokens":500,"cacheWriteTokens":200,"reasoningTokens":50,"cost":1.0,"copilotUsage":{"totalNanoAiu":50000000000}}},"id":"ev-a1","timestamp":"2026-11-01T10:01:00.000Z"}
+{"type":"session.usage_record","data":{"usage":{"model":"gpt-6-luna","inputTokens":500,"outputTokens":50,"cacheReadTokens":200,"cacheWriteTokens":0,"reasoningTokens":10,"cost":1.0,"copilotUsage":{"totalNanoAiu":10000000000}}},"id":"ev-a2","timestamp":"2026-11-01T10:02:00.000Z"}
+{"type":"session.usage_checkpoint","data":{"accountingSnapshot":{"tokenDetails":{"input":{"tokenCount":9999}}}},"id":"chk-1","timestamp":"2026-11-01T10:02:30.000Z"}
+{"type":"session.shutdown","data":{"modelMetrics":{"gpt-6.1-sol":{"usage":{"inputTokens":1000,"outputTokens":100,"cacheReadTokens":500,"cacheWriteTokens":200,"reasoningTokens":50}}}},"id":"shut-1","timestamp":"2026-11-01T10:03:00.000Z"}
+{"type":"session.usage_record","data":{"usage":{"model":"gpt-6-luna","inputTokens":
+"#;
+        std::fs::write(sess_a_dir.join("events.jsonl"), sess_a_content).unwrap();
+
+        // 2. Session B: DB only
+        let db_path = copilot_dir.join("session-store.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                cwd TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE assistant_usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_index INTEGER,
+                model TEXT NOT NULL,
+                copilot_usage_model TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                total_nano_aiu INTEGER,
+                duration_ms INTEGER,
+                created_at TEXT
+            );
+            "#,
+        )
+        .unwrap();
+
+        conn.execute(
+            r#"
+            INSERT INTO assistant_usage_events (
+                session_id, turn_index, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                total_nano_aiu, duration_ms, created_at
+            ) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                "sess-b",
+                "gpt-6-luna",
+                300,
+                30,
+                100,
+                50,
+                0,
+                5_000_000_000i64,
+                Some(500),
+                "2026-11-01T11:00:00.000Z"
+            ],
+        )
+        .unwrap();
+
+        // 3. Session C: Overlapping (turn 1 in both, turn 2 only in DB, turn 3 only in file)
+        let sess_c_dir = copilot_dir.join("session-state/sess-c");
+        std::fs::create_dir_all(&sess_c_dir).unwrap();
+        let sess_c_content = r#"{"type":"session.start","data":{"sessionId":"sess-c"},"id":"start-c","timestamp":"2026-11-01T12:00:00.000Z"}
+{"type":"session.usage_record","data":{"usage":{"model":"gpt-6.1-sol","inputTokens":400,"outputTokens":40,"cacheReadTokens":0,"cacheWriteTokens":0,"reasoningTokens":0,"copilotUsage":{"totalNanoAiu":20000000000}}},"id":"ev-c1","timestamp":"2026-11-01T12:01:00.000Z"}
+{"type":"session.usage_record","data":{"usage":{"model":"gpt-6.1-sol","inputTokens":600,"outputTokens":60,"cacheReadTokens":0,"cacheWriteTokens":0,"reasoningTokens":0,"copilotUsage":{"totalNanoAiu":30000000000}}},"id":"ev-c3","timestamp":"2026-11-01T12:03:00.000Z"}
+"#;
+        std::fs::write(sess_c_dir.join("events.jsonl"), sess_c_content).unwrap();
+
+        // Turn 1 in DB matches ev-c1 with slight ms jitter (12:01:00.005Z vs 12:01:00.000Z)
+        conn.execute(
+            r#"
+            INSERT INTO assistant_usage_events (
+                session_id, turn_index, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                total_nano_aiu, duration_ms, created_at
+            ) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                "sess-c",
+                "gpt-6.1-sol",
+                400,
+                40,
+                0,
+                0,
+                0,
+                20_000_000_000i64,
+                Some(400),
+                "2026-11-01T12:01:00.005Z"
+            ],
+        )
+        .unwrap();
+
+        // Turn 2 is ONLY in DB (e.g. rotated out of file)
+        conn.execute(
+            r#"
+            INSERT INTO assistant_usage_events (
+                session_id, turn_index, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                total_nano_aiu, duration_ms, created_at
+            ) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                "sess-c",
+                "gpt-6.1-sol",
+                500,
+                50,
+                0,
+                0,
+                0,
+                25_000_000_000i64,
+                Some(500),
+                "2026-11-01T12:02:00.000Z"
+            ],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let clients = ["copilot".to_string()];
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+
+        // sess-a: 2 records (1000-500-200=300 input, 500-200=300 input)
+        // sess-b: 1 record (300-100-50=150 input)
+        // sess-c: exactly 3 records (c1 [overlap counted once], c2 [from DB], c3 [from file])
+        // Total messages: 2 + 1 + 3 = 6
+        assert_eq!(messages.len(), 6);
+
+        let a_msgs: Vec<_> = messages
+            .iter()
+            .filter(|m| m.session_id == "sess-a")
+            .collect();
+        assert_eq!(a_msgs.len(), 2);
+        assert_eq!(a_msgs[0].tokens.input, 300);
+        assert_eq!(a_msgs[0].tokens.output, 100);
+        assert_eq!(a_msgs[0].tokens.reasoning, 50);
+        assert_eq!(a_msgs[1].tokens.input, 300);
+        assert_eq!(a_msgs[1].tokens.output, 50);
+
+        let b_msgs: Vec<_> = messages
+            .iter()
+            .filter(|m| m.session_id == "sess-b")
+            .collect();
+        assert_eq!(b_msgs.len(), 1);
+        assert_eq!(b_msgs[0].tokens.input, 150);
+
+        let c_msgs: Vec<_> = messages
+            .iter()
+            .filter(|m| m.session_id == "sess-c")
+            .collect();
+        assert_eq!(c_msgs.len(), 3);
+
+        let direct = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+
+        assert_eq!(direct.counts.get(ClientId::Copilot), 6);
+        assert_eq!(direct.messages.len(), 6);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn copilot_cross_file_anonymous_rows_survive_cached_and_direct_lanes() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
@@ -10375,8 +11061,8 @@ mod tests {
             Some("response".to_string()),
         );
         let mut native = cached.clone();
-        native.client = "antigravity-extension".to_string();
-        native.session_id = "native-session".to_string();
+        native.client = "antigravity-extension".into();
+        native.session_id = "native-session".into();
         native.cost = 0.0;
         native.duration_ms = Some(2_000);
         let unique = dedupe_antigravity_family_messages(vec![cached.clone(), native.clone()]);
@@ -10398,7 +11084,7 @@ mod tests {
             None
         );
         let mut mismatch = native.clone();
-        mismatch.model_id = "another-model".to_string();
+        mismatch.model_id = "another-model".into();
         assert_eq!(
             dedupe_antigravity_family_messages(vec![cached.clone(), mismatch])[0].duration_ms,
             None
@@ -10701,7 +11387,7 @@ mod tests {
                 },
                 0.0,
             );
-            msg.date = date.to_string();
+            msg.date = date.to_string().into();
             msg
         };
         let tz = crate::BucketTimezone::default();
@@ -10759,7 +11445,7 @@ mod tests {
                 },
                 0.0,
             );
-            message.date = date.to_string();
+            message.date = date.to_string().into();
             message
         };
 
@@ -11938,7 +12624,7 @@ mod tests {
             },
             1.0,
         );
-        msg.session_title = title.map(str::to_string);
+        msg.session_title = title.map(Into::into);
         msg
     }
 
@@ -12037,8 +12723,8 @@ mod tests {
     fn session_metadata_carries_every_known_parent_link() {
         let with = |session_id: &str, agent: Option<&str>, parent: Option<&str>| {
             let mut msg = make_session_meta_message("codex", session_id, 100, None);
-            msg.agent = agent.map(str::to_string);
-            msg.parent_session_id = parent.map(str::to_string);
+            msg.agent = agent.map(Into::into);
+            msg.parent_session_id = parent.map(Into::into);
             msg
         };
         let messages = vec![
@@ -12072,7 +12758,7 @@ mod tests {
         let orphan = "rollout-2026-10-10T15-10-00-01a12491-0000-7000-8000-000000000002";
         let row = |client: &str, session_id: &str, parent: Option<&str>| {
             let mut msg = make_session_meta_message(client, session_id, 100, None);
-            msg.parent_session_id = parent.map(str::to_string);
+            msg.parent_session_id = parent.map(Into::into);
             msg
         };
         // The continuation is seen first: the thread's first file still wins.
@@ -12641,6 +13327,7 @@ mod tests {
             GroupBy::WorkspaceModel,
             GroupBy::Session,
             GroupBy::ClientSession,
+            GroupBy::ClientWorkspaceSession,
             GroupBy::MachineModel,
         ];
 
@@ -12661,7 +13348,7 @@ mod tests {
         let labeled = |client: &str, session: &str, machine: Option<&str>| {
             let mut message =
                 make_workspace_message(client, "gpt-5.4", "openai", session, 1.0, None, None);
-            message.machine_label = machine.map(str::to_string);
+            message.machine_label = machine.map(super::SharedStr::from);
             message
         };
         let messages = vec![
@@ -12695,7 +13382,7 @@ mod tests {
     fn test_machine_model_rows_serialize_machine_only_when_set() {
         let mut message =
             make_workspace_message("codex", "gpt-5.4", "openai", "s1", 1.0, None, None);
-        message.machine_label = Some("steven".to_string());
+        message.machine_label = Some("steven".to_string().into());
         let machine_rows =
             aggregate_model_usage_entries(vec![message.clone()], &GroupBy::MachineModel);
         let value = serde_json::to_value(&machine_rows[0]).unwrap();
@@ -12950,6 +13637,88 @@ mod tests {
         assert_eq!(entries[0].output, 10);
         assert_eq!(entries[0].cost, 4.0);
         assert_eq!(entries[0].message_count, 2);
+    }
+
+    #[test]
+    fn first_party_provider_prefix_folds_into_the_bare_model_id() {
+        for (raw, canonical) in [
+            ("anthropic/claude-opus-5-5", "claude-opus-5-5"),
+            ("anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"),
+            ("anthropic/claude-opus-4-8-20260101", "claude-opus-4-8"),
+            ("openai-codex/gpt-6.1-sol", "gpt-6.1-sol"),
+            ("openai/gpt-5.4(high)", "gpt-5.4"),
+            ("x-ai/grok-4.7", "grok-4.7"),
+            ("Google/Gemini-3.8-Flash", "gemini-3.8-flash"),
+        ] {
+            assert_eq!(normalize_syntactic(raw), canonical, "{raw}");
+        }
+    }
+
+    #[test]
+    fn prefixes_that_are_part_of_the_model_name_are_kept() {
+        for raw in [
+            // router label: `cohere` does not make `north-mini-code`
+            "cohere/north-mini-code:free",
+            "cline-free/mimo-v2.6-flash",
+            // another vendor's prefix on a model it does not make
+            "openai/claude-opus-5-5",
+            "azure/gpt-4o",
+            "vertex_ai/gemini-2.5-pro",
+            // reseller or nested path
+            "openrouter/anthropic/claude-opus-5-5",
+            "anthropic/claude/opus-5-5",
+            // nothing after the prefix
+            "anthropic/",
+        ] {
+            assert_eq!(normalize_syntactic(raw), raw, "{raw}");
+        }
+    }
+
+    #[test]
+    fn prefix_is_kept_when_the_family_word_is_only_a_substring() {
+        // The model after the prefix merely contains a family word inside a
+        // longer word, so it is not that vendor's model.
+        for raw in [
+            "mistral/demistralized",
+            "openai/hypergpt-9",
+            "google/ungeminied-1",
+            "xai/ungrokked",
+            "anthropic/preclaude-3",
+        ] {
+            assert_eq!(normalize_syntactic(raw), raw, "{raw}");
+        }
+    }
+
+    #[test]
+    fn model_grouping_merges_provider_qualified_gateway_ids_across_clients() {
+        let entries = aggregate_model_usage_entries(
+            vec![
+                make_workspace_message(
+                    "hermes",
+                    "openai-codex/gpt-6.1-sol",
+                    "omp-smoke",
+                    "session-1",
+                    1.25,
+                    None,
+                    None,
+                ),
+                make_workspace_message(
+                    "omp",
+                    "gpt-6.1-sol",
+                    "openai",
+                    "session-2",
+                    2.75,
+                    None,
+                    None,
+                ),
+            ],
+            &GroupBy::Model,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "gpt-6.1-sol");
+        assert_eq!(entries[0].message_count, 2);
+        assert_eq!(entries[0].cost, 4.0);
     }
 
     #[test]
@@ -13566,6 +14335,17 @@ mod tests {
         );
         assert_eq!(round_tripped.cost, 2.5);
         assert_eq!(round_tripped.duration_ms, Some(2500));
+        assert!(parsed.client.shares_allocation_with(&unified.client));
+        assert!(parsed
+            .workspace_key
+            .as_ref()
+            .unwrap()
+            .shares_allocation_with(unified.workspace_key.as_ref().unwrap()));
+        assert!(round_tripped
+            .workspace_label
+            .as_ref()
+            .unwrap()
+            .shares_allocation_with(unified.workspace_label.as_ref().unwrap()));
     }
 
     #[test]
@@ -13800,8 +14580,8 @@ mod tests {
 
         // A physical target can have different gateway identity, but the
         // client filter must retain the selected source Codex row.
-        message.model_id = "served-model-fixture".to_string();
-        message.provider_id = "openai".to_string();
+        message.model_id = "served-model-fixture".to_string().into();
+        message.provider_id = "openai".to_string().into();
         assert!(!matches_flush_filter(&message, &context));
 
         let mut buffer = vec![message];
@@ -13912,7 +14692,7 @@ mod tests {
         for message in messages {
             cells
                 .entry((
-                    message.date.clone(),
+                    message.date.to_string(),
                     super::canonical_model_id(&message.model_id),
                 ))
                 .or_insert_with(super::RecountProofCell::default)
@@ -14005,17 +14785,17 @@ mod tests {
         }
 
         let date = &messages[0].date;
-        let gpt = &proof[date]["gpt-5"];
+        let gpt = &proof[date.as_str()]["gpt-5"];
         assert_eq!(gpt.previous.tokens.input, 380);
         assert_eq!(gpt.corrected.tokens.input, 330);
         assert_eq!(gpt.previous.messages, 4);
         assert_eq!(gpt.corrected.messages, 3);
-        let claude = &proof[date]["claude-3-7-sonnet"];
+        let claude = &proof[date.as_str()]["claude-3-7-sonnet"];
         assert_eq!(claude.previous.tokens.input, 100);
         assert_eq!(claude.corrected.tokens.input, 60);
         assert_eq!(claude.previous.messages, 2);
         assert_eq!(claude.corrected.messages, 1);
-        let legacy = &proof[date]["legacy-cursor-model"];
+        let legacy = &proof[date.as_str()]["legacy-cursor-model"];
         assert_eq!(legacy.previous, legacy.corrected);
         assert_eq!(legacy.corrected.tokens.input, 11);
         assert_eq!(legacy.corrected.tokens.cache_write, 7);
@@ -14077,7 +14857,7 @@ mod tests {
         kept_inputs.sort_unstable();
         assert_eq!(kept_inputs, vec![20, 40]);
         let date = &messages[0].date;
-        let entry = &outcome.recount_proofs["cursor"][date]["gpt-5"];
+        let entry = &outcome.recount_proofs["cursor"][date.as_str()]["gpt-5"];
         assert_eq!(entry.previous.tokens.input, 100);
         assert_eq!(entry.corrected.tokens.input, 60);
         assert_eq!(entry.previous.messages, 4);
@@ -16682,8 +17462,10 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        // A Freebuff chat: marked by its `base2-free*` root agent id, with no
-        // authoritative usage — only estimated text.
+        // A Freebuff chat: marked by its free root agent id, with no
+        // authoritative usage — only estimated text. Uses the v3 family the
+        // current Freebuff CLI writes; the parser must not depend on the v2
+        // `base2-free*` spelling.
         let freebuff_chat = manicode
             .join("projects")
             .join("proj")
@@ -16696,7 +17478,7 @@ mod tests {
                 { "variant": "user", "content": "hello world", "timestamp": "2026-08-07T13:00:00.000Z" },
                 { "variant": "ai", "timestamp": "2026-08-07T13:01:00.000Z", "blocks": [ { "content": "Hello!" } ],
                   "metadata": { "runState": { "sessionState": { "mainAgentState": {
-                      "agentType": "base2-free-deepseek-flash" } } } } }
+                      "agentType": "base3-free-catalog" } } } } }
             ]"#,
         )
         .unwrap();
@@ -17115,7 +17897,7 @@ mod tests {
             "the matching year must keep the fx row"
         );
         assert_eq!(
-            fx_rows(Some(expected_date.clone()), None, None).len(),
+            fx_rows(Some(expected_date.to_string()), None, None).len(),
             1,
             "a since cutoff on the row's own day must keep it"
         );
@@ -17209,7 +17991,7 @@ mod tests {
                 },
                 0.0,
             );
-            stale_message.date = "1900-01-01".to_string();
+            stale_message.date = "1900-01-01".to_string().into();
 
             let mut cache = message_cache::SourceMessageCache::default();
             cache.insert(message_cache::CachedSourceEntry::new(
@@ -18161,8 +18943,8 @@ mod tests {
             .iter()
             .map(|message| {
                 (
-                    message.client.clone(),
-                    message.session_id.clone(),
+                    message.client.to_string(),
+                    message.session_id.to_string(),
                     message.tokens.input,
                     message.tokens.cache_read,
                     message.tokens.output,
@@ -18270,7 +19052,7 @@ mod tests {
         let mut uncached: Vec<(String, i64, i64)> = parsed
             .messages
             .iter()
-            .map(|m| (m.session_id.clone(), m.input, m.output))
+            .map(|m| (m.session_id.to_string(), m.input, m.output))
             .collect();
         uncached.sort();
         assert_eq!(
@@ -20456,6 +21238,107 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn magpie_attributes_codex_compaction_without_changing_token_totals() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let home = source_home.path();
+        let sessions = home.join(".codex/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("rollout.jsonl"), concat!(
+            r#"{"timestamp":"2026-10-01T00:00:00Z","type":"session_meta","payload":{"id":"fixture-session","source":"vscode","model_provider":"openai"}}"#, "\n",
+            r#"{"timestamp":"2026-10-01T00:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"group/auto"}}"#, "\n",
+            r#"{"timestamp":"2026-10-01T00:00:02Z","type":"token_usage_record","payload":{"thread_id":"fixture-session","turn_id":"turn-1","response_id":"resp-compaction","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":540}}}"#, "\n",
+            r#"{"timestamp":"2026-10-01T00:00:03Z","type":"compacted","payload":{"message":"","replacement_history":[]}}"#, "\n",
+            r#"{"timestamp":"2026-10-01T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}}"#, "\n"
+        )).unwrap();
+        let ledger = home.join(".config/magpie");
+        std::fs::create_dir_all(&ledger).unwrap();
+        std::fs::write(ledger.join("usage.jsonl"), concat!(
+            r#"{"agent":"codex","response_id":"resp-compaction","provider":"openai","served":"gpt-fixture","req":"group/auto","in":300,"out":40,"cache_read":200,"reasoning":10,"status":200}"#, "\n"
+        )).unwrap();
+        let clients = ["codex".to_string()];
+        let pricing = pricing::PricingService::new(
+            HashMap::from([(
+                "gpt-fixture".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.01),
+                    output_cost_per_token: Some(0.01),
+                    cache_read_input_token_cost: Some(0.01),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+        );
+        for _ in 0..2 {
+            let messages =
+                parse_all_messages_with_pricing(home.to_str().unwrap(), &clients, Some(&pricing));
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tokens.total(), 540);
+            assert_eq!(messages[0].model_id, "gpt-fixture");
+            assert!((messages[0].cost - 5.4).abs() < 1e-9);
+        }
+
+        let row = serde_json::json!({
+            "agent": "codex", "response_id": "resp-compaction", "provider": "openai",
+            "served": "gpt-fixture", "req": "group/auto", "in": 300, "out": 40,
+            "cache_read": 200, "reasoning": 10, "status": 200
+        });
+        for (field, value) in [
+            ("err", serde_json::json!("stream failed")),
+            ("status", serde_json::json!(500)),
+            ("agent", serde_json::json!("claude")),
+            ("served", serde_json::json!("group/auto-example")),
+            ("served", serde_json::json!("group/auto")),
+            ("in", serde_json::json!(301)),
+            ("reasoning", serde_json::json!(9)),
+            ("source", serde_json::json!("reported")),
+            ("computer", serde_json::json!("remote-machine")),
+            ("via", serde_json::json!("remote-machine")),
+            ("handed_on", serde_json::json!(true)),
+        ] {
+            let mut invalid = row.clone();
+            invalid[field] = value;
+            std::fs::write(ledger.join("usage.jsonl"), format!("{invalid}\n")).unwrap();
+            let messages = parse_all_messages_with_pricing(home.to_str().unwrap(), &clients, None);
+            assert_eq!(messages[0].tokens.total(), 540, "{field}");
+            assert_eq!(messages[0].model_id, "group/auto", "{field}");
+        }
+        std::fs::write(ledger.join("usage.jsonl"), format!("{row}\n{row}\n")).unwrap();
+        let messages = parse_all_messages_with_pricing(home.to_str().unwrap(), &clients, None);
+        assert_eq!(messages[0].model_id, "group/auto", "duplicate response ID");
+
+        std::fs::write(ledger.join("usage.jsonl"), format!("{row}\n")).unwrap();
+        let opencodex = home.join(".opencodex");
+        std::fs::create_dir_all(&opencodex).unwrap();
+        let mut other = serde_json::json!({
+            "provider":"combo", "requestedModel":"group/auto", "servedModel":"other-model",
+            "inboundProtocol":"responses", "timestamp":1790812802000_i64,
+            "durationMs":0, "status":200,
+            "attempts":[{"ordinal":1,"provider":"other-provider","model":"other-model",
+                "adapter":"fixture","status":200,"durationMs":0,"sendCount":1,
+                "usageStatus":"reported","usage":{"inputTokens":500,"outputTokens":40,
+                "totalTokens":540,"cachedInputTokens":200,"reasoningOutputTokens":10}}]
+        });
+        std::fs::write(opencodex.join("usage.jsonl"), format!("{other}\n")).unwrap();
+        let messages = parse_all_messages_with_pricing(home.to_str().unwrap(), &clients, None);
+        assert_eq!(
+            messages[0].model_id, "other-model",
+            "existing OpenCodex attribution wins"
+        );
+
+        let first = other.clone();
+        other["servedModel"] = serde_json::json!("another-model");
+        std::fs::write(opencodex.join("usage.jsonl"), format!("{first}\n{other}\n")).unwrap();
+        let messages = parse_all_messages_with_pricing(home.to_str().unwrap(), &clients, None);
+        assert_eq!(
+            messages[0].model_id, "group/auto",
+            "ambiguous OpenCodex claims stay unresolved"
+        );
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_parse_local_clients_codex_counts_deduplicated_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
@@ -20830,7 +21713,7 @@ mod tests {
             let fingerprint = message_cache::SourceFingerprint::from_path(&path).unwrap();
             let mut stale_message = expected[0].clone();
             stale_message.timestamp = 0;
-            stale_message.date = "1900-01-01".to_string();
+            stale_message.date = "1900-01-01".to_string().into();
 
             let mut cache = message_cache::SourceMessageCache::default();
             cache.insert(message_cache::CachedSourceEntry::new(
@@ -21975,7 +22858,7 @@ mod tests {
                 reasoning: 0,
             },
             0.42,
-            Some("planner".to_string()),
+            Some("planner"),
         );
 
         apply_pricing_if_available(&mut msg, None);
@@ -22400,7 +23283,7 @@ mod tests {
             },
             9.0,
         );
-        unpriced.date = "2026-01-01".to_string();
+        unpriced.date = "2026-01-01".to_string().into();
         unpriced.mark_estimated_cost();
 
         let mut complete = UnifiedMessage::new(
@@ -22415,7 +23298,7 @@ mod tests {
             },
             2.0,
         );
-        complete.date = "2026-01-02".to_string();
+        complete.date = "2026-01-02".to_string().into();
         complete.mark_provider_reported_cost();
 
         let graph = build_graph_from_messages(
@@ -22998,6 +23881,18 @@ mod tests {
             estimate.evidence.kind,
             pricing::lookup::ResolutionKind::ModelPart
         );
+        let explanation = serde_json::to_value(pricing.explain_message(&message)).unwrap();
+        assert_eq!(explanation["coverage"], false);
+        assert_eq!(
+            explanation["submissionSafetyGap"],
+            "unverified_provider_identity"
+        );
+        let mut reported = message.clone();
+        reported.cost = 0.25;
+        reported.mark_provider_reported_cost();
+        let reported = serde_json::to_value(pricing.explain_message(&reported)).unwrap();
+        assert_eq!(reported["coverage"], true);
+        assert!(reported.get("submissionSafetyGap").is_none());
 
         let graph = build_graph_from_messages(
             vec![message],
@@ -23536,7 +24431,7 @@ mod tests {
             },
             0.0,
         );
-        old.date = "2020-01-01".to_string();
+        old.date = "2020-01-01".to_string().into();
         let filtered = filter_messages_for_report(
             vec![old],
             &ReportOptions {
@@ -24186,7 +25081,7 @@ mod tests {
             tokens.clone(),
             0.0,
         );
-        fast.service_tier = Some("priority".to_string());
+        fast.service_tier = Some("priority".to_string().into());
         apply_pricing_if_available(&mut fast, Some(&pricing));
 
         let mut standard = UnifiedMessage::new(
@@ -24198,7 +25093,7 @@ mod tests {
             tokens.clone(),
             0.0,
         );
-        standard.service_tier = Some("default".to_string());
+        standard.service_tier = Some("default".to_string().into());
         apply_pricing_if_available(&mut standard, Some(&pricing));
 
         let mut non_openai = UnifiedMessage::new(
@@ -24210,7 +25105,7 @@ mod tests {
             tokens,
             0.0,
         );
-        non_openai.service_tier = Some("fast".to_string());
+        non_openai.service_tier = Some("fast".to_string().into());
         apply_pricing_if_available(&mut non_openai, Some(&pricing));
 
         assert!((fast.cost - 0.0468).abs() < 1e-12);
@@ -24335,7 +25230,7 @@ mod tests {
             tokens.clone(),
             0.0,
         );
-        suffix_and_tier.service_tier = Some("fast".to_string());
+        suffix_and_tier.service_tier = Some("fast".to_string().into());
         apply_pricing_if_available(&mut suffix_and_tier, Some(&pricing));
 
         let mut standard = UnifiedMessage::new(
@@ -25820,7 +26715,7 @@ mod tests {
             .expect("devin-cli recount proof");
         let date = messages[0].date.clone();
         assert!(messages.iter().all(|message| message.date == date));
-        let entry = &proof[&date]["gpt-5"];
+        let entry = &proof[date.as_str()]["gpt-5"];
         assert_eq!(entry.corrected.tokens.input, 67 + 10 + 20);
         assert_eq!(entry.corrected.tokens.output, 103 + 5 + 5);
         assert_eq!(entry.corrected.messages, 3);
@@ -25833,6 +26728,576 @@ mod tests {
         assert_eq!(reads.discovered, 2);
         assert_eq!(reads.unreadable, 1);
         assert!(!reads.complete());
+    }
+
+    mod devin_cache_tests {
+        use super::*;
+        use std::path::{Path, PathBuf};
+
+        fn database(home: &Path) -> (PathBuf, rusqlite::Connection) {
+            let path = home.join(".local/share/devin/cli/sessions.db");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, working_directory TEXT, title TEXT);
+                 CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY, session_id TEXT, chat_message TEXT, created_at INTEGER);
+                 INSERT INTO sessions VALUES ('sess', 'gpt-5', '/tmp/project', 'Task');",
+            ).unwrap();
+            (path, conn)
+        }
+
+        fn append(conn: &rusqlite::Connection, request: &str, input: i64, output: i64) {
+            conn.execute(
+                "INSERT INTO message_nodes (session_id, chat_message, created_at) VALUES ('sess', ?1, 1700000000)",
+                [serde_json::json!({"role":"assistant", "metadata": {
+                    "request_id":request, "metrics":{"input_tokens":input,"output_tokens":output}
+                }}).to_string()],
+            ).unwrap();
+        }
+
+        fn scan(
+            home: &Path,
+            policy: SourceCachePolicy,
+        ) -> (Vec<UnifiedMessage>, crate::StreamingParseOutcome) {
+            let mut messages = Vec::new();
+            let outcome = crate::parse_all_messages_streaming(
+                home.to_str().unwrap(),
+                &["devin-cli".to_string()],
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                policy,
+                None,
+                &mut messages,
+            );
+            (messages, outcome)
+        }
+
+        fn cached(path: &Path) -> Option<message_cache::CachedSourceEntry> {
+            message_cache::SourceMessageCache::load().get(
+                message_cache::CacheIdentity::for_client(ClientId::DevinCli),
+                path,
+            )
+        }
+
+        fn persist_legacy_entry(
+            cache_home: &Path,
+            entry: message_cache::CachedSourceEntry,
+            version: u32,
+        ) {
+            let mut serialized = serde_json::to_value(entry).unwrap();
+            serialized["parser_version"] = serde_json::json!(version);
+            let old_entry: message_cache::CachedSourceEntry =
+                serde_json::from_value(serialized).unwrap();
+            // Keep the combined downstream wire layout loadable while freezing
+            // the old source-parser version. This isolates parser invalidation
+            // from envelope migration or accidental payload corruption.
+            use bincode::Options;
+            let parser_dir =
+                cache_home.join(".config/tokscale/cache/source-message-cache-v2/devin-cli");
+            let shards: Vec<_> = std::fs::read_dir(parser_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "bin"))
+                .collect();
+            assert_eq!(shards.len(), 1);
+            // Bincode encodes this struct positionally: format, namespace,
+            // parser version, payload. Keep the existing format and bytes.
+            let (format, namespace, _, _): (u32, String, u32, Vec<u8>) = bincode::options()
+                .deserialize(&std::fs::read(&shards[0]).unwrap())
+                .unwrap();
+            assert_eq!(format, 14);
+            let payload = bincode::options().serialize(&vec![old_entry]).unwrap();
+            let envelope = bincode::options()
+                .serialize(&(format, namespace, version, payload))
+                .unwrap();
+            std::fs::write(&shards[0], envelope).unwrap();
+        }
+
+        fn assert_warm_matches_cold(home: &Path, path: &Path, raw_rows: usize) {
+            let (warm, warm_outcome) = scan(home, SourceCachePolicy::Persistent);
+            let (cold, cold_outcome) = scan(home, SourceCachePolicy::InMemory);
+            assert_eq!(warm_outcome.source_reads, cold_outcome.source_reads);
+            assert!(warm_outcome.source_reads["devin-cli"].complete());
+            assert_eq!(
+                serde_json::to_value(&warm).unwrap(),
+                serde_json::to_value(&cold).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&warm_outcome.recount_proofs).unwrap(),
+                serde_json::to_value(&cold_outcome.recount_proofs).unwrap()
+            );
+            let entry = cached(path).expect("stable scan writes an entry");
+            assert_eq!(entry.messages.len(), raw_rows);
+            assert_eq!(
+                serde_json::to_value(&entry.messages).unwrap(),
+                serde_json::to_value(crate::sessions::devin::parse_devin_cli_sqlite(path)).unwrap()
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_preserves_cached_and_appended_request_multiplicities() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            append(&conn, "req-1", 67, 103);
+            append(&conn, "req-1", 67, 103);
+            assert_warm_matches_cold(home.path(), &path, 2);
+            // Cached duplicates survive, and a third distinct row must survive
+            // even though request, time, and every token bucket are identical.
+            append(&conn, "req-1", 67, 103);
+            append(&conn, "req-2", 10, 5);
+            assert_warm_matches_cold(home.path(), &path, 4);
+            let (messages, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert_eq!(messages.len(), 2);
+            let proof = &outcome.recount_proofs["devin-cli"][messages[0].date.as_str()]["gpt-5"];
+            assert_eq!(proof.previous.messages, 4);
+            assert_eq!(proof.previous.tokens.input, 67 * 3 + 10);
+            assert_eq!(proof.corrected.tokens.input, 67 + 10);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_preserves_equal_totals_with_different_token_buckets() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            append(&conn, "req-1", 67, 103);
+            assert_warm_matches_cold(home.path(), &path, 1);
+            append(&conn, "req-1", 103, 67);
+            assert_warm_matches_cold(home.path(), &path, 2);
+            let (messages, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            let proof = &outcome.recount_proofs["devin-cli"][messages[0].date.as_str()]["gpt-5"];
+            assert_eq!(proof.previous.tokens.input, 170);
+            assert_eq!(proof.previous.tokens.output, 170);
+            assert_eq!(proof.corrected.tokens.input, 67);
+            assert_eq!(proof.corrected.tokens.output, 103);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_unchanged_hit_and_live_edits() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            let probe = crate::sessions::devin::cache_test_hooks::watch(&path);
+            append(&conn, "req-1", 67, 103);
+            append(&conn, "req-1", 67, 103);
+            scan(home.path(), SourceCachePolicy::Persistent);
+            assert_eq!(probe.reads(), 1);
+            scan(home.path(), SourceCachePolicy::Persistent);
+            assert_eq!(
+                probe.reads(),
+                1,
+                "unchanged cache hit must not decode SQLite rows"
+            );
+
+            let edits = [
+                "UPDATE message_nodes SET chat_message = '{\"role\":\"assistant\",\"metadata\":{\"request_id\":\"req-1\",\"metrics\":{\"input_tokens\":103,\"output_tokens\":67}}}' WHERE row_id = 2",
+                "UPDATE message_nodes SET created_at = 1700086400 WHERE row_id = 2",
+                "UPDATE sessions SET model = 'gpt-4o'",
+                "UPDATE sessions SET working_directory = '/tmp/other'",
+                "UPDATE sessions SET title = 'Edited task'",
+            ];
+            for sql in edits {
+                conn.execute_batch(sql).unwrap();
+                let before = probe.reads();
+                scan(home.path(), SourceCachePolicy::Persistent);
+                assert_eq!(
+                    probe.reads(),
+                    before + 1,
+                    "edit requires a full read: {sql}"
+                );
+                assert_warm_matches_cold(home.path(), &path, 2);
+            }
+            conn.execute_batch("DELETE FROM message_nodes WHERE row_id = 2")
+                .unwrap();
+            assert_warm_matches_cold(home.path(), &path, 1);
+            // Same count, sum, max id and sessions as the cached source, but
+            // replacement row contents: row stats never proved pure append.
+            conn.execute_batch("DELETE FROM message_nodes WHERE row_id = 1")
+                .unwrap();
+            append(&conn, "replacement", 20, 30);
+            assert_warm_matches_cold(home.path(), &path, 1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_retries_watermark_races_without_replaying_rows() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            let probe = crate::sessions::devin::cache_test_hooks::watch(&path);
+            append(&conn, "req-1", 67, 103);
+            scan(home.path(), SourceCachePolicy::Persistent);
+            // Append after the pre-read fingerprint, before SELECT. The old
+            // watermark design cached this extra row under an earlier mark.
+            append(&conn, "req-2", 10, 5);
+            probe.before_read_sql("INSERT INTO message_nodes (session_id, chat_message, created_at) SELECT session_id, chat_message, created_at FROM message_nodes WHERE row_id = 1");
+            let (_, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(!outcome.source_reads["devin-cli"].complete());
+            assert!(
+                cached(&path).is_none(),
+                "racing read must not publish a stale fingerprint"
+            );
+            assert_warm_matches_cold(home.path(), &path, 3);
+            // Append after SELECT, before fingerprint revalidation. Do not
+            // tag the old read with the newer database fingerprint either.
+            append(&conn, "req-3", 20, 5);
+            probe.after_read_sql("INSERT INTO message_nodes (session_id, chat_message, created_at) SELECT session_id, chat_message, created_at FROM message_nodes WHERE row_id = 1");
+            let (_, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(!outcome.source_reads["devin-cli"].complete());
+            assert!(cached(&path).is_none());
+            assert_warm_matches_cold(home.path(), &path, 5);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_does_not_cache_failed_or_partial_reads() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            append(&conn, "req-1", 67, 103);
+            scan(home.path(), SourceCachePolicy::Persistent);
+            // The usage SELECT does not need title. A missing title must not
+            // be mistaken for a successful zero-valued sessions hash.
+            conn.execute_batch(
+                "ALTER TABLE sessions DROP COLUMN title; UPDATE sessions SET model = 'gpt-4o'",
+            )
+            .unwrap();
+            assert_warm_matches_cold(home.path(), &path, 1);
+            // SQLite accepts a blob in this TEXT column, but row decoding
+            // fails. Keep readable rows for local output, not for the cache.
+            conn.execute_batch("INSERT INTO message_nodes VALUES (2, 'sess', X'FF', 1700000000)")
+                .unwrap();
+            let (messages, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(outcome.source_reads["devin-cli"].unreadable, 1);
+            assert!(!outcome.source_reads["devin-cli"].complete());
+            assert!(cached(&path).is_none());
+            assert!(!crate::sessions::devin::devin_cli_source_is_readable(&path));
+            let (_, repeated) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(!repeated.source_reads["devin-cli"].complete());
+            conn.execute_batch("DELETE FROM message_nodes WHERE row_id = 2")
+                .unwrap();
+            assert_warm_matches_cold(home.path(), &path, 1);
+            conn.execute_batch("ALTER TABLE sessions RENAME TO unavailable_sessions")
+                .unwrap();
+            let (messages, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(messages.is_empty());
+            assert_eq!(outcome.source_reads["devin-cli"].unreadable, 1);
+            assert!(cached(&path).is_none());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn devin_submission_graph_withholds_completeness_for_partial_rows() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            let probe = crate::sessions::devin::cache_test_hooks::watch(&path);
+            append(&conn, "req-1", 67, 103);
+            append(&conn, "req-1", 67, 103);
+            let pricing = pricing::PricingService::new(
+                HashMap::from([(
+                    "gpt-5".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(0.001),
+                        output_cost_per_token: Some(0.002),
+                        ..Default::default()
+                    },
+                )]),
+                HashMap::new(),
+            );
+            let options = || ReportOptions {
+                home_dir: Some(home.path().to_str().unwrap().to_string()),
+                clients: Some(vec!["devin-cli".to_string()]),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let graph = crate::generate_graph_with_loaded_pricing(
+                    options(),
+                    Some(&pricing),
+                    crate::GraphPricingRequirement::Submission,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(graph.source_reads["devin-cli"].complete());
+                assert_eq!(graph.contributions.len(), 1);
+            }
+            assert_eq!(
+                probe.reads(),
+                1,
+                "unchanged submission cache hit must not rescan rows"
+            );
+            conn.execute_batch("INSERT INTO message_nodes VALUES (3, 'sess', X'FF', 1700000000)")
+                .unwrap();
+            for _ in 0..2 {
+                let graph = crate::generate_graph_with_loaded_pricing(
+                    options(),
+                    Some(&pricing),
+                    crate::GraphPricingRequirement::Submission,
+                    None,
+                )
+                .await
+                .unwrap();
+                let summary = graph.source_reads["devin-cli"];
+                assert_eq!(summary.discovered, 1);
+                assert_eq!(summary.unreadable, 1);
+                // The CLI uses this exact predicate before assigning both
+                // full-history and complete-day authority to submission.
+                assert!(!summary.complete());
+                assert_eq!(
+                    graph.contributions.len(),
+                    1,
+                    "readable usage still reaches the graph"
+                );
+                assert!(!graph.recount_proofs["devin-cli"].is_empty());
+                assert!(cached(&path).is_none());
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_handles_row_ids_whose_sum_overflows() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            append(&conn, "req-1", 67, 103);
+            append(&conn, "req-1", 103, 67);
+            conn.execute(
+                "UPDATE message_nodes SET row_id = ?1 WHERE row_id = 2",
+                [i64::MAX],
+            )
+            .unwrap();
+            assert_warm_matches_cold(home.path(), &path, 2);
+            scan(home.path(), SourceCachePolicy::Persistent);
+            assert_warm_matches_cold(home.path(), &path, 2);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_rejects_literal_v5_entry_with_unchanged_fingerprint() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            let probe = crate::sessions::devin::cache_test_hooks::watch(&path);
+            append(&conn, "req-1", 67, 103);
+            append(&conn, "req-1", 67, 103);
+            scan(home.path(), SourceCachePolicy::Persistent);
+            let mut stale = cached(&path).unwrap();
+            stale.messages.truncate(1);
+
+            // Positive control: these are loadable persisted bytes with the
+            // exact live fingerprint, not an accidentally unreadable fixture.
+            let mut cache = message_cache::SourceMessageCache::load();
+            cache.insert(stale.clone());
+            cache.save_if_dirty();
+            let (_, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert_eq!(probe.reads(), 1);
+            assert_eq!(
+                outcome.recount_proofs["devin-cli"].values().next().unwrap()["gpt-5"]
+                    .previous
+                    .messages,
+                1
+            );
+
+            // Freeze the old producer version literally. The old row-stats
+            // resume could persist this lossy raw vector; changing only its
+            // parser version must force a fresh read even with matching bytes.
+            persist_legacy_entry(cache_home.path(), stale, 5);
+            let (_, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert_eq!(probe.reads(), 2, "v5 entries must not be served unchanged");
+            assert_eq!(
+                outcome.recount_proofs["devin-cli"].values().next().unwrap()["gpt-5"]
+                    .previous
+                    .messages,
+                2
+            );
+            assert_warm_matches_cold(home.path(), &path, 2);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_json_decode_failures_revoke_authority_but_valid_skips_do_not() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            append(&conn, "req-1", 67, 103);
+            for valid in [
+                r#"{"role":"user","metadata":["non-assistant schema"]}"#,
+                r#"{"role":"tool","metadata":"tool metadata"}"#,
+                r#"{"role":"assistant"}"#,
+                r#"{"role":"assistant","metadata":{"metrics":{"input_tokens":0}}}"#,
+            ] {
+                conn.execute("INSERT INTO message_nodes (session_id, chat_message, created_at) VALUES ('sess', ?1, 1700000000)", [valid]).unwrap();
+            }
+            assert_warm_matches_cold(home.path(), &path, 1);
+            for invalid in [
+                "{not json",
+                r#"{"role":"assistant","metadata":"wrong schema"}"#,
+                r#"{"role":"assistant","metadata":{"metrics":{"input_tokens":"bad"}}}"#,
+            ] {
+                conn.execute(
+                    "INSERT INTO message_nodes VALUES (100, 'sess', ?1, 1700000000)",
+                    [invalid],
+                )
+                .unwrap();
+                for policy in [
+                    SourceCachePolicy::Persistent,
+                    SourceCachePolicy::Persistent,
+                    SourceCachePolicy::InMemory,
+                ] {
+                    let (messages, outcome) = scan(home.path(), policy);
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(outcome.source_reads["devin-cli"].unreadable, 1);
+                    assert!(!outcome.source_reads["devin-cli"].complete());
+                    assert!(cached(&path).is_none());
+                }
+                assert!(!crate::sessions::devin::devin_cli_source_is_readable(&path));
+                conn.execute_batch("DELETE FROM message_nodes WHERE row_id = 100")
+                    .unwrap();
+                assert_warm_matches_cold(home.path(), &path, 1);
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_empty_legacy_and_disappearing_sources() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            conn.execute_batch("DROP TABLE message_nodes").unwrap();
+            let (messages, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(messages.is_empty());
+            assert_eq!(outcome.source_reads["devin-cli"].discovered, 1);
+            assert!(outcome.source_reads["devin-cli"].complete());
+            assert!(crate::sessions::devin::devin_cli_source_is_readable(&path));
+            conn.execute_batch("CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY)")
+                .unwrap();
+            let (_, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(!outcome.source_reads["devin-cli"].complete());
+            assert!(!crate::sessions::devin::devin_cli_source_is_readable(&path));
+            drop(conn);
+            let probe = crate::sessions::devin::cache_test_hooks::watch(&path);
+            probe.remove_before_read();
+            let (messages, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(messages.is_empty());
+            assert_eq!(outcome.source_reads["devin-cli"].discovered, 1);
+            assert!(!outcome.source_reads["devin-cli"].complete());
+            assert!(cached(&path).is_none());
+            assert!(!crate::sessions::devin::devin_cli_source_is_readable(&path));
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_schema_probe_matches_sqlite_identifier_rules() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            append(&conn, "req-1", 67, 103);
+            conn.execute_batch("ALTER TABLE message_nodes RENAME TO renamed_nodes; ALTER TABLE renamed_nodes RENAME TO Message_Nodes").unwrap();
+            assert_warm_matches_cold(home.path(), &path, 1);
+            conn.execute_batch("ALTER TABLE Message_Nodes RENAME TO backing_nodes; CREATE VIEW message_nodes AS SELECT * FROM backing_nodes").unwrap();
+            assert_warm_matches_cold(home.path(), &path, 1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_one_failed_database_revokes_client_completeness() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let imported = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (good_path, good) = database(home.path());
+            let (bad_path, bad) = database(imported.path());
+            append(&good, "good", 67, 103);
+            append(&bad, "bad-prefix", 10, 5);
+            bad.execute_batch("INSERT INTO message_nodes VALUES (2, 'sess', X'FF', 1700000000)")
+                .unwrap();
+            let probe = crate::sessions::devin::cache_test_hooks::watch(&good_path);
+            let settings = scanner::ScannerSettings {
+                extra_scan_paths: std::collections::BTreeMap::from([(
+                    "devin-cli".to_string(),
+                    vec![bad_path.parent().unwrap().to_path_buf()],
+                )]),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let mut messages = Vec::new();
+                let outcome = crate::parse_all_messages_streaming(
+                    home.path().to_str().unwrap(),
+                    &["devin-cli".to_string()],
+                    None,
+                    false,
+                    &settings,
+                    SourceCachePolicy::Persistent,
+                    None,
+                    &mut messages,
+                );
+                assert_eq!(messages.len(), 2);
+                assert_eq!(outcome.source_reads["devin-cli"].discovered, 2);
+                assert_eq!(outcome.source_reads["devin-cli"].unreadable, 1);
+                assert!(!outcome.source_reads["devin-cli"].complete());
+                assert!(cached(&good_path).is_some());
+                assert!(cached(&bad_path).is_none());
+            }
+            assert_eq!(probe.reads(), 1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn devin_cache_rejects_literal_v6_prefix_that_skipped_invalid_json() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let (path, conn) = database(home.path());
+            let probe = crate::sessions::devin::cache_test_hooks::watch(&path);
+            append(&conn, "req-1", 67, 103);
+            scan(home.path(), SourceCachePolicy::Persistent);
+            let mut stale = cached(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO message_nodes VALUES (2, 'sess', '{not json', 1700000000)",
+            )
+            .unwrap();
+            stale.fingerprint =
+                match message_cache::SourceFingerprint::check_sqlite_path(&path, None).unwrap() {
+                    message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
+                    _ => unreachable!(),
+                };
+            // Positive control: the exact live fingerprint serves the cached
+            // prefix without decoding. v6 used to admit precisely this entry.
+            let mut cache = message_cache::SourceMessageCache::load();
+            cache.insert(stale.clone());
+            cache.save_if_dirty();
+            let (_, control) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert!(control.source_reads["devin-cli"].complete());
+            assert_eq!(probe.reads(), 1);
+            persist_legacy_entry(cache_home.path(), stale, 6);
+            let (messages, outcome) = scan(home.path(), SourceCachePolicy::Persistent);
+            assert_eq!(
+                probe.reads(),
+                2,
+                "literal v6 must reparse under the stronger decode contract"
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(!outcome.source_reads["devin-cli"].complete());
+            assert!(cached(&path).is_none());
+        }
     }
 
     #[test]
@@ -27143,7 +28608,11 @@ mod tests {
         assert_eq!(parsed.counts.get(ClientId::Amp), 2);
         assert_eq!(parsed.messages.len(), 2);
 
-        let dates: HashSet<String> = parsed.messages.iter().map(|msg| msg.date.clone()).collect();
+        let dates: HashSet<String> = parsed
+            .messages
+            .iter()
+            .map(|msg| msg.date.to_string())
+            .collect();
         let local_date = |timestamp_ms: i64| {
             chrono::Local
                 .timestamp_millis_opt(timestamp_ms)
@@ -28040,7 +29509,7 @@ mod tests {
             let mut per_model: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
             for message in &messages {
-                *per_model.entry(message.model_id.clone()).or_default() += message.tokens.input;
+                *per_model.entry(message.model_id.to_string()).or_default() += message.tokens.input;
             }
             assert_eq!(per_model.get("model-a").copied(), Some(150));
             assert_eq!(per_model.get("model-b").copied(), Some(100));
@@ -28172,7 +29641,7 @@ mod tests {
                 TokenBreakdown::default(),
                 0.0,
             );
-            message.date = date.to_string();
+            message.date = date.to_string().into();
             message
         };
 
@@ -28251,7 +29720,7 @@ mod tests {
                 0,
                 TokenBreakdown::default(),
                 0.0,
-                agent.map(str::to_string),
+                agent,
             )
         };
 
@@ -29357,6 +30826,587 @@ mod tests {
                     existing.billing_identity,
                     sessions::BillingIdentity::Unknown
                 );
+            }
+        }
+    }
+
+    /// The model report folds rows straight out of the parse instead of
+    /// collecting every message first. These pin it to the collecting path it
+    /// replaced: same rows, totals and undated tokens for every grouping and
+    /// date range, including the recovery-ledger case that still collects.
+    mod model_report_streaming {
+        use super::super::{
+            claude_desktop, get_model_report_v2, load_pricing_for_local_parse,
+            model_report_token_totals, parse_all_messages_with_coverage, recovery, ModelReportSink,
+            ModelReportV2, ModelUsage,
+        };
+        use super::*;
+
+        /// One Claude Code assistant response at `timestamp` (UTC).
+        fn claude_line(timestamp: &str, id: &str, model: &str, input: i64, output: i64) -> String {
+            format!(
+                concat!(
+                    r#"{{"type":"assistant","timestamp":"{timestamp}","requestId":"req_{id}","#,
+                    r#""message":{{"id":"msg_{id}","model":"{model}","#,
+                    r#""usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#,
+                    "\n"
+                ),
+                timestamp = timestamp,
+                id = id,
+                model = model,
+                input = input,
+                output = output,
+            )
+        }
+
+        /// One Codex rollout with a single response at `timestamp` (UTC).
+        fn codex_rollout(session: &str, timestamp: &str, input: i64, output: i64) -> String {
+            let total = input + output;
+            format!(
+                concat!(
+                    r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"id":"{session}","source":"interactive","model_provider":"openai","cwd":"/repo"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"gpt-5.5"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"output_tokens":{output},"total_tokens":{total}}},"last_token_usage":{{"input_tokens":{input},"output_tokens":{output},"total_tokens":{total}}}}}}}}}"#,
+                    "\n"
+                ),
+                ts = timestamp,
+                session = session,
+                input = input,
+                output = output,
+                total = total,
+            )
+        }
+
+        /// Claude and Codex usage on both sides of the Asia/Seoul midnight at
+        /// 2026-05-01T15:00:00Z, with one copy of each client's usage in two
+        /// sources. Each copy must count once.
+        fn write_fixture(home: &Path) {
+            let projects = client_scan_root(home, ClientId::Claude);
+            let project_a = projects.join("-tmp-stream-a");
+            let project_b = projects.join("-tmp-stream-b");
+            std::fs::create_dir_all(&project_a).unwrap();
+            std::fs::create_dir_all(&project_b).unwrap();
+            std::fs::write(
+                project_a.join("a.jsonl"),
+                [
+                    claude_line(
+                        "2026-05-01T14:59:59.000Z",
+                        "late",
+                        "claude-sonnet-4-5",
+                        100,
+                        10,
+                    ),
+                    claude_line(
+                        "2026-05-01T15:00:00.000Z",
+                        "dup",
+                        "claude-sonnet-4-5",
+                        200,
+                        20,
+                    ),
+                    claude_line(
+                        "2026-05-02T03:00:00.000Z",
+                        "noon",
+                        "claude-opus-4-1",
+                        300,
+                        30,
+                    ),
+                ]
+                .concat(),
+            )
+            .unwrap();
+            std::fs::write(
+                project_b.join("b.jsonl"),
+                [
+                    claude_line(
+                        "2026-05-01T15:00:00.000Z",
+                        "dup",
+                        "claude-sonnet-4-5",
+                        200,
+                        20,
+                    ),
+                    claude_line(
+                        "2026-05-03T01:00:00.000Z",
+                        "next",
+                        "claude-sonnet-4-5",
+                        400,
+                        40,
+                    ),
+                ]
+                .concat(),
+            )
+            .unwrap();
+
+            let sessions = home.join(".codex/sessions");
+            let archived = home.join(".codex/archived_sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::create_dir_all(&archived).unwrap();
+            std::fs::write(
+                sessions.join("late.jsonl"),
+                codex_rollout(
+                    "11111111-1111-7111-8111-111111111111",
+                    "2026-05-01T14:59:59Z",
+                    50,
+                    5,
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                sessions.join("early.jsonl"),
+                codex_rollout(
+                    "22222222-2222-7222-8222-222222222222",
+                    "2026-05-01T15:00:01Z",
+                    60,
+                    6,
+                ),
+            )
+            .unwrap();
+            let shared = codex_rollout(
+                "33333333-3333-7333-8333-333333333333",
+                "2026-05-02T02:00:00Z",
+                70,
+                7,
+            );
+            std::fs::write(sessions.join("shared.jsonl"), &shared).unwrap();
+            std::fs::write(archived.join("shared-archived.jsonl"), &shared).unwrap();
+        }
+
+        fn options(
+            home: &Path,
+            zone: &str,
+            group_by: GroupBy,
+            rollup: WorktreeRollup,
+            range: (Option<&str>, Option<&str>, Option<&str>),
+        ) -> ReportOptions {
+            let (since, until, year) = range;
+            ReportOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                clients: Some(vec!["claude".to_string(), "codex".to_string()]),
+                since: since.map(str::to_string),
+                until: until.map(str::to_string),
+                year: year.map(str::to_string),
+                group_by,
+                worktree_rollup: rollup,
+                scanner_settings: scanner::ScannerSettings {
+                    bucket_timezone: Some(zone.into()),
+                    ..Default::default()
+                },
+            }
+        }
+
+        /// What the report computed before it streamed: the whole parse with
+        /// the recovery overlay applied, then the date filter, the undated
+        /// tally and the aggregation, each over the collected messages.
+        async fn collected_report(options: &ReportOptions) -> ModelReportV2 {
+            let home = options.home_dir.clone().unwrap();
+            let clients = options.clients.clone().unwrap();
+            let pricing = load_pricing_for_local_parse().await;
+            let (messages, claude_desktop_cache) = parse_all_messages_with_coverage(
+                &home,
+                &clients,
+                pricing.as_deref(),
+                options.use_env_roots,
+                &options.scanner_settings,
+                SourceCachePolicy::Persistent,
+                None,
+            );
+            let mut filtered = filter_messages_for_report(messages, options);
+            resolve_codex_parent_session_ids(&mut filtered);
+            let sessions = if matches!(
+                options.group_by,
+                GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+            ) {
+                aggregate_session_metadata(&filtered)
+            } else {
+                Vec::new()
+            };
+            let mut undated_tokens = TokenBreakdown::default();
+            for message in &filtered {
+                if claude_desktop::is_undated_balance(message) {
+                    undated_tokens.add_assign_saturating(&message.tokens);
+                }
+            }
+            let entries = aggregate_model_usage_entries_with_rollup(
+                filtered,
+                &options.group_by,
+                options.worktree_rollup,
+            );
+            let workspaces =
+                workspace_metadata_for_entries(&entries, &mut WorkspaceLabeler::default());
+            let (total_input, total_output, total_cache_read, total_cache_write) =
+                model_report_token_totals(&entries);
+            ModelReportV2 {
+                undated_tokens,
+                claude_desktop_cache,
+                report: crate::ModelReport {
+                    sessions,
+                    workspaces,
+                    total_messages: entries.iter().map(|e| e.message_count).sum(),
+                    total_cost: entries.iter().map(|e| e.cost).sum::<f64>() + 0.0,
+                    entries,
+                    total_input,
+                    total_output,
+                    total_cache_read,
+                    total_cache_write,
+                    processing_time_ms: 0,
+                },
+            }
+        }
+
+        /// Rows in a fixed order. Rows that tie on cost come out in hash-map
+        /// order, which differs between two folds of the same messages.
+        fn canonical_rows(entries: &[ModelUsage]) -> Vec<String> {
+            let mut rows: Vec<String> = entries
+                .iter()
+                .map(|entry| serde_json::to_string(entry).unwrap())
+                .collect();
+            rows.sort();
+            rows
+        }
+
+        fn assert_same_report(streamed: &ModelReportV2, collected: &ModelReportV2, label: &str) {
+            assert_eq!(
+                canonical_rows(&streamed.report.entries),
+                canonical_rows(&collected.report.entries),
+                "{label}"
+            );
+            let totals = |report: &ModelReportV2| {
+                (
+                    report.report.total_input,
+                    report.report.total_output,
+                    report.report.total_cache_read,
+                    report.report.total_cache_write,
+                    report.report.total_messages,
+                    report.report.total_cost.to_bits(),
+                )
+            };
+            assert_eq!(totals(streamed), totals(collected), "{label}");
+            assert_eq!(streamed.undated_tokens, collected.undated_tokens, "{label}");
+            assert_eq!(
+                serde_json::to_value(&streamed.report.sessions).unwrap(),
+                serde_json::to_value(&collected.report.sessions).unwrap(),
+                "{label}"
+            );
+            let canonical_workspaces = |rows: &[crate::WorkspaceMeta]| {
+                let mut rows: Vec<_> = rows
+                    .iter()
+                    .map(|row| serde_json::to_string(row).unwrap())
+                    .collect();
+                rows.sort();
+                rows
+            };
+            assert_eq!(
+                canonical_workspaces(&streamed.report.workspaces),
+                canonical_workspaces(&collected.report.workspaces),
+                "{label}"
+            );
+            assert_eq!(
+                serde_json::to_value(&streamed.claude_desktop_cache).unwrap(),
+                serde_json::to_value(&collected.claude_desktop_cache).unwrap(),
+                "{label}"
+            );
+        }
+
+        const GROUPINGS: [GroupBy; 8] = [
+            GroupBy::Model,
+            GroupBy::ClientModel,
+            GroupBy::ClientProviderModel,
+            GroupBy::WorkspaceModel,
+            GroupBy::Session,
+            GroupBy::ClientSession,
+            GroupBy::ClientWorkspaceSession,
+            GroupBy::MachineModel,
+        ];
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        fn day_totals(report: &ModelReportV2) -> (i64, i64, i32) {
+            (
+                report.report.total_input,
+                report.report.total_output,
+                report.report.total_messages,
+            )
+        }
+
+        #[test]
+        #[serial]
+        fn streamed_model_report_matches_collected_report_for_every_grouping_and_range() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut cache_env = redirect_cache_home(cache_home.path());
+            cache_env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            let mut recovery_env =
+                crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_RECOVERY_DISABLE"]);
+            recovery_env.remove("TOKSCALE_RECOVERY_DISABLE");
+            write_fixture(source_home.path());
+            assert!(!recovery::applicable(&source_home.path().to_string_lossy()));
+            let runtime = runtime();
+
+            let ranges = [
+                (None, None, None),
+                (Some("2026-05-01"), Some("2026-05-01"), None),
+                (Some("2026-05-02"), Some("2026-05-02"), None),
+                (Some("2026-05-02"), None, None),
+                (None, Some("2026-05-01"), None),
+                (Some("2026-05-01"), Some("2026-05-03"), None),
+                (None, None, Some("2026")),
+                (Some("2027-01-01"), Some("2027-01-31"), None),
+            ];
+            for zone in ["Asia/Seoul", "UTC"] {
+                for group_by in GROUPINGS {
+                    // Only `workspace,model` consults the worktree rollup.
+                    let rollups = if group_by == GroupBy::WorkspaceModel {
+                        vec![WorktreeRollup::Separate, WorktreeRollup::MergeIntoRepo]
+                    } else {
+                        vec![WorktreeRollup::Separate]
+                    };
+                    for rollup in rollups {
+                        for range in ranges {
+                            let options =
+                                options(source_home.path(), zone, group_by.clone(), rollup, range);
+                            let streamed = runtime
+                                .block_on(get_model_report_v2(options.clone()))
+                                .unwrap();
+                            let collected = runtime.block_on(collected_report(&options));
+                            let label = format!("{zone} {group_by} {rollup:?} {range:?}");
+                            assert_same_report(&streamed, &collected, &label);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn streamed_model_report_buckets_days_in_the_pinned_zone_and_counts_copies_once() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut cache_env = redirect_cache_home(cache_home.path());
+            cache_env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            write_fixture(source_home.path());
+            let runtime = runtime();
+            let report = |zone: &str, day: &str| {
+                let options = options(
+                    source_home.path(),
+                    zone,
+                    GroupBy::ClientModel,
+                    WorktreeRollup::Separate,
+                    (Some(day), Some(day), None),
+                );
+                runtime.block_on(get_model_report_v2(options)).unwrap()
+            };
+
+            // Seoul: the last second before its midnight stays on 05-01.
+            assert_eq!(
+                day_totals(&report("Asia/Seoul", "2026-05-01")),
+                (150, 15, 2)
+            );
+            // Seoul 05-02 opens at exactly 15:00:00Z. The Claude response copied
+            // into two transcripts and the Codex rollout kept in both
+            // sessions/ and archived_sessions/ count once each.
+            let seoul_second_day = report("Asia/Seoul", "2026-05-02");
+            assert_eq!(day_totals(&seoul_second_day), (630, 63, 4));
+            let codex_row = seoul_second_day
+                .report
+                .entries
+                .iter()
+                .find(|entry| entry.client == "codex")
+                .unwrap();
+            assert_eq!((codex_row.input, codex_row.message_count), (130, 2));
+            // The same instants on the UTC calendar all fall on 05-01.
+            assert_eq!(day_totals(&report("UTC", "2026-05-01")), (410, 41, 4));
+            assert_eq!(day_totals(&report("UTC", "2026-05-02")), (370, 37, 2));
+            assert_eq!(
+                day_totals(&report("Asia/Seoul", "2026-05-03")),
+                (400, 40, 1)
+            );
+
+            let empty = report("Asia/Seoul", "2027-01-01");
+            assert!(empty.report.entries.is_empty());
+            assert_eq!(day_totals(&empty), (0, 0, 0));
+            assert_eq!(empty.report.total_cost.to_bits(), 0.0_f64.to_bits());
+            assert_eq!(empty.undated_tokens, TokenBreakdown::default());
+        }
+
+        #[test]
+        #[serial]
+        fn model_report_with_a_recovery_ledger_still_applies_the_overlay() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut cache_env = redirect_cache_home(cache_home.path());
+            cache_env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            let mut recovery_env =
+                crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_RECOVERY_DISABLE"]);
+            recovery_env.remove("TOKSCALE_RECOVERY_DISABLE");
+            write_fixture(source_home.path());
+            let home = source_home.path().to_string_lossy().into_owned();
+            let write_ledger = |ledger_home: &str| {
+                let ledger = serde_json::json!({
+                    "version": 1,
+                    "home": ledger_home,
+                    "messages": [{
+                        "client": "codex",
+                        "model_id": "gpt-5.5",
+                        "provider_id": "openai",
+                        "session_id": "wiped-session",
+                        "workspace_key": null,
+                        "workspace_label": null,
+                        // 2026-05-02T03:00:00Z, noon in Seoul.
+                        "timestamp": 1_777_690_800_000_i64,
+                        "date": "2026-05-02",
+                        "tokens": {
+                            "input": 150,
+                            "output": 0,
+                            "cache_read": 0,
+                            "cache_write": 0,
+                            "reasoning": 0
+                        },
+                        "cost": 0.0,
+                        "agent": null,
+                        "dedup_key": "wiped-session-row"
+                    }]
+                });
+                let path = recovery::path();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, serde_json::to_string(&ledger).unwrap()).unwrap();
+            };
+            let runtime = runtime();
+            let codex_input = |report: &ModelReportV2| {
+                report
+                    .report
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.client == "codex")
+                    .map(|entry| entry.input)
+                    .sum::<i64>()
+            };
+
+            for (ledger_home, applies) in [(home.as_str(), true), ("/not/this/home", false)] {
+                write_ledger(ledger_home);
+                assert_eq!(recovery::applicable(&home), applies);
+                for group_by in [GroupBy::ClientModel, GroupBy::Model] {
+                    for range in [
+                        (Some("2026-05-02"), Some("2026-05-02"), None),
+                        (None, None, None),
+                    ] {
+                        let options = options(
+                            source_home.path(),
+                            "Asia/Seoul",
+                            group_by.clone(),
+                            WorktreeRollup::Separate,
+                            range,
+                        );
+                        let streamed = runtime
+                            .block_on(get_model_report_v2(options.clone()))
+                            .unwrap();
+                        let collected = runtime.block_on(collected_report(&options));
+                        let label = format!("{ledger_home} {group_by} {range:?}");
+                        assert_same_report(&streamed, &collected, &label);
+                        let native_codex = if range.0.is_some() { 130 } else { 180 };
+                        let recovered = if applies { 150 } else { 0 };
+                        assert_eq!(codex_input(&streamed), native_codex + recovered, "{label}");
+                    }
+                }
+            }
+        }
+
+        fn message(
+            client: &str,
+            model: &str,
+            session: &str,
+            date: &str,
+            input: i64,
+            cost: f64,
+        ) -> UnifiedMessage {
+            let mut message = UnifiedMessage::new(
+                client,
+                model,
+                "anthropic",
+                session,
+                1_777_690_800_000,
+                TokenBreakdown {
+                    input,
+                    output: 1,
+                    ..Default::default()
+                },
+                cost,
+            );
+            message.date = date.into();
+            message
+        }
+
+        #[test]
+        fn model_report_sink_matches_collected_fold_for_undated_and_dated_messages() {
+            let mut undated = message("claude", "claude-opus-4-1", "desktop", "", 1_000, 0.5);
+            undated.timestamp = 0;
+            undated.date = claude_desktop::UNKNOWN_DATE.into();
+            assert!(claude_desktop::is_undated_balance(&undated));
+            // Costs whose f64 sum depends on the order they are added in.
+            let messages = vec![
+                message("claude", "claude-opus-4-1", "s1", "2026-05-01", 10, 0.1),
+                undated,
+                message("claude", "claude-opus-4-1", "s1", "2026-05-02", 20, 0.2),
+                message("codex", "claude-opus-4-1", "s2", "2026-05-02", 30, 0.3),
+                message("claude", "claude-opus-4-1", "s2", "2026-05-02", 40, 1e-17),
+                message("claude", "claude-sonnet-4-5", "s3", "2026-05-03", 50, 3.3),
+                message("claude", "claude-opus-4-1", "s1", "2026-05-03", 60, 0.7),
+            ];
+            let ranges = [
+                (None, None, None),
+                (Some("2026-05-02"), Some("2026-05-02"), None),
+                (Some("2026-05-02"), None, None),
+                (None, Some("2026-05-02"), None),
+                (None, None, Some("2026")),
+                (Some("2027-01-01"), Some("2027-01-01"), None),
+            ];
+            for group_by in GROUPINGS {
+                for (since, until, year) in ranges {
+                    let options = ReportOptions {
+                        since: since.map(str::to_string),
+                        until: until.map(str::to_string),
+                        year: year.map(str::to_string),
+                        group_by: group_by.clone(),
+                        ..Default::default()
+                    };
+                    let mut sink = ModelReportSink::new(&options);
+                    for message in messages.clone() {
+                        sink.accept(message);
+                    }
+                    let (entries, undated_tokens) = sink.finish();
+
+                    let filtered = filter_messages_for_report(messages.clone(), &options);
+                    let mut expected_undated = TokenBreakdown::default();
+                    for message in &filtered {
+                        if claude_desktop::is_undated_balance(message) {
+                            expected_undated.add_assign_saturating(&message.tokens);
+                        }
+                    }
+                    let expected = aggregate_model_usage_entries_with_rollup(
+                        filtered,
+                        &group_by,
+                        WorktreeRollup::Separate,
+                    );
+                    let label = format!("{group_by} {since:?} {until:?} {year:?}");
+                    assert_eq!(
+                        canonical_rows(&entries),
+                        canonical_rows(&expected),
+                        "{label}"
+                    );
+                    assert_eq!(undated_tokens, expected_undated, "{label}");
+                    let dated = since.is_some() || until.is_some() || year.is_some();
+                    assert_eq!(
+                        undated_tokens.input,
+                        if dated { 0 } else { 1_000 },
+                        "{label}"
+                    );
+                }
             }
         }
     }

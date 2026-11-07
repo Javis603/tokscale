@@ -74,7 +74,7 @@ impl Counted {
             }
             if let Some(key) = &message.dedup_key {
                 dedup_keys
-                    .entry(message.client.clone())
+                    .entry(message.client.to_string())
                     .or_default()
                     .push(key.clone());
             }
