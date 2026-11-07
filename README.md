@@ -761,7 +761,7 @@ tokscale antigravity purge-cache
 
 **How it works**: `tokscale antigravity sync` discovers local Antigravity session candidates, fetches confirmed usage data from the local language server RPC, and stores normalized JSONL artifacts for tokscale-core to parse later. Run sync before reports if you want the freshest Antigravity data.
 
-A server-confirmed missing trajectory is skipped without discarding its cached usage. Other RPC or connection failures still report an incomplete sync, even when some sessions update successfully.
+A server-confirmed missing trajectory is skipped without discarding its cached usage. Other metadata-fetch or session-listing failures still report an incomplete sync; optional trajectory timestamp enrichment remains best-effort.
 
 ### Trae Commands
 
