@@ -1,7 +1,7 @@
 //! Shared parsers for Tencent CodeBuddy / WorkBuddy session formats.
 
 use super::utils::for_each_json_line;
-use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
+use super::{normalize_workspace_key, workspace_label_from_key, PerformanceTiming, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use chrono::TimeZone;
 use serde::Deserialize;
@@ -25,8 +25,8 @@ const DEFAULT_PROVIDER: &str = "tencent";
 /// `duration_ms`.
 ///
 /// Version 3 spreads the wall-clock duration recorded by each `turn-metrics`
-/// line over the usage rows of that turn, so JSONL transcripts report
-/// throughput as well.
+/// line over the usage rows of that turn as independent performance timing,
+/// so JSONL transcripts report throughput without extending activity spans.
 ///
 /// Logs are append-only, so cached rows from an older version have to be
 /// re-parsed to gain either field.
@@ -337,19 +337,17 @@ pub(crate) fn parse_jsonl_file(
 }
 
 /// Spread a turn's measured wall-clock duration over the usage rows that turn
-/// produced, in proportion to their output tokens.
+/// produced, in proportion to their completion and reasoning tokens.
 ///
 /// CodeBuddy writes one `turn-metrics` line per finished user turn, carrying the
 /// wall-clock length of that turn and no token counts; the tokens live on the
-/// per-step rows. Splitting the duration by output keeps the ratio a consumer
-/// computes (`sum(output) / sum(duration)`) equal to the turn's real rate instead
-/// of attributing the whole turn to a single step.
+/// per-step rows. Splitting by generated tokens keeps reasoning-only rows in
+/// the measured sample and the aggregate rate equal to the turn's real rate
+/// instead of attributing the whole turn to a single step.
 ///
-/// The message timestamps are deliberately left alone. `SessionSpan` projects a
-/// message as `[timestamp, timestamp + duration_ms]`, and moving the stamp to the
-/// turn's start (the dsh approach in junhoyeo/tokscale#1427, where an exact
-/// per-request anchor exists) would drag every step of the turn backwards by up
-/// to the whole turn and move the day buckets it lands in.
+/// Turn metrics do not provide a per-step start anchor. Keep both usage
+/// timestamps and activity spans unchanged: the apportioned duration belongs
+/// only to performance timing, not to an interval after each usage timestamp.
 fn spread_turn_duration(
     messages: &mut [UnifiedMessage],
     turn_indices: &[usize],
@@ -358,35 +356,51 @@ fn spread_turn_duration(
     let Some(duration_ms) = duration_ms.filter(|duration| *duration > 0) else {
         return;
     };
-    // Sum and divide in i128: `duration_ms * output` can exceed i64 for a
+    // Sum and divide in i128: `duration_ms * generated` can exceed i64 for a
     // malformed transcript, and a panic here would take the whole scan down.
-    let total_output: i128 = turn_indices
+    let generated_tokens = |message: &UnifiedMessage| {
+        message.tokens.output.max(0) as i128 + message.tokens.reasoning.max(0) as i128
+    };
+    let total_generated: i128 = turn_indices
         .iter()
-        .map(|index| messages[*index].tokens.output.max(0) as i128)
+        .map(|index| generated_tokens(&messages[*index]))
         .sum();
-    if total_output <= 0 {
+    if total_generated <= 0 {
         return;
     }
-    // The integer remainder goes to the last row that actually produced output,
-    // so a trailing zero-output row cannot collect time it did not spend.
+    // The integer remainder goes to the last row that generated tokens, so a
+    // trailing input-only row cannot collect time it did not spend.
     let Some(last_positive) = turn_indices
         .iter()
-        .rposition(|index| messages[*index].tokens.output > 0)
+        .rposition(|index| generated_tokens(&messages[*index]) > 0)
     else {
         return;
     };
 
+    // Reserve one millisecond per generated row when the measured duration
+    // permits it. Otherwise a small reasoning row can round to zero and vanish
+    // from the matched performance counters even in a seconds-long turn.
+    let generated_rows = turn_indices
+        .iter()
+        .filter(|index| generated_tokens(&messages[**index]) > 0)
+        .count() as i64;
+    let minimum_ms = i64::from(duration_ms >= generated_rows);
+    let weighted_duration = duration_ms - minimum_ms * generated_rows;
     let mut assigned = 0i64;
     for (position, index) in turn_indices.iter().enumerate() {
         let message = &mut messages[*index];
+        let generated = generated_tokens(message);
+        if generated == 0 {
+            continue;
+        }
         let share = if position == last_positive {
             duration_ms - assigned
         } else {
-            (duration_ms as i128 * message.tokens.output.max(0) as i128 / total_output) as i64
+            minimum_ms + (weighted_duration as i128 * generated / total_generated) as i64
         };
         assigned += share;
         if share > 0 {
-            message.duration_ms = Some(share);
+            message.performance_timing = Some(PerformanceTiming::Duration(share));
         }
     }
 }
@@ -441,7 +455,9 @@ pub(crate) fn parse_extension_log_file(
         // malformed or empty usage. Leaving the anchor in place would hand the
         // next settlement of the same agent a stale clock and bill the whole
         // gap between two executions as one generation.
-        let prepared = prepared_by_agent.remove(&agent_id);
+        let prepared_at = prepared_by_agent
+            .get_mut(&agent_id)
+            .and_then(|prepared| prepared.prepared_at_ms.take());
         let Some(usage_json) = line.split("Agent execution successful with usage:").nth(1) else {
             return;
         };
@@ -464,22 +480,18 @@ pub(crate) fn parse_extension_log_file(
         // whole lifetime of the file.
         let parsed_settled_at = parse_log_timestamp_ms(line);
         let settled_at = parsed_settled_at.unwrap_or(fallback_timestamp);
-        let model_id = prepared
-            .as_ref()
+        let model_id = prepared_by_agent
+            .get(&agent_id)
             .map(|prepared| prepared.model_id.clone())
             .unwrap_or_else(|| default_model.to_string());
-        // Date the message at the anchor, not at the settlement. `SessionSpan`
-        // projects a message as `[timestamp, timestamp + duration_ms]`, so
-        // stamping the settlement would push the interval forward by one
-        // generation and move the day buckets it lands in.
-        let (timestamp, duration_ms) = match (
-            prepared.and_then(|prepared| prepared.prepared_at_ms),
-            parsed_settled_at,
-        ) {
+        // Keep the released accounting timestamp at settlement. Performance
+        // timing is independent of the activity span, which must not extend
+        // past settlement or move usage into the preparation day's archive.
+        let performance_timing = match (prepared_at, parsed_settled_at) {
             (Some(prepared_at), Some(settled_at)) if settled_at > prepared_at => {
-                (prepared_at, Some(settled_at - prepared_at))
+                Some(PerformanceTiming::Duration(settled_at - prepared_at))
             }
-            _ => (settled_at, None),
+            _ => None,
         };
         let provider_id = provider_identity::inferred_provider_from_model(&model_id)
             .unwrap_or(DEFAULT_PROVIDER)
@@ -489,11 +501,11 @@ pub(crate) fn parse_extension_log_file(
             model_id,
             provider_id,
             agent_id.clone(),
-            timestamp,
+            settled_at,
             tokens,
             0.0,
         );
-        message.duration_ms = duration_ms;
+        message.performance_timing = performance_timing;
         // Key on the SECOND, not the millisecond. The same [AgentReporter] line
         // is written to multiple sinks (the extension's own log AND the host's
         // output-channel log), each prefixed by its own logger a few ms apart, so
@@ -821,20 +833,19 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
-        assert_eq!(message.duration_ms, Some(1_100));
-        // The message is dated at the anchor and the span closes on the
-        // settlement, so the projected interval still ends where the log
-        // reports the execution finishing.
-        let prepared_at = parse_log_timestamp_ms(
-            "[2026/7/1 16:56:01.100] [info] [CraftInvokableAgent] [agent-1] Model prepared: Kimi-K2.7-Code (kimi-k2.7)",
-        )
-        .unwrap();
+        assert_eq!(message.performance_duration_ms(), Some(1_100));
+        assert_eq!(message.duration_ms, None);
         let settled_at = parse_log_timestamp_ms(
             "[2026/7/1 16:56:02.200] [info] [AgentReporter] [agent-1] Agent execution successful with usage: {}",
         )
         .unwrap();
-        assert_eq!(message.timestamp, prepared_at);
-        assert_eq!(message.timestamp + message.duration_ms.unwrap(), settled_at);
+        assert_eq!(message.timestamp, settled_at);
+        let span = crate::sessionize::SessionSpan::from_message(
+            message,
+            &mut crate::sessionize::SpanInterner::default(),
+        );
+        assert_eq!(span.start_ts, settled_at);
+        assert_eq!(span.end_ts, settled_at);
     }
 
     #[test]
@@ -868,10 +879,34 @@ mod tests {
         let messages = parse_extension_log_file("codebuddy", "codebuddy", &path);
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].duration_ms, Some(1_100));
+        assert_eq!(messages[0].model_id, "glm-5.2");
+        assert_eq!(messages[1].model_id, "glm-5.2");
+        assert_eq!(messages[0].performance_duration_ms(), Some(1_100));
         // Without a fresh `Model prepared:` line the second settlement stays
         // untimed instead of billing the minute between the two executions.
-        assert_eq!(messages[1].duration_ms, None);
+        assert_eq!(messages[1].performance_duration_ms(), None);
+    }
+
+    #[test]
+    fn parse_extension_log_file_preserves_settlement_day_across_midnight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.log");
+        std::fs::write(
+            &path,
+            r#"[2026/7/1 23:59:59.100] [info] [CraftInvokableAgent] [agent-1] Model prepared: GLM-5.2 (glm-5.2)
+[2026/7/2 00:00:00.200] [info] [AgentReporter] [agent-1] Agent execution successful with usage: {"inputTokens":10,"outputTokens":2,"totalTokens":12}"#,
+        )
+        .unwrap();
+
+        let settled_at = parse_log_timestamp_ms("[2026/7/2 00:00:00.200]").unwrap();
+        for client in ["codebuddy", "workbuddy"] {
+            let messages = parse_extension_log_file(client, client, &path);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].timestamp, settled_at);
+            assert_eq!(messages[0].date, "2026-07-02");
+            assert_eq!(messages[0].tokens.total(), 12);
+            assert_eq!(messages[0].performance_duration_ms(), Some(1_100));
+        }
     }
 
     #[test]
@@ -893,6 +928,86 @@ mod tests {
         // time and bill the minute between the two lines as one generation.
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].duration_ms, None);
+        assert_eq!(messages[0].performance_duration_ms(), None);
+        assert_eq!(messages[0].model_id, "glm-5.2");
+    }
+
+    #[test]
+    fn parse_jsonl_turn_timing_includes_reasoning_without_timing_other_turns() {
+        for (reasoning, output, duration) in
+            [(100, 300, 4_000), (1, 10_000, 1_000), (100, 0, 4_000)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reasoning.jsonl");
+            let lines = [
+                serde_json::json!({"id":"u1","timestamp":1780000000000_i64,"type":"message","role":"user","sessionId":"s1"}),
+                serde_json::json!({"id":"r1","timestamp":1780000001000_i64,"type":"function_call","sessionId":"s1","providerData":{"model":"glm-5.2","usage":{"prompt_tokens":10,"completion_tokens":0,"completion_thinking_tokens":reasoning}}}),
+                serde_json::json!({"id":"o1","timestamp":1780000002000_i64,"type":"function_call","sessionId":"s1","providerData":{"model":"glm-5.2","usage":{"prompt_tokens":10,"completion_tokens":output}}}),
+                serde_json::json!({"id":"t1","timestamp":1780000003000_i64,"type":"turn-metrics","sessionId":"s1","durationMs":duration}),
+                serde_json::json!({"id":"u2","timestamp":1780000010000_i64,"type":"message","role":"user","sessionId":"s1"}),
+                serde_json::json!({"id":"r2","timestamp":1780000011000_i64,"type":"function_call","sessionId":"s1","providerData":{"model":"glm-5.2","usage":{"prompt_tokens":10,"completion_tokens":5,"completion_thinking_tokens":50}}}),
+            ];
+            std::fs::write(
+                &path,
+                lines
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+
+            for client in ["codebuddy", "workbuddy"] {
+                let messages = parse_jsonl_file(client, client, &path);
+                assert_eq!(messages.len(), 3);
+                let mut performance = crate::ModelPerformance::default();
+                for message in &messages {
+                    performance
+                        .record_token_breakdown(&message.tokens, message.performance_duration_ms());
+                    assert_eq!(message.duration_ms, None);
+                }
+                assert_eq!(performance.total_duration_ms, duration);
+                assert_eq!(performance.timed_reasoning_tokens, reasoning);
+                assert_eq!(performance.timed_output_tokens, output);
+                assert!(messages[0]
+                    .performance_duration_ms()
+                    .is_some_and(|ms| ms > 0));
+                assert_eq!(messages[2].performance_duration_ms(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_jsonl_turn_timing_does_not_extend_activity_across_midnight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midnight.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"id":"user-1","timestamp":1782950395000,"type":"message","role":"user","sessionId":"s1"}
+{"id":"call-1","timestamp":1782950399000,"type":"function_call","sessionId":"s1","providerData":{"model":"glm-5.2","messageId":"m-1","usage":{"prompt_tokens":10,"completion_tokens":2}}}
+{"id":"turn-1","timestamp":1782950399100,"type":"turn-metrics","sessionId":"s1","durationMs":4000}"#,
+        )
+        .unwrap();
+
+        for client in ["codebuddy", "workbuddy"] {
+            let messages = parse_jsonl_file(client, client, &path);
+            assert_eq!(messages.len(), 1);
+            let message = &messages[0];
+            let span = crate::sessionize::SessionSpan::from_message(
+                message,
+                &mut crate::sessionize::SpanInterner::default(),
+            );
+            let midnight = chrono::DateTime::parse_from_rfc3339("2026-07-02T00:00:00Z")
+                .unwrap()
+                .timestamp_millis();
+            assert_eq!(span.start_ts, midnight - 1_000);
+            assert_eq!(span.end_ts, span.start_ts);
+            assert_eq!(message.duration_ms, None);
+            assert_eq!(message.performance_duration_ms(), Some(4_000));
+            assert_eq!(message.tokens.input, 10);
+            assert_eq!(message.tokens.output, 2);
+            assert_eq!(message.model_id, "glm-5.2");
+        }
     }
 
     #[test]
@@ -913,10 +1028,10 @@ mod tests {
         assert_eq!(messages.len(), 2);
         // The turn's 4 s is split 1:3 by output tokens, and the ratio a consumer
         // computes from these rows is the turn's own rate.
-        assert_eq!(messages[0].duration_ms, Some(1_000));
-        assert_eq!(messages[1].duration_ms, Some(3_000));
-        // Timestamps stay where the steps were written; only the duration is
-        // attributed, so day buckets do not move.
+        assert_eq!(messages[0].performance_duration_ms(), Some(1_000));
+        assert_eq!(messages[1].performance_duration_ms(), Some(3_000));
+        assert!(messages.iter().all(|message| message.duration_ms.is_none()));
+        // Usage timestamps and day buckets stay unchanged.
         assert_eq!(messages[0].timestamp, 1_780_000_001_000);
         assert_eq!(messages[1].timestamp, 1_780_000_002_000);
     }
@@ -939,8 +1054,8 @@ mod tests {
         let messages = parse_jsonl_file("codebuddy", "codebuddy", &path);
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].duration_ms, Some(1_000));
-        assert_eq!(messages[1].duration_ms, Some(3_000));
+        assert_eq!(messages[0].performance_duration_ms(), Some(1_000));
+        assert_eq!(messages[1].performance_duration_ms(), Some(3_000));
     }
 
     #[test]
@@ -959,6 +1074,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].duration_ms, None);
+        assert_eq!(messages[0].performance_duration_ms(), None);
     }
 
     #[test]
@@ -978,12 +1094,13 @@ mod tests {
         let messages = parse_jsonl_file("codebuddy", "codebuddy", &path);
 
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].duration_ms, Some(500));
+        assert_eq!(messages[0].performance_duration_ms(), Some(500));
         // The 1000 ms cannot divide evenly across two rows, so the remainder
         // lands on the last row that produced output rather than on the
         // trailing row that generated nothing.
-        assert_eq!(messages[1].duration_ms, Some(500));
+        assert_eq!(messages[1].performance_duration_ms(), Some(500));
         assert_eq!(messages[2].duration_ms, None);
+        assert_eq!(messages[2].performance_duration_ms(), None);
     }
 
     #[test]
