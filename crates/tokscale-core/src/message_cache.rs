@@ -1330,7 +1330,7 @@ struct LegacyCodexStateV19 {
     turn_id_announced_by_task_started: bool,
     usage_event_ordinal: u64,
     turn_coverage: crate::sessions::codex::CodexTurnCoverage,
-    pending_usage_record: Option<crate::sessions::codex::CodexPendingUsageRecord>,
+    pending_usage_record: Option<crate::sessions::codex::LegacyCodexPendingUsageRecordV19>,
     settled_usage_records: std::collections::VecDeque<crate::sessions::codex::CodexTotals>,
 }
 
@@ -1368,7 +1368,7 @@ impl From<LegacyCodexStateV19> for CodexParseState {
             turn_id_announced_by_task_started: state.turn_id_announced_by_task_started,
             usage_event_ordinal: state.usage_event_ordinal,
             turn_coverage: state.turn_coverage,
-            pending_usage_record: state.pending_usage_record,
+            pending_usage_record: state.pending_usage_record.map(Into::into),
             settled_usage_records: state.settled_usage_records,
             has_entered_review_mode: false,
             has_own_turn_context: true,
@@ -1431,7 +1431,7 @@ impl From<CodexParseState> for LegacyCodexStateV19 {
             turn_id_announced_by_task_started: state.turn_id_announced_by_task_started,
             usage_event_ordinal: state.usage_event_ordinal,
             turn_coverage: state.turn_coverage,
-            pending_usage_record: state.pending_usage_record,
+            pending_usage_record: state.pending_usage_record.map(Into::into),
             settled_usage_records: state.settled_usage_records,
         }
     }
@@ -2002,7 +2002,9 @@ fn parser_version(client: ClientId) -> u32 {
         // contribute generation performance; request timing tracks content evidence
         // independently of missing/invalid timestamps.
         // v22->v23: world_state model attribution reparses shipped v22 rollouts.
-        ClientId::Codex => 23,
+        // v23->v24: freeze each usage record's request timing before later
+        // responses and tool waits can alter its pending settlement.
+        ClientId::Codex => 24,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -5223,6 +5225,17 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("turn_coverage");
+        // Parser 19 had no per-request timing evidence to resume. Its
+        // accounting state must match, while fresh timing may close at the
+        // usage record rather than at the later token_count.
+        fresh_state
+            .as_object_mut()
+            .unwrap()
+            .remove("request_timing");
+        resumed_state
+            .as_object_mut()
+            .unwrap()
+            .remove("request_timing");
         assert_eq!(fresh_state, resumed_state);
     }
 
@@ -5462,7 +5475,7 @@ mod tests {
     #[test]
     fn historical_codex_cache_is_stale_before_decoding_old_state() {
         let identity = CacheIdentity::for_client(ClientId::Codex);
-        assert_eq!(identity.parser_version, 23);
+        assert_eq!(identity.parser_version, 24);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("old.bin");
         for bytes in [
@@ -6434,7 +6447,7 @@ mod tests {
         // v21->v22 excludes explicit empty completions from performance.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 23);
+        assert_eq!(parser_version(ClientId::Codex), 24);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -7610,7 +7623,7 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         let cached = warm.get(identity, &source).unwrap();
-        assert_eq!(cached.parser_version, 23);
+        assert_eq!(cached.parser_version, 24);
         assert_eq!(cached.messages, parsed);
     }
 
@@ -7719,7 +7732,7 @@ mod tests {
         let fresh_entry = fresh_cache
             .get(identity, &source)
             .expect("the production scan must persist a v22 replacement");
-        assert_eq!(fresh_entry.parser_version, 23);
+        assert_eq!(fresh_entry.parser_version, 24);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
             "the v19 replacement must carry valid incremental metadata"
@@ -7839,7 +7852,7 @@ mod tests {
         let fresh_entry = fresh_cache
             .get(identity, &source)
             .expect("the production scan must persist a v22 replacement");
-        assert_eq!(fresh_entry.parser_version, 23);
+        assert_eq!(fresh_entry.parser_version, 24);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
             "the v19 replacement must carry valid incremental metadata"
@@ -7931,7 +7944,7 @@ mod tests {
             assert_eq!(missing_usage_warnings(), 0);
         }
         let entry = SourceMessageCache::load().get(identity, &source).unwrap();
-        assert_eq!(entry.parser_version, 23);
+        assert_eq!(entry.parser_version, 24);
         let state = &entry.codex_incremental.as_ref().unwrap().state;
         assert!(state.has_entered_review_mode);
         assert!(!state.has_own_turn_context);
