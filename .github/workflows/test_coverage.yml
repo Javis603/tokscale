@@ -269,6 +269,7 @@ jobs:
           path: .github/badges/coverage.svg
 
       - name: Commit coverage badge
+        if: github.repository == 'junhoyeo/tokscale'
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
