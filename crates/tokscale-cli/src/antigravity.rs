@@ -3164,6 +3164,18 @@ impl std::fmt::Display for SessionNotFoundError {
 
 impl std::error::Error for SessionNotFoundError {}
 
+fn is_missing_trajectory_message(message: &str) -> bool {
+    let message = message.strip_prefix("not_found: ").unwrap_or(message);
+    if message == "trajectory not found" {
+        return true;
+    }
+    // The language server can append an opaque diagnostic ID to the same miss.
+    message
+        .strip_prefix("trajectory not found (error ID: ")
+        .and_then(|suffix| suffix.strip_suffix(')'))
+        .is_some_and(|id| !id.trim().is_empty())
+}
+
 fn rpc_status_error(method: &str, status: u16, body: &str, https: bool) -> anyhow::Error {
     let message = format!(
         "Antigravity {}RPC {method} failed with status {status}: {body}",
@@ -3172,10 +3184,10 @@ fn rpc_status_error(method: &str, status: u16, body: &str, https: bool) -> anyho
     if method == "GetCascadeTrajectoryGeneratorMetadata" && status == 404 {
         if let Ok(response) = serde_json::from_str::<Value>(body) {
             if response.get("code").and_then(Value::as_str) == Some("not_found")
-                && matches!(
-                    response.get("message").and_then(Value::as_str),
-                    Some("trajectory not found" | "not_found: trajectory not found")
-                )
+                && response
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_missing_trajectory_message)
             {
                 return SessionNotFoundError(message).into();
             }
@@ -4948,7 +4960,18 @@ mod tests {
     #[test]
     #[serial]
     fn deleted_sessions_keep_cached_usage_without_failing_sync_or_blocking_live_sessions() {
-        for deleted_still_listed in [false, true] {
+        for (deleted_still_listed, missing_message) in [
+            (false, "not_found: trajectory not found"),
+            (true, "not_found: trajectory not found"),
+            (
+                false,
+                "not_found: trajectory not found (error ID: 0123456789abcdef0123456789abcdef)",
+            ),
+            (
+                true,
+                "not_found: trajectory not found (error ID: 0123456789abcdef0123456789abcdef)",
+            ),
+        ] {
             let temp_dir = tempfile::tempdir().unwrap();
             let _env = TestEnvGuard::redirect_to(temp_dir.path());
             let mut manifest = sample_manifest();
@@ -4988,16 +5011,16 @@ mod tests {
                 }
             }
             let summaries = serde_json::json!({ "cascadeTrajectories": summaries }).to_string();
+            let missing_response = serde_json::json!({
+                "code": "not_found", "message": missing_message
+            })
+            .to_string();
             let (port, seen) = serve_rpc_requests(move |method, body| match method {
                 "GetAllCascadeTrajectories" => Some((200, summaries.clone())),
                 "GetCascadeTrajectoryGeneratorMetadata" if body["cascadeId"] == "active" => {
                     Some((200, timestamped_test_metadata(22, 8)))
                 }
-                "GetCascadeTrajectoryGeneratorMetadata" => Some((
-                    404,
-                    r#"{ "code": "not_found", "message": "not_found: trajectory not found" }"#
-                        .to_string(),
-                )),
+                "GetCascadeTrajectoryGeneratorMetadata" => Some((404, missing_response.clone())),
                 _ => None,
             });
             let connection = enrichment_test_connection(port);
@@ -5045,6 +5068,8 @@ mod tests {
             for body in [
                 r#"{"code":"not_found","message":"trajectory not found"}"#,
                 r#"{ "message": "not_found: trajectory not found", "code": "not_found" }"#,
+                r#"{"code":"not_found","message":"trajectory not found (error ID: 0123456789abcdef0123456789abcdef)"}"#,
+                r#"{"code":"not_found","message":"not_found: trajectory not found (error ID: 0123456789abcdef0123456789abcdef)"}"#,
             ] {
                 let err =
                     rpc_status_error("GetCascadeTrajectoryGeneratorMetadata", 404, body, https)
@@ -5068,6 +5093,8 @@ mod tests {
                 "<html>Not Found</html>",
                 "trajectory not found",
                 r#"{"code":"not_found","message":"RPC route not found"}"#,
+                r#"{"code":"not_found","message":"RPC route not found (error ID: 0123456789abcdef0123456789abcdef)"}"#,
+                r#"{"code":"not_found","message":"trajectory not found (error ID: )"}"#,
                 r#"{"code":"internal","message":"trajectory not found"}"#,
                 r#"{"code":"not_found","message":null}"#,
             ] {
