@@ -494,6 +494,8 @@ tokscale models --week --client claude --json
 tokscale monthly --month --benchmark
 ```
 
+The Token Monitor fork accepts `--bucket-timezone <IANA>` on JSON model reports and `graph`. It selects both the report's day buckets and its relative date filters without changing `scanner.bucketTimezone` or the submission calendar. The override is rejected for submission, configuration and interactive commands.
+
 > **Note**: Date filters use your local timezone. Both `--since` and `--until` are inclusive.
 > **v2.2.0 note**: Session active-time daily buckets also use your local timezone, so users outside UTC may see active-time dates align with local token/cost report days instead of UTC day boundaries.
 
