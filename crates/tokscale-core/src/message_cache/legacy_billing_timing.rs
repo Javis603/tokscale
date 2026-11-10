@@ -57,6 +57,7 @@ impl From<TimingMessage> for UnifiedMessage {
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
+            hermes_last_active_ms: None,
         }
     }
 }
@@ -149,6 +150,7 @@ impl From<BillingMessage> for UnifiedMessage {
             pricing_model_id: message.pricing_model_id.map(Into::into),
             estimate_status: message.estimate_status,
             copilot_context: None,
+            hermes_last_active_ms: None,
         }
     }
 }

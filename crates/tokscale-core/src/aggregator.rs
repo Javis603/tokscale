@@ -994,6 +994,7 @@ mod tests {
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
         }
     }
@@ -1669,6 +1670,7 @@ mod tests {
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             duration_ms: None,
             performance_timing: None,

@@ -2122,7 +2122,8 @@ fn parser_version(client: ClientId) -> u32 {
         // change shape; cached aggregates from before the split must miss.
         // v3->v4: parser-owned key markers distinguish logged evidence from a
         // residual start-day share and from user-controlled date-like suffixes.
-        ClientId::Hermes => 4,
+        // v4->v5: native parent links and message activity, independent of usage dates.
+        ClientId::Hermes => 5,
         // v1->v2: Unsloth Studio now reads the responding model and provider
         // route from scalar responseDetails fields. Reparse cached rows so
         // local usage stays authoritatively free, metered providers receive
@@ -2553,6 +2554,7 @@ impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
             session_title: message.session_title.map(crate::sessions::SharedStr::from),
             parent_session_id: None,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
@@ -2646,6 +2648,7 @@ impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
             session_title: message.session_title.map(crate::sessions::SharedStr::from),
             parent_session_id: None,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
@@ -2737,6 +2740,7 @@ impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
             session_title: message.session_title.map(crate::sessions::SharedStr::from),
             parent_session_id: None,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
@@ -2903,6 +2907,7 @@ impl From<LegacyUnifiedMessageV10> for UnifiedMessage {
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
             pricing_model_id: None,
@@ -7046,21 +7051,21 @@ mod tests {
 
     #[test]
     fn test_hermes_parser_version_invalidates_ambiguous_day_keys() {
-        assert_eq!(parser_version(ClientId::Hermes), 4);
+        assert_eq!(parser_version(ClientId::Hermes), 5);
     }
 
     #[test]
     #[serial_test::serial]
-    fn hermes_v3_shard_misses_and_is_rebuilt_under_v4_identity() {
+    fn hermes_v4_shard_misses_under_v5_identity() {
         let cache_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(cache_home.path());
         let source = write_temp_file(b"unchanged Hermes source");
         let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
         let current_identity = CacheIdentity::for_client(ClientId::Hermes);
-        assert_eq!(current_identity.parser_version, 4);
+        assert_eq!(current_identity.parser_version, 5);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
-            parser_version: 3,
+            parser_version: 4,
         };
         let stale_message = UnifiedMessage::new(
             "hermes",
@@ -7074,10 +7079,9 @@ mod tests {
             },
             0.99,
         );
-        // Fabricate the shard exactly as a v3-era writer left it: a v3
-        // envelope holding v3 entries. Routing a stale-identity entry through
-        // the current save pipeline would instead write a current envelope
-        // with a mismatched entry, which shard validation rejects as corrupt.
+        // Write a current generic envelope carrying the stale parser-v4
+        // identity. The parser-version guard must reject it before decoding
+        // the payload; this does not model the legacy envelope's byte layout.
         let stale_entry = CachedSourceEntry::new(
             stale_identity,
             source.path(),
@@ -7103,7 +7107,7 @@ mod tests {
         let mut current_cache = SourceMessageCache::load();
         assert!(
             current_cache.get(current_identity, source.path()).is_none(),
-            "an unchanged v3 Hermes shard must miss under the v4 identity"
+            "an unchanged v4 Hermes shard must miss under the v5 identity"
         );
 
         let mut rebuilt = UnifiedMessage::new(
@@ -7132,7 +7136,7 @@ mod tests {
 
         let warm = SourceMessageCache::load();
         let entry = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(entry.parser_version, 4);
+        assert_eq!(entry.parser_version, 5);
         assert_eq!(entry.messages, vec![rebuilt]);
     }
 

@@ -205,6 +205,10 @@ pub struct UnifiedMessage {
     /// cache envelope so adding this does not change other clients' wire layout.
     #[serde(skip)]
     pub copilot_context: Option<copilot::CopilotContextProvenance>,
+    /// Latest native Hermes message time, independent of accounting timestamps.
+    /// Hermes SQLite is parsed directly; other clients keep their cache layout.
+    #[serde(skip)]
+    pub hermes_last_active_ms: Option<i64>,
     /// Machine whose session file this message was read from: the
     /// `scanner.machineLabels` label of the folder holding the file, else
     /// `scanner.localMachineLabel` when set. `None` is the default local
@@ -502,6 +506,7 @@ impl UnifiedMessage {
             is_turn_start: false,
             model_attribution_conflicted: false,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             billing_identity: BillingIdentity::Unknown,
             pricing_model_id: None,
