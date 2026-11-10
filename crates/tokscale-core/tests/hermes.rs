@@ -1,10 +1,12 @@
 use rusqlite::{params, Connection};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tempfile::TempDir;
 use tokscale_core::bucket_tz::BucketTimezone;
+use tokscale_core::pricing::{litellm::ModelPricing, PricingService};
 use tokscale_core::sessions::hermes::{
-    message_is_day_split, parse_hermes_sqlite, parse_hermes_sqlite_in,
+    message_is_day_split, message_logged_day, parse_hermes_sqlite, parse_hermes_sqlite_in,
 };
+use tokscale_core::sessions::UnifiedMessage;
 
 #[test]
 fn test_parse_hermes_sqlite_returns_empty_for_missing_database() {
@@ -1492,8 +1494,8 @@ fn insert_usage_row_with_route(
 }
 
 /// A session that started two days ago and was used again yesterday reports one
-/// message per active day, with each logged bucket kept on the day that
-/// produced it — the database totals stay authoritative.
+/// message per logged call, each on the day that produced it, with the call's
+/// exact buckets — the database totals stay authoritative.
 #[test]
 fn test_parse_hermes_sqlite_splits_cross_day_session_by_logged_calls() {
     let dir = TempDir::new().unwrap();
@@ -1520,22 +1522,23 @@ fn test_parse_hermes_sqlite_splits_cross_day_session_by_logged_calls() {
     );
 
     let mut messages = parse_hermes_sqlite(&db_path);
-    assert_eq!(messages.len(), 2, "one message per active day");
+    assert_eq!(messages.len(), 3, "one message per logged call");
     assert!(messages
         .iter()
         .all(|m| m.billing_identity.id() == Some("zai")));
     messages.sort_by_key(|m| m.timestamp);
 
-    // Each bucket stays on the day whose calls reported it. A shared overall
+    // Each bucket stays with the call that reported it. A shared overall
     // weight would incorrectly move fresh-input and cache-read tokens between
-    // these differently shaped days.
-    let (a, b) = (&messages[0], &messages[1]);
-    assert_eq!(a.tokens.input, 400);
-    assert_eq!(a.tokens.output, 200);
-    assert_eq!(a.tokens.cache_read, 1600);
-    assert_eq!(b.tokens.input, 1000);
-    assert_eq!(b.tokens.output, 300);
-    assert_eq!(b.tokens.cache_read, 2000);
+    // these differently shaped calls and days.
+    let calls: Vec<_> = messages
+        .iter()
+        .map(|m| (m.tokens.input, m.tokens.output, m.tokens.cache_read))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(200, 100, 800), (200, 100, 800), (1000, 300, 2000)]
+    );
     // Exact split: the parts sum back to the authoritative row.
     assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 1400);
     assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 500);
@@ -1543,17 +1546,23 @@ fn test_parse_hermes_sqlite_splits_cross_day_session_by_logged_calls() {
         messages.iter().map(|m| m.tokens.cache_read).sum::<i64>(),
         3600
     );
-    assert!((a.cost - 0.4).abs() < 1e-9 && (b.cost - 0.6).abs() < 1e-9);
+    let costs: Vec<f64> = messages.iter().map(|m| m.cost).collect();
+    assert!(costs
+        .iter()
+        .zip([0.2, 0.2, 0.6])
+        .all(|(cost, expected)| (cost - expected).abs() < 1e-9));
 
-    // Each message lands on the day its logged calls fall in, and the day is
-    // part of the dedup key so no day is dropped by the caller's dedup pass.
-    for msg in &messages {
+    // Each message lands on the day its logged call falls in. The call's
+    // position and its day are part of the dedup key, so the caller's dedup
+    // pass drops no call, and the day stays readable for coverage.
+    for (index, msg) in messages.iter().enumerate() {
         let day_key = local_day_key(msg.timestamp);
-        let expected =
-            format!("hermes:session-cross-day:glm-5.2:zai:__hermes_logged_day_v1__:{day_key}");
+        let expected = format!(
+            "hermes:session-cross-day:glm-5.2:zai:{index}:__hermes_logged_day_v1__:{day_key}"
+        );
         assert_eq!(msg.dedup_key.as_deref(), Some(expected.as_str()));
+        assert_eq!(message_logged_day(msg), Some(day_key.as_str()));
     }
-    assert_ne!(a.dedup_key, b.dedup_key);
 
     // The session message_count is still credited exactly once.
     assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 12);
@@ -1815,15 +1824,22 @@ fn test_parse_hermes_sqlite_leaves_unlogged_residual_on_start_day() {
     let mut messages = parse_hermes_sqlite(&db_path);
     assert_eq!(
         messages.len(),
-        2,
-        "logged day plus the residual's start day"
+        3,
+        "two logged calls plus the residual's start day"
     );
     messages.sort_by_key(|m| m.timestamp);
-    let (start, logged) = (&messages[0], &messages[1]);
-    // The logged day carries exactly what the logs account for.
-    assert_eq!(logged.tokens.input, 400);
-    assert_eq!(logged.tokens.output, 200);
-    assert_eq!(logged.tokens.cache_read, 1600);
+    let (start, logged) = (&messages[0], &messages[1..]);
+    // The logged calls carry exactly what the logs account for.
+    for call in logged {
+        assert_eq!(
+            (
+                call.tokens.input,
+                call.tokens.output,
+                call.tokens.cache_read
+            ),
+            (200, 100, 800)
+        );
+    }
     // The unlogged remainder stays on the start day, at the start day's
     // timestamp.
     assert_eq!(start.timestamp, 1_775_000_000_000_i64);
@@ -1837,11 +1853,152 @@ fn test_parse_hermes_sqlite_leaves_unlogged_residual_on_start_day() {
         messages.iter().map(|m| m.tokens.cache_read).sum::<i64>(),
         7600
     );
-    // Cost rides the emitted tokens: 2200 of 11900 for the logged day.
-    assert!((logged.cost - 2.0 * 2200.0 / 11900.0).abs() < 1e-9);
+    // Cost rides the emitted tokens: 1100 of 11900 for each logged call.
+    for call in logged {
+        assert!((call.cost - 2.0 * 1100.0 / 11900.0).abs() < 1e-9);
+    }
     assert!((start.cost - (2.0 - 2.0 * 2200.0 / 11900.0)).abs() < 1e-9);
     assert!((messages.iter().map(|m| m.cost).sum::<f64>() - 2.0).abs() < 1e-9);
     assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 12);
+}
+
+/// Each logged call is timed by its own request latency. A call that logged no
+/// latency stays untimed without untiming the other calls of its day.
+#[test]
+fn test_parse_hermes_sqlite_times_logged_calls_by_request_latency() {
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params!["session-timed", "desktop", "glm-5.2", 1_775_100_000.0_f64, 6_i64],
+    )
+    .unwrap();
+    insert_usage_row(&conn, "session-timed", 600, 300, 2400, 0.6);
+    let day_a = log_stamp(2, 9);
+    let day_b = log_stamp(1, 9);
+    write_agent_log(
+        &dir,
+        &[
+            log_call("session-timed", 1, &day_a, 1000, 100, 800)
+                .replace("latency=1.0s", "latency=2.5s"),
+            log_call("session-timed", 2, &day_a, 1000, 100, 800)
+                .replace("latency=1.0s", "latency=0.0s"),
+            log_call("session-timed", 3, &day_b, 1000, 100, 800).replace(" latency=1.0s", ""),
+        ],
+    );
+
+    let mut messages = parse_hermes_sqlite(&db_path);
+    messages.sort_by_key(|m| m.timestamp);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].performance_duration_ms(), Some(2_500));
+    // A logged 0.0s is a measured sub-rounding call, not a missing latency.
+    assert_eq!(messages[1].performance_duration_ms(), Some(0));
+    assert_eq!(messages[2].performance_duration_ms(), None);
+    // Timing never changes the split itself.
+    for message in &messages {
+        assert_eq!((message.tokens.input, message.tokens.output), (200, 100));
+    }
+}
+
+/// Most sessions start on a day their calls are logged, and their task-variant
+/// calls (titles, compression) never reach the log. That residual stays on the
+/// start day as its own untimed share: merged into the logged share, its
+/// tokens would count as timed over a duration that leaves them out.
+#[test]
+fn test_parse_hermes_sqlite_keeps_residual_untimed_on_a_logged_start_day() {
+    use chrono::TimeZone;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+
+    let stamp = log_stamp(1, 15);
+    let day_key = &stamp[..10];
+    let start = chrono::Local
+        .from_local_datetime(
+            &chrono::NaiveDateTime::parse_from_str(
+                &format!("{day_key} 09:00:00"),
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .unwrap(),
+        )
+        .earliest()
+        .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params!["session-same-day", "desktop", "glm-5.2", start.timestamp() as f64, 9_i64],
+    )
+    .unwrap();
+    // The logs account for 400/200/1600 of the row's 500/260/1700.
+    insert_usage_row(&conn, "session-same-day", 500, 260, 1700, 1.0);
+    write_agent_log(
+        &dir,
+        &[
+            log_call("session-same-day", 1, &stamp, 1000, 100, 800),
+            log_call("session-same-day", 2, &stamp, 1000, 100, 800),
+        ],
+    );
+
+    let messages = parse_hermes_sqlite(&db_path);
+    assert_eq!(
+        messages.len(),
+        3,
+        "two logged calls and a residual share on one day"
+    );
+    let logged: Vec<_> = messages
+        .iter()
+        .filter(|m| message_logged_day(m) == Some(day_key))
+        .collect();
+    let residual = messages
+        .iter()
+        .find(|m| message_logged_day(m).is_none())
+        .unwrap();
+    // The residual starts the day at 09:00, so the calls follow it.
+    let logged_keys: Vec<_> = logged
+        .iter()
+        .map(|m| m.dedup_key.clone().unwrap())
+        .collect();
+    assert_eq!(
+        logged_keys,
+        [1, 2].map(|index| format!(
+            "hermes:session-same-day:glm-5.2:zai:{index}:__hermes_logged_day_v1__:{day_key}"
+        ))
+    );
+    assert_eq!(
+        residual.dedup_key.as_deref(),
+        Some(
+            format!("hermes:session-same-day:glm-5.2:zai:__hermes_residual_day_v1__:{day_key}")
+                .as_str()
+        )
+    );
+    assert!(message_is_day_split(residual));
+
+    for call in &logged {
+        assert_eq!(
+            (
+                call.tokens.input,
+                call.tokens.output,
+                call.tokens.cache_read
+            ),
+            (200, 100, 800)
+        );
+        assert_eq!(call.performance_duration_ms(), Some(1_000));
+    }
+    assert_eq!(
+        (
+            residual.tokens.input,
+            residual.tokens.output,
+            residual.tokens.cache_read
+        ),
+        (100, 60, 100)
+    );
+    assert_eq!(residual.performance_duration_ms(), None);
+    assert_eq!(residual.timestamp, start.timestamp_millis());
+
+    assert!((messages.iter().map(|m| m.cost).sum::<f64>() - 1.0).abs() < 1e-9);
+    assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 9);
 }
 
 /// The split groups the logged calls in the scan's bucket timezone, not the
@@ -1887,20 +2044,29 @@ fn test_parse_hermes_sqlite_groups_split_by_bucket_timezone() {
     {
         return;
     }
+    let logged_days = |messages: &[UnifiedMessage]| {
+        messages
+            .iter()
+            .filter_map(message_logged_day)
+            .map(str::to_string)
+            .collect::<HashSet<_>>()
+            .len()
+    };
     let pinned_messages = parse_hermes_sqlite_in(&db_path, &pinned);
     assert_eq!(
-        pinned_messages.len(),
+        logged_days(&pinned_messages),
         1,
         "Kiritimati keeps both calls on one day"
     );
-    assert_eq!(pinned_messages[0].tokens.input, 400);
-    assert_eq!(pinned_messages[0].tokens.output, 200);
-    assert_eq!(pinned_messages[0].tokens.cache_read, 1600);
+    assert_eq!(
+        pinned_messages.iter().map(|m| m.tokens.input).sum::<i64>(),
+        400
+    );
 
     // The host-zone parse still splits them, so the grouping really is the pin.
     let local_messages = parse_hermes_sqlite(&db_path);
     assert_eq!(
-        local_messages.len(),
+        logged_days(&local_messages),
         2,
         "the host zone splits the same calls"
     );
@@ -1983,4 +2149,87 @@ fn test_parse_hermes_sqlite_copies_session_title() {
     assert_eq!(totals.session_title.as_deref(), Some("会话总量标题"));
     assert_eq!(totals.tokens.input, 40);
     assert_eq!(totals.dedup_key.as_deref(), Some("session-totals"));
+}
+
+/// Hermes stores a subscription session's cost as zero, so its usage is
+/// estimated. OpenAI's 272K tier is selected per request: two logged calls of
+/// ~150K each must price at the base rates even though their day's sum crosses
+/// 272K, and so must a residual that sums an unknown number of calls. A single
+/// logged call above 272K still prices at the high tier.
+#[test]
+fn test_hermes_estimates_select_full_request_tier_per_logged_call() {
+    let mut litellm = HashMap::new();
+    litellm.insert(
+        "gpt-6.1-sol".to_string(),
+        ModelPricing {
+            input_cost_per_token: Some(5e-6),
+            output_cost_per_token: Some(30e-6),
+            cache_read_input_token_cost: Some(0.5e-6),
+            input_cost_per_token_above_272k_tokens: Some(10e-6),
+            output_cost_per_token_above_272k_tokens: Some(45e-6),
+            cache_read_input_token_cost_above_272k_tokens: Some(1e-6),
+            ..Default::default()
+        },
+    );
+    let pricing = PricingService::new(litellm, HashMap::new());
+
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+    // (session, fresh input, output, cache read) — Hermes recorded no cost.
+    for (session, input, output, cache_read) in [
+        ("session-small-calls", 30_000_i64, 3_000_i64, 590_000_i64),
+        ("session-large-call", 20_000, 1_000, 280_000),
+    ] {
+        conn.execute(
+            "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session, "desktop", "gpt-6.1-sol", 1_775_100_000.0_f64, 4_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, input_tokens, output_tokens, cache_read_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session, "gpt-6.1-sol", "openai", input, output, cache_read],
+        )
+        .unwrap();
+    }
+    let day = log_stamp(1, 9);
+    let gpt_call = |session: &str, call: i64, prompt: i64, output: i64, cache: i64| {
+        log_call(session, call, &day, prompt, output, cache).replace(
+            "model=glm-5.2 provider=zai",
+            "model=gpt-6.1-sol provider=openai",
+        )
+    };
+    write_agent_log(
+        &dir,
+        &[
+            // 150K and 160K prompts: 310K together. The residual is
+            // 10K fresh + 300K cached, also above 272K as a sum.
+            gpt_call("session-small-calls", 1, 150_000, 1_000, 140_000),
+            gpt_call("session-small-calls", 2, 160_000, 1_000, 150_000),
+            gpt_call("session-large-call", 1, 300_000, 1_000, 280_000),
+        ],
+    );
+
+    let messages = parse_hermes_sqlite(&db_path);
+    assert!(messages.iter().all(|message| message.cost == 0.0));
+    let estimate = |session: &str| -> f64 {
+        messages
+            .iter()
+            .filter(|message| message.session_id == session)
+            .map(|message| pricing.estimate_message(message).cost)
+            .sum()
+    };
+
+    let base = 30_000.0 * 5e-6 + 3_000.0 * 30e-6 + 590_000.0 * 0.5e-6;
+    let small = estimate("session-small-calls");
+    assert!(
+        (small - base).abs() < 1e-9,
+        "small calls priced {small}, base tier is {base}"
+    );
+    let high = 20_000.0 * 10e-6 + 1_000.0 * 45e-6 + 280_000.0 * 1e-6;
+    let large = estimate("session-large-call");
+    assert!(
+        (large - high).abs() < 1e-9,
+        "large call priced {large}, high tier is {high}"
+    );
 }
