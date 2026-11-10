@@ -72,6 +72,8 @@ const LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V12: u32 = 12;
 // released v12 envelope must reparse rather than decode it as the new layout.
 // Copilot is dispatched by namespace before the other envelope versions.
 const COPILOT_CACHE_FORMAT_VERSION: u32 = 16;
+// Hermes activity metadata does not change any other client's message layout.
+const HERMES_CACHE_FORMAT_VERSION: u32 = 17;
 const _: () = assert!(COPILOT_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
 const _: () = assert!(MICODE_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
 const _: () = assert!(CLAUDE_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
@@ -2122,7 +2124,8 @@ fn parser_version(client: ClientId) -> u32 {
         // change shape; cached aggregates from before the split must miss.
         // v3->v4: parser-owned key markers distinguish logged evidence from a
         // residual start-day share and from user-controlled date-like suffixes.
-        ClientId::Hermes => 4,
+        // v4->v5: native parent links and message activity, independent of usage dates.
+        ClientId::Hermes => 5,
         // v1->v2: Unsloth Studio now reads the responding model and provider
         // route from scalar responseDetails fields. Reparse cached rows so
         // local usage stays authoritatively free, metered providers receive
@@ -2553,6 +2556,7 @@ impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
             session_title: message.session_title.map(crate::sessions::SharedStr::from),
             parent_session_id: None,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
@@ -2646,6 +2650,7 @@ impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
             session_title: message.session_title.map(crate::sessions::SharedStr::from),
             parent_session_id: None,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
@@ -2737,6 +2742,7 @@ impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
             session_title: message.session_title.map(crate::sessions::SharedStr::from),
             parent_session_id: None,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
@@ -2903,6 +2909,7 @@ impl From<LegacyUnifiedMessageV10> for UnifiedMessage {
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             copilot_context: None,
+            hermes_last_active_ms: None,
             machine_label: None,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
             pricing_model_id: None,
@@ -4363,6 +4370,31 @@ fn read_shard_with_limit_unchecked(
         return status;
     }
 
+    if identity.namespace == ClientId::Hermes.as_str() {
+        if envelope.format_version != HERMES_CACHE_FORMAT_VERSION {
+            return ShardReadStatus::Stale;
+        }
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<(CachedSourceEntry, Vec<Option<i64>>)>>(&envelope.payload)
+        {
+            Ok(entries) => {
+                let mut restored = Vec::with_capacity(entries.len());
+                for (mut entry, activity) in entries {
+                    if entry.messages.len() != activity.len() {
+                        return ShardReadStatus::Invalid("Hermes activity length mismatch".into());
+                    }
+                    for (message, last_active) in entry.messages.iter_mut().zip(activity) {
+                        message.hermes_last_active_ms = last_active;
+                    }
+                    restored.push(entry);
+                }
+                ShardReadStatus::Loaded(restored)
+            }
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
     if identity.namespace == ClientId::Copilot.as_str() {
         if envelope.format_version != COPILOT_CACHE_FORMAT_VERSION {
             return ShardReadStatus::Stale;
@@ -4707,10 +4739,26 @@ fn write_shard_with_limit(
     entries: &[CachedSourceEntry],
     max_shard_bytes: u64,
 ) -> std::io::Result<()> {
+    let is_hermes = identity.namespace == ClientId::Hermes.as_str();
     let is_micode = identity.namespace == ClientId::MiMoCode.as_str();
     let is_copilot = identity.namespace == ClientId::Copilot.as_str();
     let is_claude = identity.namespace == ClientId::Claude.as_str();
-    let payload = if is_copilot {
+    let payload = if is_hermes {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let activity: Vec<_> = entry
+                    .messages
+                    .iter()
+                    .map(|message| message.hermes_last_active_ms)
+                    .collect();
+                (entry, activity)
+            })
+            .collect();
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(&entries)
+    } else if is_copilot {
         let entries: Vec<_> = entries
             .iter()
             .map(|entry| {
@@ -4748,7 +4796,9 @@ fn write_shard_with_limit(
     }
     .map_err(std::io::Error::other)?;
     let envelope = CachedShardEnvelope {
-        format_version: if is_copilot {
+        format_version: if is_hermes {
+            HERMES_CACHE_FORMAT_VERSION
+        } else if is_copilot {
             COPILOT_CACHE_FORMAT_VERSION
         } else if is_micode {
             MICODE_CACHE_FORMAT_VERSION
@@ -7046,21 +7096,21 @@ mod tests {
 
     #[test]
     fn test_hermes_parser_version_invalidates_ambiguous_day_keys() {
-        assert_eq!(parser_version(ClientId::Hermes), 4);
+        assert_eq!(parser_version(ClientId::Hermes), 5);
     }
 
     #[test]
     #[serial_test::serial]
-    fn hermes_v3_shard_misses_and_is_rebuilt_under_v4_identity() {
+    fn hermes_v4_shard_misses_and_preserves_activity_under_v5_identity() {
         let cache_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(cache_home.path());
         let source = write_temp_file(b"unchanged Hermes source");
         let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
         let current_identity = CacheIdentity::for_client(ClientId::Hermes);
-        assert_eq!(current_identity.parser_version, 4);
+        assert_eq!(current_identity.parser_version, 5);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
-            parser_version: 3,
+            parser_version: 4,
         };
         let stale_message = UnifiedMessage::new(
             "hermes",
@@ -7074,8 +7124,8 @@ mod tests {
             },
             0.99,
         );
-        // Fabricate the shard exactly as a v3-era writer left it: a v3
-        // envelope holding v3 entries. Routing a stale-identity entry through
+        // Fabricate the shard exactly as a v4-era writer left it: a v4
+        // envelope holding v4 entries. Routing a stale-identity entry through
         // the current save pipeline would instead write a current envelope
         // with a mismatched entry, which shard validation rejects as corrupt.
         let stale_entry = CachedSourceEntry::new(
@@ -7103,7 +7153,7 @@ mod tests {
         let mut current_cache = SourceMessageCache::load();
         assert!(
             current_cache.get(current_identity, source.path()).is_none(),
-            "an unchanged v3 Hermes shard must miss under the v4 identity"
+            "an unchanged v4 Hermes shard must miss under the v5 identity"
         );
 
         let mut rebuilt = UnifiedMessage::new(
@@ -7118,6 +7168,8 @@ mod tests {
             },
             0.01,
         );
+        rebuilt.hermes_last_active_ms = Some(1_775_104_000_123);
+        rebuilt.parent_session_id = Some("parent".into());
         rebuilt.dedup_key =
             Some("hermes:session:glm-5.2:zai:__hermes_logged_day_v1__:2026-04-01".to_string());
         current_cache.insert(CachedSourceEntry::new(
@@ -7132,7 +7184,7 @@ mod tests {
 
         let warm = SourceMessageCache::load();
         let entry = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(entry.parser_version, 4);
+        assert_eq!(entry.parser_version, 5);
         assert_eq!(entry.messages, vec![rebuilt]);
     }
 

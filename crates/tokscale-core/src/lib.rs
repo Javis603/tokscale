@@ -6132,13 +6132,17 @@ fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
             }
         }
 
-        if msg.timestamp > 0 {
-            if entry.first_active_ms == 0 || msg.timestamp < entry.first_active_ms {
-                entry.first_active_ms = msg.timestamp;
-            }
-            if msg.timestamp > entry.last_active_ms {
-                entry.last_active_ms = msg.timestamp;
-            }
+        if msg.timestamp > 0
+            && (entry.first_active_ms == 0 || msg.timestamp < entry.first_active_ms)
+        {
+            entry.first_active_ms = msg.timestamp;
+        }
+        let last_active = msg
+            .hermes_last_active_ms
+            .unwrap_or(msg.timestamp)
+            .max(msg.timestamp);
+        if last_active > entry.last_active_ms {
+            entry.last_active_ms = last_active;
         }
     }
 
@@ -9711,6 +9715,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         pricing_model_id: msg.pricing_model_id.clone(),
         estimate_status: msg.estimate_status,
         copilot_context: None,
+        hermes_last_active_ms: None,
         machine_label: None,
     }
 }
@@ -27601,6 +27606,71 @@ mod tests {
         );
         assert_eq!(second_messages[0].model_id, "claude-sonnet-4");
         assert_eq!(lookup_cache.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn hermes_report_metadata_keeps_accounting_dates_and_native_parentage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = create_hermes_sqlite_db(&db_path);
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
+            CREATE TABLE messages (session_id TEXT, timestamp REAL);",
+        )
+        .unwrap();
+        for id in ["parent", "child", "continued", "self"] {
+            insert_hermes_session(&conn, id, "claude-sonnet-4", 2, 100, 25, 0.07);
+        }
+        conn.execute_batch("UPDATE sessions SET source = 'subagent', parent_session_id = 'parent' WHERE id = 'child';
+            UPDATE sessions SET parent_session_id = 'parent' WHERE id = 'continued';
+            UPDATE sessions SET source = 'subagent', parent_session_id = 'self' WHERE id = 'self';
+            INSERT INTO messages VALUES ('parent', 1775004702.125), ('parent', 1775008302.5);").unwrap();
+        let messages = sessions::hermes::parse_hermes_sqlite(&db_path);
+        assert_eq!(messages.len(), 4);
+        assert!(messages
+            .iter()
+            .all(|message| message.timestamp == 1775001102000));
+        assert!(messages
+            .iter()
+            .all(|message| message.tokens.input == 100 && message.tokens.output == 25));
+        assert!(messages
+            .iter()
+            .all(|message| message.performance_duration_ms().is_none()));
+        let metadata = aggregate_session_metadata(&messages);
+        let find = |id: &str| metadata.iter().find(|row| row.session_id == id).unwrap();
+        assert_eq!(find("child").parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(find("continued").parent_session_id, None);
+        assert_eq!(find("self").parent_session_id, None);
+        assert_eq!(find("parent").first_active_ms, 1775001102000);
+        assert_eq!(find("parent").last_active_ms, 1775008302500);
+        assert_eq!(find("child").last_active_ms, 1775001102000);
+        conn.execute("INSERT INTO messages VALUES ('parent', 1775011902.75)", [])
+            .unwrap();
+        let updated = aggregate_session_metadata(&sessions::hermes::parse_hermes_sqlite(&db_path));
+        assert_eq!(
+            updated
+                .iter()
+                .find(|row| row.session_id == "parent")
+                .unwrap()
+                .last_active_ms,
+            1775011902750
+        );
+    }
+
+    #[test]
+    fn hermes_legacy_relationship_schema_still_reports_message_activity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = create_hermes_sqlite_db(&db_path);
+        insert_hermes_session(&conn, "legacy", "claude-sonnet-4", 2, 100, 25, 0.07);
+        conn.execute_batch(
+            "CREATE TABLE messages (session_id TEXT, timestamp REAL);
+            INSERT INTO messages VALUES ('legacy', 1775004702.125);",
+        )
+        .unwrap();
+        let metadata = aggregate_session_metadata(&sessions::hermes::parse_hermes_sqlite(&db_path));
+        assert_eq!(metadata[0].parent_session_id, None);
+        assert_eq!(metadata[0].last_active_ms, 1775004702125);
     }
 
     #[test]

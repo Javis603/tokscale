@@ -17,6 +17,10 @@
 //! (rotated-away calls, or turns that never reach the log) stays on the
 //! session's start day — and a row whose logs over-report its buckets keeps
 //! its whole total on the start day.
+//!
+//! Native delegated-parent links and the latest `messages.timestamp` are read
+//! on the same connection. Last activity is session metadata only: it does not
+//! move accounting timestamps, change day shares, or supply request latency.
 
 use super::utils::{
     lossy_lines, open_readonly_sqlite, resolved_provider, sqlite_for_each_row_on,
@@ -746,6 +750,56 @@ fn has_session_model_usage(db_path: &Path, conn: &Connection) -> bool {
     }
 }
 
+// Read metadata on the parser's existing connection. The newest message is
+// activity evidence, never a reason to move the session's accounting date.
+fn session_metadata(conn: &Connection) -> HashMap<String, (Option<String>, Option<i64>)> {
+    let has_columns = |table: &str, required: &[&str]| {
+        let Ok(mut statement) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+            return false;
+        };
+        let Ok(columns) = statement.query_map([], |row| row.get::<_, String>(1)) else {
+            return false;
+        };
+        let columns: HashSet<_> = columns.filter_map(Result::ok).collect();
+        required.iter().all(|column| columns.contains(*column))
+    };
+    let parent = if has_columns("sessions", &["source", "parent_session_id"]) {
+        "CASE WHEN source = 'subagent' AND TRIM(parent_session_id) != id THEN NULLIF(TRIM(parent_session_id), '') END"
+    } else {
+        "NULL"
+    };
+    let query = format!("SELECT id, {parent} FROM sessions");
+    let mut metadata = HashMap::new();
+    if let Ok(mut statement) = conn.prepare(&query) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        }) {
+            for (id, parent) in rows.flatten() {
+                metadata.insert(id, (parent, None));
+            }
+        }
+    }
+    if has_columns("messages", &["session_id", "timestamp"]) {
+        if let Ok(mut statement) =
+            conn.prepare("SELECT session_id, MAX(timestamp) FROM messages GROUP BY session_id")
+        {
+            if let Ok(rows) = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+            }) {
+                for (id, at) in rows.flatten() {
+                    if let Some(entry) = metadata.get_mut(&id) {
+                        entry.1 = at
+                            .filter(|at| at.is_finite() && *at > 0.0)
+                            .map(timestamp_secs_to_ms)
+                            .filter(|at| *at > 0);
+                    }
+                }
+            }
+        }
+    }
+    metadata
+}
+
 pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
     parse_hermes_sqlite_in(db_path, &BucketTimezone::Local)
 }
@@ -906,5 +960,12 @@ pub fn parse_hermes_sqlite_in(
         );
     }
 
+    let metadata = session_metadata(&conn);
+    for message in &mut messages {
+        if let Some((parent, last_active)) = metadata.get(message.session_id.as_str()) {
+            message.parent_session_id = parent.as_deref().map(Into::into);
+            message.hermes_last_active_ms = *last_active;
+        }
+    }
     messages
 }
