@@ -3564,6 +3564,8 @@ pub(crate) struct SourceMessageCache {
     /// `false` for [`SourceCachePolicy::InMemory`] callers, who must never
     /// touch the on-disk shards.
     persistent: bool,
+    /// Only an explicit home scan may prune cached WSL sources below that home.
+    scan_home: Option<PathBuf>,
 }
 
 // A shard can be as large as `MAX_CACHE_SHARD_BYTES`, and one transaction
@@ -3610,22 +3612,43 @@ where
         .collect()
 }
 
-fn source_missing_during_cache_load(path: &Path) -> bool {
-    // Merely checking a WSL UNC path can start its distro. Namespace shards
-    // mix host and WSL sources, so cache maintenance must leave WSL entries
-    // alone. Explicit source discovery still checks the requested files, and
-    // unused entries never contribute messages or get deleted on a save.
-    #[cfg(windows)]
-    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
-        if let std::path::Prefix::UNC(server, _) | std::path::Prefix::VerbatimUNC(server, _) =
-            prefix.kind()
+#[cfg(windows)]
+fn wsl_unc_parts(path: &Path) -> Option<(&std::ffi::OsStr, &Path)> {
+    let mut components = path.components();
+    if let Some(std::path::Component::Prefix(prefix)) = components.next() {
+        if let std::path::Prefix::UNC(server, distro)
+        | std::path::Prefix::VerbatimUNC(server, distro) = prefix.kind()
         {
             let server = server.to_string_lossy();
             if server.eq_ignore_ascii_case("wsl$") || server.eq_ignore_ascii_case("wsl.localhost") {
-                return false;
+                return Some((distro, components.as_path()));
             }
         }
     }
+    None
+}
+
+fn source_missing_during_cache_load(path: &Path, scan_home: Option<&Path>) -> bool {
+    // Merely checking a WSL UNC path can start its distro. Only an explicit
+    // home scan may prune its own WSL sources; shared shards can also contain
+    // other distros and users, whose cached paths must remain unprobed.
+    #[cfg(windows)]
+    if let Some((distro, relative)) = wsl_unc_parts(path) {
+        let in_scan_home =
+            scan_home
+                .and_then(wsl_unc_parts)
+                .is_some_and(|(home_distro, home_relative)| {
+                    distro
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&home_distro.to_string_lossy())
+                        && relative.starts_with(home_relative)
+                });
+        if !in_scan_home {
+            return false;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = scan_home;
     !path.exists()
 }
 
@@ -3638,6 +3661,14 @@ impl SourceMessageCache {
         Self {
             state: Mutex::new(CacheState::default()),
             persistent: true,
+            scan_home: None,
+        }
+    }
+
+    pub(crate) fn load_for_scan(home: Option<&Path>) -> Self {
+        Self {
+            scan_home: home.map(Path::to_path_buf),
+            ..Self::load()
         }
     }
 
@@ -3752,7 +3783,10 @@ impl SourceMessageCache {
                 // Only retained Claude history can outlive a missing source;
                 // an ordinary deleted session must stop contributing usage.
                 if !entry.holds_retained_history()
-                    && source_missing_during_cache_load(&key.path.to_path_buf())
+                    && source_missing_during_cache_load(
+                        &key.path.to_path_buf(),
+                        self.scan_home.as_deref(),
+                    )
                 {
                     state.deleted_keys.insert(key, DeletionReason::Missing);
                     state.dirty = true;
@@ -3799,6 +3833,14 @@ impl SourceMessageCache {
     /// Claude cache entries can be the only surviving copy of compacted
     /// history, including after the original transcript disappears.
     pub(crate) fn missing_claude_history(&self, roots: &[PathBuf]) -> Vec<CachedSourceEntry> {
+        self.missing_claude_history_with_probe(roots, Path::exists)
+    }
+
+    fn missing_claude_history_with_probe(
+        &self,
+        roots: &[PathBuf],
+        exists: impl Fn(&Path) -> bool,
+    ) -> Vec<CachedSourceEntry> {
         let mut state = self.state();
         self.ensure_namespace_loaded(&mut state, ClientId::Claude.as_str());
         let mut entries: Vec<_> = state
@@ -3809,7 +3851,7 @@ impl SourceMessageCache {
                     && roots
                         .iter()
                         .any(|root| entry.path.to_path_buf().starts_with(root))
-                    && !entry.path.to_path_buf().exists()
+                    && !exists(&entry.path.to_path_buf())
             })
             .cloned()
             .collect();
@@ -12470,16 +12512,112 @@ mod tests {
         }
         seed.save_if_dirty();
 
-        let mut cache = SourceMessageCache::load();
-        for path in paths {
-            assert!(cache.get(identity, Path::new(path)).is_some(), "{path}");
+        for home in [None, Some(temp_home.path())] {
+            let mut cache = SourceMessageCache::load_for_scan(home);
+            for path in paths {
+                assert!(cache.get(identity, Path::new(path)).is_some(), "{path}");
+            }
+            cache.insert(test_entry(identity, source.path(), "native-session"));
+            cache.save_if_dirty();
         }
-        cache.insert(test_entry(identity, source.path(), "native-session"));
-        cache.save_if_dirty();
         let reloaded = SourceMessageCache::load();
         for path in paths {
             assert!(reloaded.get(identity, Path::new(path)).is_some(), "{path}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial_test::serial]
+    fn explicit_wsl_home_prunes_only_its_missing_sources() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let source = write_temp_file(b"codex\n");
+        let missing = [
+            r"\\wsl$\tokscale-cache-test-distro\home\user\.codex\gone.jsonl",
+            r"\\WSL.LOCALHOST\TOKSCALE-CACHE-TEST-DISTRO\home\user\.codex\gone-alias.jsonl",
+            r"\\?\UNC\wsl$\tokscale-cache-test-distro\home\user\.codex\gone-extended.jsonl",
+            r"//wsl.localhost/tokscale-cache-test-distro/home/user/.codex/gone-forward.jsonl",
+        ];
+        let unrelated = [
+            r"\\wsl$\tokscale-cache-other-distro\home\user\.codex\keep.jsonl",
+            r"\\wsl$\tokscale-cache-test-distro\home\user-other\.codex\keep.jsonl",
+            r"\\wsl$\tokscale-cache-test-distro\home\User\.codex\keep.jsonl",
+        ];
+        let mut seed = SourceMessageCache::default();
+        for path in missing.into_iter().chain(unrelated) {
+            let mut entry = test_entry(identity, source.path(), "wsl-session");
+            entry.path = CachedPath::from_path(Path::new(path));
+            seed.insert(entry);
+        }
+        let claude = CacheIdentity::for_client(ClientId::Claude);
+        let retained_path = Path::new(
+            r"\\wsl$\tokscale-cache-test-distro\home\user\.claude\projects\retained.jsonl",
+        );
+        let mut retained = test_entry(claude, source.path(), "legacy-retained-session");
+        retained.path = CachedPath::from_path(retained_path);
+        assert!(retained.holds_retained_history());
+        seed.insert(retained);
+        seed.save_if_dirty();
+
+        let home = Path::new(r"\\wsl.localhost\tokscale-cache-test-distro\home\user");
+        let mut cache = SourceMessageCache::load_for_scan(Some(home));
+        for path in missing {
+            assert!(cache.get(identity, Path::new(path)).is_none(), "{path}");
+        }
+        for path in unrelated {
+            assert!(cache.get(identity, Path::new(path)).is_some(), "{path}");
+        }
+        assert!(cache.get(claude, retained_path).is_some());
+        cache.save_if_dirty();
+
+        let reloaded = SourceMessageCache::load();
+        for path in missing {
+            assert!(reloaded.get(identity, Path::new(path)).is_none(), "{path}");
+        }
+        for path in unrelated {
+            assert!(reloaded.get(identity, Path::new(path)).is_some(), "{path}");
+        }
+        assert!(reloaded.get(claude, retained_path).is_some());
+    }
+
+    #[test]
+    fn missing_claude_history_probes_only_requested_roots() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("selected");
+        fs::create_dir(&root).unwrap();
+        let missing = root.join("missing.jsonl");
+        let live = root.join("live.jsonl");
+        let outside = home.path().join("selected-other.jsonl");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = SourceMessageCache::default();
+        for path in [&missing, &live, &outside] {
+            fs::write(path, b"claude\n").unwrap();
+            cache.insert(CachedSourceEntry::new_with_retained_message_keys(
+                identity,
+                path,
+                SourceFingerprint::from_path(path).unwrap(),
+                vec![keyed_message(
+                    identity.namespace,
+                    "retained-session",
+                    "old:req_old",
+                )],
+                &HashSet::from(["old:req_old".to_string()]),
+            ));
+        }
+        let probes = std::cell::RefCell::new(Vec::new());
+        let entries = cache.missing_claude_history_with_probe(&[root], |path| {
+            probes.borrow_mut().push(path.to_path_buf());
+            path == live
+        });
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.to_path_buf(), missing);
+        let mut probes = probes.into_inner();
+        probes.sort();
+        let mut expected = vec![missing, live];
+        expected.sort();
+        assert_eq!(probes, expected);
     }
 
     /// The shard on disk is older than what this scan produced, so loading the
