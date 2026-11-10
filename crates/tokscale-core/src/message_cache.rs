@@ -3610,6 +3610,25 @@ where
         .collect()
 }
 
+fn source_missing_during_cache_load(path: &Path) -> bool {
+    // Merely checking a WSL UNC path can start its distro. Namespace shards
+    // mix host and WSL sources, so cache maintenance must leave WSL entries
+    // alone. Explicit source discovery still checks the requested files, and
+    // unused entries never contribute messages or get deleted on a save.
+    #[cfg(windows)]
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        if let std::path::Prefix::UNC(server, _) | std::path::Prefix::VerbatimUNC(server, _) =
+            prefix.kind()
+        {
+            let server = server.to_string_lossy();
+            if server.eq_ignore_ascii_case("wsl$") || server.eq_ignore_ascii_case("wsl.localhost") {
+                return false;
+            }
+        }
+    }
+    !path.exists()
+}
+
 impl SourceMessageCache {
     /// Opens the persistent cache without reading any shard.
     ///
@@ -3732,7 +3751,9 @@ impl SourceMessageCache {
                 let repaired_billing = entry.remove_legacy_claude_tool_result_billing();
                 // Only retained Claude history can outlive a missing source;
                 // an ordinary deleted session must stop contributing usage.
-                if !key.path.to_path_buf().exists() && !entry.holds_retained_history() {
+                if !entry.holds_retained_history()
+                    && source_missing_during_cache_load(&key.path.to_path_buf())
+                {
                     state.deleted_keys.insert(key, DeletionReason::Missing);
                     state.dirty = true;
                     continue;
@@ -3785,10 +3806,10 @@ impl SourceMessageCache {
             .values()
             .filter(|entry| {
                 entry.holds_retained_history()
-                    && !entry.path.to_path_buf().exists()
                     && roots
                         .iter()
                         .any(|root| entry.path.to_path_buf().starts_with(root))
+                    && !entry.path.to_path_buf().exists()
             })
             .cloned()
             .collect();
@@ -12425,6 +12446,40 @@ mod tests {
         cache.save_if_dirty();
 
         assert!(SourceMessageCache::load().get(identity, &path).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial_test::serial]
+    fn loading_a_namespace_preserves_unvisited_wsl_sources() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let source = write_temp_file(b"codex\n");
+        let paths = [
+            r"\\wsl$\tokscale-cache-test-distro\home\user\.codex\session.jsonl",
+            r"\\WSL.LOCALHOST\tokscale-cache-test-distro\home\user\.codex\session.jsonl",
+            r"\\?\UNC\wsl$\tokscale-cache-test-distro\home\user\.codex\session.jsonl",
+            r"//wsl.localhost/tokscale-cache-test-distro/home/user/.codex/session.jsonl",
+        ];
+        let mut seed = SourceMessageCache::default();
+        for path in paths {
+            let mut entry = test_entry(identity, source.path(), "wsl-session");
+            entry.path = CachedPath::from_path(Path::new(path));
+            seed.insert(entry);
+        }
+        seed.save_if_dirty();
+
+        let mut cache = SourceMessageCache::load();
+        for path in paths {
+            assert!(cache.get(identity, Path::new(path)).is_some(), "{path}");
+        }
+        cache.insert(test_entry(identity, source.path(), "native-session"));
+        cache.save_if_dirty();
+        let reloaded = SourceMessageCache::load();
+        for path in paths {
+            assert!(reloaded.get(identity, Path::new(path)).is_some(), "{path}");
+        }
     }
 
     /// The shard on disk is older than what this scan produced, so loading the
