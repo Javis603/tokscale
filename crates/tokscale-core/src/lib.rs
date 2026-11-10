@@ -3634,9 +3634,13 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // lane asks for one of its sources, and entries whose file is gone are
     // pruned as that namespace loads. A scan therefore pays for the clients it
     // actually reads instead of for every client the machine has ever cached.
+    // WSL pruning is narrower: only explicit --home scans may probe cached
+    // paths under that home, never unrelated WSL paths in the same shard.
     let mut source_cache = match cache_policy {
         SourceCachePolicy::Persistent | SourceCachePolicy::PersistentDeferred => {
-            message_cache::SourceMessageCache::load()
+            message_cache::SourceMessageCache::load_for_scan(
+                (!use_env_roots).then_some(std::path::Path::new(home_dir)),
+            )
         }
         SourceCachePolicy::InMemory => message_cache::SourceMessageCache::default(),
     };
