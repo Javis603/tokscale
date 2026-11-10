@@ -752,50 +752,85 @@ fn has_session_model_usage(db_path: &Path, conn: &Connection) -> bool {
 
 // Read metadata on the parser's existing connection. The newest message is
 // activity evidence, never a reason to move the session's accounting date.
-fn session_metadata(conn: &Connection) -> HashMap<String, (Option<String>, Option<i64>)> {
-    let has_columns = |table: &str, required: &[&str]| {
-        let Ok(mut statement) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
-            return false;
-        };
-        let Ok(columns) = statement.query_map([], |row| row.get::<_, String>(1)) else {
-            return false;
-        };
-        let columns: HashSet<_> = columns.filter_map(Result::ok).collect();
-        required.iter().all(|column| columns.contains(*column))
+fn session_metadata(
+    db_path: &Path,
+    conn: &Connection,
+) -> HashMap<String, (Option<String>, Option<i64>)> {
+    let columns = |table: &str| {
+        let mut columns = HashSet::new();
+        sqlite_for_each_row_on(
+            conn,
+            db_path,
+            &format!("PRAGMA table_info({table})"),
+            Some("Hermes metadata schema"),
+            &mut |row| {
+                columns.insert(row.get::<_, String>(1)?);
+                Ok(())
+            },
+        );
+        columns
     };
-    let parent = if has_columns("sessions", &["source", "parent_session_id"]) {
-        "CASE WHEN source = 'subagent' AND TRIM(parent_session_id) != id THEN NULLIF(TRIM(parent_session_id), '') END"
+    let session_columns = columns("sessions");
+    let source = if session_columns.contains("source") {
+        "source"
     } else {
         "NULL"
     };
-    let query = format!("SELECT id, {parent} FROM sessions");
+    let parent = if session_columns.contains("parent_session_id") {
+        "parent_session_id"
+    } else {
+        "NULL"
+    };
+    // Gateway children retain their gateway source. The marker names the
+    // immediate parent; a compression continuation can inherit an older one.
+    let marker = if session_columns.contains("model_config") {
+        "CAST(json_extract(CASE WHEN json_valid(model_config) THEN model_config ELSE '{}' END, '$._delegate_from') AS TEXT)"
+    } else {
+        "NULL"
+    };
+    let query = format!("SELECT id, {source}, {parent}, {marker} FROM sessions");
     let mut metadata = HashMap::new();
-    if let Ok(mut statement) = conn.prepare(&query) {
-        if let Ok(rows) = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        }) {
-            for (id, parent) in rows.flatten() {
-                metadata.insert(id, (parent, None));
-            }
-        }
-    }
-    if has_columns("messages", &["session_id", "timestamp"]) {
-        if let Ok(mut statement) =
-            conn.prepare("SELECT session_id, MAX(timestamp) FROM messages GROUP BY session_id")
-        {
-            if let Ok(rows) = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
-            }) {
-                for (id, at) in rows.flatten() {
-                    if let Some(entry) = metadata.get_mut(&id) {
-                        entry.1 = at
-                            .filter(|at| at.is_finite() && *at > 0.0)
-                            .map(timestamp_secs_to_ms)
-                            .filter(|at| *at > 0);
-                    }
+    sqlite_for_each_row_on(
+        conn,
+        db_path,
+        &query,
+        Some("Hermes parent metadata"),
+        &mut |row| {
+            let id = row.get::<_, String>(0)?;
+            let source = row.get::<_, Option<String>>(1)?;
+            let parent = row.get::<_, Option<String>>(2)?;
+            let marker = row.get::<_, Option<String>>(3)?;
+            let parent = parent
+                .as_deref()
+                .map(str::trim)
+                .filter(|parent| {
+                    !parent.is_empty()
+                        && *parent != id
+                        && marker
+                            .as_deref()
+                            .map_or(source.as_deref() == Some("subagent"), |marker| {
+                                marker == *parent
+                            })
+                })
+                .map(str::to_owned);
+            metadata.insert(id, (parent, None));
+            Ok(())
+        },
+    );
+    let message_columns = columns("messages");
+    if message_columns.contains("session_id") && message_columns.contains("timestamp") {
+        // Match Hermes' coerce_epoch window (hermes_cli/timefmt.py). Filter
+        // before MAX so one corrupt cell cannot hide a valid recent message.
+        sqlite_for_each_row_on(conn, db_path,
+            "SELECT session_id, MAX(timestamp) FROM messages WHERE timestamp BETWEEN 0 AND 4200000000 GROUP BY session_id",
+            Some("Hermes last activity"), &mut |row| {
+                let id = row.get::<_, String>(0)?;
+                let at = row.get::<_, Option<f64>>(1)?;
+                if let Some(entry) = metadata.get_mut(&id) {
+                    entry.1 = at.map(timestamp_secs_to_ms).filter(|at| *at > 0);
                 }
-            }
-        }
+                Ok(())
+            });
     }
     metadata
 }
@@ -960,7 +995,7 @@ pub fn parse_hermes_sqlite_in(
         );
     }
 
-    let metadata = session_metadata(&conn);
+    let metadata = session_metadata(db_path, &conn);
     for message in &mut messages {
         if let Some((parent, last_active)) = metadata.get(message.session_id.as_str()) {
             message.parent_session_id = parent.as_deref().map(Into::into);

@@ -206,7 +206,7 @@ pub struct UnifiedMessage {
     #[serde(skip)]
     pub copilot_context: Option<copilot::CopilotContextProvenance>,
     /// Latest native Hermes message time, independent of accounting timestamps.
-    /// Persisted only in the Hermes cache envelope; other clients keep their layout.
+    /// Hermes SQLite is parsed directly; other clients keep their cache layout.
     #[serde(skip)]
     pub hermes_last_active_ms: Option<i64>,
     /// Machine whose session file this message was read from: the
