@@ -254,9 +254,34 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  attest:
+    name: Attest build provenance
+    needs: [resolve-source, build]
+    runs-on: ubuntu-latest
+    # Keep OIDC out of the build job: it checks out and executes whatever
+    # source_repository/source_ref was dispatched, so a malicious build script
+    # or proc macro must not be able to request credentials. This job only
+    # downloads the resulting artifacts and attests their digests.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v6
+        with:
+          pattern: tokscale-*
+          path: dist
+          merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
   publish-release:
     name: Publish GitHub Release
-    needs: [resolve-source, build]
+    needs: [resolve-source, build, attest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
