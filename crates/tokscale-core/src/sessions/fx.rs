@@ -328,6 +328,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
         let (cost, cost_source) = reported_cost(model_usage.total_cost);
 
         messages.push(UnifiedMessage {
+            qoder_prompt_tokens: None,
             client: CLIENT_ID.into(),
             model_id: model_id.as_str().into(),
             provider_id: provider_id.as_str().into(),
@@ -382,6 +383,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
         let (cost, cost_source) = reported_cost(snapshot.total_cost);
         if tokens.total() > 0 || request_count > 0 || cost > 0.0 {
             messages.push(UnifiedMessage {
+                qoder_prompt_tokens: None,
                 client: CLIENT_ID.into(),
                 model_id: UNKNOWN_MODEL.into(),
                 provider_id: "zai".into(),
