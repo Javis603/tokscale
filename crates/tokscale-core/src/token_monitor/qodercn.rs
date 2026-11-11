@@ -39,7 +39,7 @@ const JSONL_MAX_FILES: usize = 5000;
 const JSONL_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const JSONL_MAX_ROWS: usize = 100_000;
 const JSONL_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 /// Qoder CN stores internal model codes; these are the app's own display
 /// names. Unmapped codes (custom models) pass through unchanged.
@@ -262,7 +262,7 @@ fn load_cache(path: &Path) -> Cache {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Cache>(&bytes).ok())
-        .filter(|cache| cache.version == CACHE_VERSION || cache.version == 1)
+        .filter(|cache| matches!(cache.version, 1..=CACHE_VERSION))
         .unwrap_or_default()
 }
 
@@ -637,7 +637,7 @@ fn list_jsonl(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) -> Result<(), 
 fn read_jsonl_file(path: &Path, bytes_read: &mut u64) -> Result<Vec<Row>, String> {
     let source = js::path_namespace(path);
     let mut read = Ok(());
-    let messages = crate::sessions::qoder::parse_qoder_measured_source(path, |sink| {
+    let messages = crate::sessions::qoder::parse_qoder_cn_measured_source(path, |sink| {
         read = read_jsonl_source(path, bytes_read, sink);
     });
     read?;
@@ -1072,6 +1072,34 @@ mod tests {
                     assert_eq!(message.tokens.total(), 123 + output);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn gemini_usage_splits_cached_prompt_once_and_keeps_reasoning_cold_and_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cache = dir.path().join("cache.json");
+        write_jsonl(
+            &p.projects.join("session.jsonl"),
+            &[json!({
+                "type":"assistant", "sessionId":"gemini-session",
+                "timestamp":"2026-11-11T10:00:00Z",
+                "message":{"id":"gemini-request","model":"gemini-2.5-pro",
+                    "usage":{"promptTokenCount":100,"cachedContentTokenCount":40,
+                        "candidatesTokenCount":20,"thoughtsTokenCount":10,"totalTokenCount":130}}
+            })],
+        );
+        for _ in 0..2 {
+            let messages = parse_with(&p, &cache);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                (messages[0].tokens.input, messages[0].tokens.cache_read),
+                (60, 40)
+            );
+            assert_eq!(messages[0].tokens.output, 20);
+            assert_eq!(messages[0].tokens.reasoning, 10);
+            assert_eq!(messages[0].tokens.total(), 130);
         }
     }
 

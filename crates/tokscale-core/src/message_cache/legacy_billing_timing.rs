@@ -31,6 +31,7 @@ struct TimingMessage {
 impl From<TimingMessage> for UnifiedMessage {
     fn from(message: TimingMessage) -> Self {
         Self {
+            qoder_prompt_tokens: None,
             client: message.client.into(),
             model_id: message.model_id.into(),
             provider_id: message.provider_id.into(),
@@ -124,6 +125,7 @@ struct BillingMessage {
 impl From<BillingMessage> for UnifiedMessage {
     fn from(message: BillingMessage) -> Self {
         Self {
+            qoder_prompt_tokens: None,
             client: message.client.into(),
             model_id: message.model_id.into(),
             provider_id: message.provider_id.into(),

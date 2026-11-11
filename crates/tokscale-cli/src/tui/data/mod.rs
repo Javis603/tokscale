@@ -2126,6 +2126,7 @@ mod tests {
     fn accumulate_session_entry_normalizes_and_deduplicates_agents() {
         let mut entry = SessionUsage::new("opencode", "sess-test");
         let mut msg = UnifiedMessage {
+            qoder_prompt_tokens: None,
             client: "opencode".to_string().into(),
             model_id: "test-model".to_string().into(),
             provider_id: "test-provider".to_string().into(),

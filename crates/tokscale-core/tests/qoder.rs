@@ -287,3 +287,71 @@ async fn test_qoder_gist_representative_schema_periods() {
         .unwrap();
     assert_eq!(uncached.len(), 6);
 }
+
+#[tokio::test]
+async fn test_qoder_divergent_request_copies_keep_complete_usage() {
+    for complete_first in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join(".qoder/projects/app");
+        std::fs::create_dir_all(&project).unwrap();
+        let row = |output| serde_json::json!({"type":"assistant","sessionId":"shared-session","timestamp":"2026-11-11T10:00:00Z","message":{"id":"shared-request","model":"gpt-5","usage":{"input_tokens":100,"cache_read_input_tokens":40,"output_tokens":output}}});
+        let (main, copy) = if complete_first {
+            ("a.jsonl", "z.jsonl")
+        } else {
+            ("z.jsonl", "a.jsonl")
+        };
+        std::fs::write(project.join(copy), format!("{}\n", row(2))).unwrap();
+        for output in [30, 50] {
+            std::fs::write(project.join(main), format!("{}\n", row(output))).unwrap();
+            let parsed = parse_local_clients(qoder_options(dir.path())).unwrap();
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].output, output);
+            let unified =
+                parse_local_unified_messages_with_pricing_uncached(qoder_options(dir.path()), None)
+                    .await
+                    .unwrap();
+            assert_eq!(unified.len(), 1);
+            assert_eq!(unified[0].tokens.output, output);
+            assert_eq!(unified[0].tokens.total(), 140 + output);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_qoder_gemini_copies_merge_inclusive_prompt_before_cache_split() {
+    for complete_first in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join(".qoder/projects/app");
+        std::fs::create_dir_all(&project).unwrap();
+        let row = |usage| serde_json::json!({"type":"assistant","sessionId":"gemini-session","timestamp":"2026-11-11T10:00:00Z","message":{"id":"gemini-request","model":"gemini-2.5-pro","usage":usage}});
+        let stale = row(
+            serde_json::json!({"promptTokenCount":100,"candidatesTokenCount":2,"totalTokenCount":102}),
+        );
+        let complete = row(
+            serde_json::json!({"promptTokenCount":100,"cachedContentTokenCount":40,"candidatesTokenCount":20,"totalTokenCount":120}),
+        );
+        let (main, copy) = if complete_first {
+            ("a.jsonl", "z.jsonl")
+        } else {
+            ("z.jsonl", "a.jsonl")
+        };
+        std::fs::write(project.join(main), format!("{complete}\n")).unwrap();
+        std::fs::write(project.join(copy), format!("{stale}\n")).unwrap();
+        let parsed = parse_local_clients(qoder_options(dir.path())).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(
+            (
+                parsed.messages[0].input,
+                parsed.messages[0].cache_read,
+                parsed.messages[0].output
+            ),
+            (60, 40, 20)
+        );
+        let unified =
+            parse_local_unified_messages_with_pricing_uncached(qoder_options(dir.path()), None)
+                .await
+                .unwrap();
+        assert_eq!(unified.len(), 1);
+        assert_eq!(unified[0].tokens.total(), 120);
+    }
+}
