@@ -47,7 +47,7 @@ const CLIENTS: &[Client] = &[
     },
     Client {
         id: qodercn::CLIENT_ID,
-        parse: |scope| qodercn::parse(scope.home_dir),
+        parse: |scope| qodercn::parse(scope.home_dir, scope.use_env_roots),
     },
 ];
 

@@ -131,10 +131,7 @@ fn canonicalize_qoder_model_and_provider(
     (canonical_model, provider_id)
 }
 
-fn extract_usage_breakdown(
-    usage: &Value,
-    cn_inclusive_prompt: bool,
-) -> Option<(TokenBreakdown, bool, Option<i64>)> {
+fn extract_usage_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool, Option<i64>)> {
     let obj = usage.as_object()?;
 
     // Check Gemini/Qwen-style usageMetadata fields first if present
@@ -158,9 +155,7 @@ fn extract_usage_breakdown(
             return None;
         }
 
-        let input = if cn_inclusive_prompt {
-            prompt
-        } else if cache_read <= prompt {
+        let input = if cache_read <= prompt {
             prompt - cache_read
         } else {
             prompt
@@ -425,7 +420,7 @@ impl AssembledAssistantTurn {
         }
     }
 
-    fn into_unified_message(self, cn_inclusive_prompt: bool) -> Option<UnifiedMessage> {
+    fn into_unified_message(self) -> Option<UnifiedMessage> {
         let mut tokens = if let Some(mut auth) = self.authoritative_tokens {
             auth.cache_write_1h = auth.cache_write_1h.min(auth.cache_write);
             auth
@@ -452,7 +447,7 @@ impl AssembledAssistantTurn {
         tokens.cache_write_1h = tokens.cache_write_1h.min(tokens.cache_write);
 
         if let Some(prompt) = self.inclusive_prompt_tokens {
-            tokens.input = if cn_inclusive_prompt || tokens.cache_read > prompt {
+            tokens.input = if tokens.cache_read > prompt {
                 prompt
             } else {
                 prompt - tokens.cache_read
@@ -585,28 +580,26 @@ pub(crate) fn reconcile_request_copies(messages: Vec<UnifiedMessage>) -> Vec<Uni
 
 /// Parse a Qoder or Qoder CN `.jsonl` transcript file into [`UnifiedMessage`] records.
 pub fn parse_qoder_file(path: &Path) -> Vec<UnifiedMessage> {
-    parse_qoder_source(path, false, false, |sink| for_each_json_line(path, sink))
+    parse_qoder_source(path, false, |sink| for_each_json_line(path, sink))
 }
 
 /// Token Monitor counts reported tokens only; managed-model text estimates
 /// must not enter the same accounting plane as measured usage.
 pub fn parse_qoder_file_measured(path: &Path) -> Vec<UnifiedMessage> {
-    parse_qoder_source(path, true, false, |sink| for_each_json_line(path, sink))
+    parse_qoder_measured_source(path, |sink| for_each_json_line(path, sink))
 }
 
-/// Share upstream fragment assembly with the bounded CN source reader.
-pub(crate) fn parse_qoder_cn_measured_source(
+/// Parse reported usage with caller-supplied source traversal.
+pub(crate) fn parse_qoder_measured_source(
     path: &Path,
     visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
 ) -> Vec<UnifiedMessage> {
-    // Keep the CN inclusive prompt envelope until its adapter splits cache reads.
-    parse_qoder_source(path, true, true, visit)
+    parse_qoder_source(path, true, visit)
 }
 
 fn parse_qoder_source(
     path: &Path,
     measured_only: bool,
-    cn_inclusive_prompt: bool,
     visit: impl FnOnce(&mut dyn FnMut(usize, &str)),
 ) -> Vec<UnifiedMessage> {
     if should_skip_qoder_file(path) {
@@ -750,9 +743,7 @@ fn parse_qoder_source(
                 let Some(data) = value.get("data") else {
                     return;
                 };
-                let Some((breakdown, reports_split, prompt)) =
-                    extract_usage_breakdown(data, cn_inclusive_prompt)
-                else {
+                let Some((breakdown, reports_split, prompt)) = extract_usage_breakdown(data) else {
                     return;
                 };
                 let raw_model_candidate = data
@@ -917,8 +908,7 @@ fn parse_qoder_source(
                     .or_else(|| value.get("usage"))
                     .or_else(|| value.get("usageMetadata"))
                     .or_else(|| value.get("token_usage"));
-                let usage_breakdown =
-                    usage_val.and_then(|usage| extract_usage_breakdown(usage, cn_inclusive_prompt));
+                let usage_breakdown = usage_val.and_then(extract_usage_breakdown);
 
                 let msg_id = message_val
                     .and_then(|m| m.get("id"))
@@ -1053,7 +1043,7 @@ fn parse_qoder_source(
     turns
         .into_iter()
         .filter(|turn| !measured_only || turn.authoritative_tokens.is_some())
-        .filter_map(|turn| turn.into_unified_message(cn_inclusive_prompt))
+        .filter_map(|turn| turn.into_unified_message())
         .collect()
 }
 
