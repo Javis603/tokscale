@@ -38,11 +38,128 @@ pub fn storage_roots(home: &Path) -> Vec<PathBuf> {
     ]
 }
 
+fn child_directories(parent: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect()
+}
+
+fn has_desktop_data(root: &Path) -> bool {
+    [
+        "IndexedDB/https_claude.ai_0.indexeddb.leveldb",
+        "local-agent-mode-sessions",
+        "claude-code-sessions",
+    ]
+    .iter()
+    .any(|relative| root.join(relative).is_dir())
+}
+
+fn is_claude_profile(root: &Path) -> bool {
+    root.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("claude_")
+    })
+}
+
+/// Windows MSIX builds keep Claude Desktop's persistent profile outside the
+/// user's roaming profile. Newer builds may also retain a Chromium store in
+/// the app-container package directory. Inspect only known, shallow locations;
+/// never recurse through the whole LocalAppData tree.
+fn windows_storage_roots(local_app_data: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    let claude_data = local_app_data.join("Claude-Data");
+    for profile in child_directories(&claude_data) {
+        if is_claude_profile(&profile) && has_desktop_data(&profile) {
+            roots.push(profile);
+        }
+    }
+
+    let packages = local_app_data.join("Packages");
+    for package in child_directories(&packages) {
+        if !package.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("claude")
+        }) {
+            continue;
+        }
+        if has_desktop_data(&package) {
+            roots.push(package.clone());
+        }
+        for profile in child_directories(&package) {
+            if is_claude_profile(&profile) && has_desktop_data(&profile) {
+                roots.push(profile);
+            }
+        }
+        for name in [
+            "LocalCache",
+            "LocalCache/Roaming/Claude",
+            "LocalState",
+            "RoamingState",
+        ] {
+            let candidate = package.join(name);
+            if has_desktop_data(&candidate) {
+                roots.push(candidate);
+            }
+        }
+    }
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn storage_roots_with_local_app_data(home: &Path, local_app_data: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = storage_roots(home);
+    if let Some(local_app_data) = local_app_data {
+        roots.extend(windows_storage_roots(local_app_data));
+    }
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(root.clone()));
+    roots
+}
+
+/// Resolve native Windows MSIX data only for an unscoped host scan. An explicit
+/// --home must remain isolated from the host account's LocalAppData.
+pub fn storage_roots_with_env_strategy(home: &Path, use_env_roots: bool) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    let local_app_data = if use_env_roots {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let local_app_data: Option<PathBuf> = {
+        let _ = use_env_roots;
+        None
+    };
+
+    storage_roots_with_local_app_data(home, local_app_data.as_deref())
+}
+
 /// Scan every retained session, with no date cutoff. Only actual transcript
 /// roots are included: audit.jsonl is another copy of the same API traffic.
 pub fn transcript_roots(home: &Path) -> Vec<PathBuf> {
+    transcript_roots_with_env_strategy(home, false)
+}
+
+pub fn transcript_roots_with_env_strategy(home: &Path, use_env_roots: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for app in storage_roots(home) {
+    for app in storage_roots_with_env_strategy(home, use_env_roots) {
         for name in ["local-agent-mode-sessions", "claude-code-sessions"] {
             let root = app.join(name);
             let mut walk = walkdir::WalkDir::new(root).follow_links(false).into_iter();
@@ -91,10 +208,14 @@ fn identity(value: &Value) -> Option<String> {
 }
 
 pub fn read(home: &Path) -> DesktopUsage {
+    read_with_env_strategy(home, false)
+}
+
+pub fn read_with_env_strategy(home: &Path, use_env_roots: bool) -> DesktopUsage {
     let mut coverage = Coverage::default();
     let mut trees: BTreeMap<String, Value> = BTreeMap::new();
     let mut deleted = HashSet::new();
-    for root in storage_roots(home) {
+    for root in storage_roots_with_env_strategy(home, use_env_roots) {
         let path = root.join("IndexedDB/https_claude.ai_0.indexeddb.leveldb");
         if !path.is_dir() {
             continue;
@@ -763,5 +884,40 @@ mod tests {
         let roots = transcript_roots(home.path());
         assert_eq!(roots.len(), 2);
         assert!(roots.iter().all(|p| p.ends_with(".claude/projects")));
+    }
+    #[test]
+    fn discovers_windows_msix_and_package_roots_without_scanning_unrelated_directories() {
+        let local = tempfile::tempdir().unwrap();
+        let msix = local.path().join("Claude-Data/claude_pzs8sxrjxfjjc");
+        let package = local.path().join("Packages/Claude_pzs8sxrjxfjjc");
+        let nested_profile = package.join("claude_pzs8sxrjxfjjc");
+        let local_cache = package.join("LocalCache");
+        let legacy = package.join("LocalCache/Roaming/Claude");
+        let unrelated = local.path().join("Packages/OtherApp");
+
+        for root in [
+            &msix,
+            &package,
+            &nested_profile,
+            &local_cache,
+            &legacy,
+            &unrelated,
+        ] {
+            std::fs::create_dir_all(root.join("IndexedDB/https_claude.ai_0.indexeddb.leveldb"))
+                .unwrap();
+        }
+
+        let roots = windows_storage_roots(local.path());
+        assert!(roots.contains(&msix));
+        assert!(roots.contains(&package));
+        assert!(roots.contains(&nested_profile));
+        assert!(roots.contains(&local_cache));
+        assert!(roots.contains(&legacy));
+        assert!(!roots.contains(&unrelated));
+
+        let home = tempfile::tempdir().unwrap();
+        let all = storage_roots_with_local_app_data(home.path(), Some(local.path()));
+        assert!(all.contains(&msix));
+        assert!(all.contains(&package));
     }
 }

@@ -913,9 +913,12 @@ pub fn built_in_extra_scan_paths_for(
                 .map(|path| (ClientId::Claude, path)),
         );
         paths.extend(
-            crate::claude_desktop::transcript_roots(Path::new(home_dir))
-                .into_iter()
-                .map(|path| (ClientId::Claude, path)),
+            crate::claude_desktop::transcript_roots_with_env_strategy(
+                Path::new(home_dir),
+                use_env_roots,
+            )
+            .into_iter()
+            .map(|path| (ClientId::Claude, path)),
         );
     }
 

@@ -3933,9 +3933,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .map(|(_, _, message)| message)
         .collect();
     if clients.is_empty() || clients.iter().any(|client| client == "claude") {
-        // Claude Desktop's cache databases are read from this home only, never
+        // Claude Desktop's cache databases are read from this home and, when
+        // use_env_roots is enabled, native environment roots. They are never read
         // from a scan path, so their rows keep the local machine label.
-        let desktop = claude_desktop::read(Path::new(home_dir));
+        let desktop = claude_desktop::read_with_env_strategy(Path::new(home_dir), use_env_roots);
         if desktop.coverage.cache_databases > 0 {
             desktop_coverage = Some(desktop.coverage.clone());
         }
@@ -8494,7 +8495,8 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         billing_conflicts.push(false);
     }
     if include_all || clients.iter().any(|client| client == "claude") {
-        claude_desktop::read(Path::new(&home_dir)).merge_into(&mut claude_messages);
+        claude_desktop::read_with_env_strategy(Path::new(&home_dir), options.use_env_roots)
+            .merge_into(&mut claude_messages);
     }
     sessions::claudecode::reconcile_advisor_billing(&mut claude_messages);
     claude_turns.resolve_legacy_rows(scan_result.get(ClientId::Claude), &claude_home);
