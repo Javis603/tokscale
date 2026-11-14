@@ -103,7 +103,12 @@ fn windows_storage_roots(local_app_data: &Path) -> Vec<PathBuf> {
                 roots.push(profile);
             }
         }
-        for name in ["LocalCache", "LocalCache/Roaming/Claude", "LocalState", "RoamingState"] {
+        for name in [
+            "LocalCache",
+            "LocalCache/Roaming/Claude",
+            "LocalState",
+            "RoamingState",
+        ] {
             let candidate = package.join(name);
             if has_desktop_data(&candidate) {
                 roots.push(candidate);
@@ -890,7 +895,14 @@ mod tests {
         let legacy = package.join("LocalCache/Roaming/Claude");
         let unrelated = local.path().join("Packages/OtherApp");
 
-        for root in [&msix, &package, &nested_profile, &local_cache, &legacy, &unrelated] {
+        for root in [
+            &msix,
+            &package,
+            &nested_profile,
+            &local_cache,
+            &legacy,
+            &unrelated,
+        ] {
             std::fs::create_dir_all(root.join("IndexedDB/https_claude.ai_0.indexeddb.leveldb"))
                 .unwrap();
         }
