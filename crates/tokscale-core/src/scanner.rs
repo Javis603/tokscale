@@ -917,8 +917,8 @@ pub fn built_in_extra_scan_paths_for(
                 Path::new(home_dir),
                 use_env_roots,
             )
-                .into_iter()
-                .map(|path| (ClientId::Claude, path)),
+            .into_iter()
+            .map(|path| (ClientId::Claude, path)),
         );
     }
 

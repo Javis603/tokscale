@@ -65,8 +65,11 @@ fn has_desktop_data(root: &Path) -> bool {
 }
 
 fn is_claude_profile(root: &Path) -> bool {
-    root.file_name()
-        .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().starts_with("claude_"))
+    root.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("claude_")
+    })
 }
 
 /// Windows MSIX builds keep Claude Desktop's persistent profile outside the
@@ -85,10 +88,11 @@ fn windows_storage_roots(local_app_data: &Path) -> Vec<PathBuf> {
 
     let packages = local_app_data.join("Packages");
     for package in child_directories(&packages) {
-        if !package
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().contains("claude"))
-        {
+        if !package.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("claude")
+        }) {
             continue;
         }
         if has_desktop_data(&package) {
@@ -99,7 +103,7 @@ fn windows_storage_roots(local_app_data: &Path) -> Vec<PathBuf> {
                 roots.push(profile);
             }
         }
-        for name in ["LocalCache", "LocalState", "RoamingState"] {
+        for name in ["LocalCache", "LocalCache/Roaming/Claude", "LocalState", "RoamingState"] {
             let candidate = package.join(name);
             if has_desktop_data(&candidate) {
                 roots.push(candidate);
@@ -112,10 +116,7 @@ fn windows_storage_roots(local_app_data: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn storage_roots_with_local_app_data(
-    home: &Path,
-    local_app_data: Option<&Path>,
-) -> Vec<PathBuf> {
+fn storage_roots_with_local_app_data(home: &Path, local_app_data: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = storage_roots(home);
     if let Some(local_app_data) = local_app_data {
         roots.extend(windows_storage_roots(local_app_data));
@@ -886,13 +887,12 @@ mod tests {
         let package = local.path().join("Packages/Claude_pzs8sxrjxfjjc");
         let nested_profile = package.join("claude_pzs8sxrjxfjjc");
         let local_cache = package.join("LocalCache");
+        let legacy = package.join("LocalCache/Roaming/Claude");
         let unrelated = local.path().join("Packages/OtherApp");
 
-        for root in [&msix, &package, &nested_profile, &local_cache, &unrelated] {
-            std::fs::create_dir_all(
-                root.join("IndexedDB/https_claude.ai_0.indexeddb.leveldb"),
-            )
-            .unwrap();
+        for root in [&msix, &package, &nested_profile, &local_cache, &legacy, &unrelated] {
+            std::fs::create_dir_all(root.join("IndexedDB/https_claude.ai_0.indexeddb.leveldb"))
+                .unwrap();
         }
 
         let roots = windows_storage_roots(local.path());
@@ -900,6 +900,7 @@ mod tests {
         assert!(roots.contains(&package));
         assert!(roots.contains(&nested_profile));
         assert!(roots.contains(&local_cache));
+        assert!(roots.contains(&legacy));
         assert!(!roots.contains(&unrelated));
 
         let home = tempfile::tempdir().unwrap();
@@ -907,5 +908,4 @@ mod tests {
         assert!(all.contains(&msix));
         assert!(all.contains(&package));
     }
-
 }

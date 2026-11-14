@@ -3933,10 +3933,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .map(|(_, _, message)| message)
         .collect();
     if clients.is_empty() || clients.iter().any(|client| client == "claude") {
-        // Claude Desktop's cache databases are read from this home only, never
+        // Claude Desktop's cache databases are read from this home and, when
+        // use_env_roots is enabled, native environment roots. They are never read
         // from a scan path, so their rows keep the local machine label.
-        let desktop =
-            claude_desktop::read_with_env_strategy(Path::new(home_dir), use_env_roots);
+        let desktop = claude_desktop::read_with_env_strategy(Path::new(home_dir), use_env_roots);
         if desktop.coverage.cache_databases > 0 {
             desktop_coverage = Some(desktop.coverage.clone());
         }
