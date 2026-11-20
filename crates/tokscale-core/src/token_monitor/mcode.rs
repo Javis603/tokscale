@@ -47,9 +47,9 @@ const DATA_DIR_BASENAMES: [&str; 2] = [".minimax", ".mavis"];
 /// Data directories to read, in the order MiniMax Code would choose them.
 ///
 /// A non-empty override replaces the home directories, as it does for MiniMax
-/// Code itself; extra `mcode:` directories from `TOKSCALE_EXTRA_DIRS` are
-/// appended afterward so relocated and original stores are read together. Both
-/// environment inputs are ignored when targeting another home (`--home`).
+/// Code itself; extra `mcode:` data directories from `TOKSCALE_EXTRA_DIRS` are
+/// appended afterward so the original and a relocated store are read together.
+/// Both environment inputs are ignored when targeting another home (`--home`).
 /// Otherwise every default and profile directory under the home is read, since
 /// the desktop app and each profile can write to a different one.
 pub fn data_dirs(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
@@ -66,7 +66,7 @@ pub fn data_dirs(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
         if let Some(extra) = non_empty(std::env::var("TOKSCALE_EXTRA_DIRS").ok()) {
             let enabled = HashSet::from([crate::ClientId::Mcode]);
             for (_, path) in crate::scanner::parse_extra_dirs(&extra, &enabled) {
-                dirs.extend(resolve_extra_data_dirs(Path::new(&path)));
+                dirs.push(PathBuf::from(path));
             }
         }
     }
@@ -97,18 +97,6 @@ fn named_data_dirs(root: &Path) -> Vec<PathBuf> {
     profiles.sort();
     dirs.extend(profiles);
     dirs
-}
-
-/// Resolve a configured custom root into MiniMax Code data directories.
-///
-/// Accepts a data directory itself (`.../.minimax`) or a parent directory
-/// containing `.minimax` / `.mavis` / `-<profile>` stores, as the Windows
-/// desktop app's `localRuntimeDataParentDir` points at.
-fn resolve_extra_data_dirs(root: &Path) -> Vec<PathBuf> {
-    if root.join("v2").join("sessions").is_dir() {
-        return vec![root.to_path_buf()];
-    }
-    named_data_dirs(root)
 }
 
 /// One assistant message with usage, as extracted from a history file.
@@ -1049,54 +1037,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn extra_scan_paths_append_relocated_stores_without_double_counting() {
+    fn extra_scan_paths_append_another_data_dir() {
         let mut env = clear_env();
         let home = tempfile::tempdir().unwrap();
-        let parent = tempfile::tempdir().unwrap();
-        let direct = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap().path().join(".minimax");
+        env.set("TOKSCALE_EXTRA_DIRS", format!("mcode:{}", extra.display()));
 
-        // Keep original and relocated copies so overlapping history deduplicates.
-        for (dir, rows) in [
-            (
-                home.path().join(".minimax"),
-                vec![assistant("msg-a", "turn-1", 1791050552292, 704)],
-            ),
-            (
-                parent.path().join(".minimax"),
-                vec![
-                    assistant("msg-a", "turn-1", 1791050552292, 704),
-                    assistant("msg-b", "turn-2", 1791050553292, 800),
-                ],
-            ),
-            (
-                direct.path().join("custom-root"),
-                vec![assistant("msg-c", "turn-3", 1791050554292, 900)],
-            ),
-        ] {
-            fs::write(session_dir(&dir).join("messages.jsonl"), rows.join("\n")).unwrap();
-        }
-
-        env.set(
-            "TOKSCALE_EXTRA_DIRS",
-            format!(
-                "claude:{},mcode:{},mcode:{}",
-                parent.path().display(),
-                parent.path().display(),
-                direct.path().join("custom-root").display()
-            ),
-        );
-
-        let inputs: Vec<i64> = scan(home.path(), true)
-            .iter()
-            .map(|m| m.tokens.input)
-            .collect();
-        assert_eq!(inputs, vec![704, 800, 900]);
+        let dirs = data_dirs(home.path().to_str().unwrap(), true);
+        assert!(dirs.contains(&home.path().join(".minimax")));
+        assert!(dirs.contains(&extra));
 
         // --home scans ignore host TOKSCALE_EXTRA_DIRS just like MINIMAX_DATA_DIR.
-        let scoped: Vec<i64> = scan(home.path(), false)
-            .iter()
-            .map(|m| m.tokens.input)
-            .collect();
-        assert_eq!(scoped, vec![704]);
+        let scoped = data_dirs(home.path().to_str().unwrap(), false);
+        assert!(!scoped.contains(&extra));
     }
 }
