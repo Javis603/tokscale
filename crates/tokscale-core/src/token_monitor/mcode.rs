@@ -1040,7 +1040,8 @@ mod tests {
     fn extra_scan_paths_append_another_data_dir() {
         let mut env = clear_env();
         let home = tempfile::tempdir().unwrap();
-        let extra = tempfile::tempdir().unwrap().path().join(".minimax");
+        let extra_dir = tempfile::tempdir().unwrap();
+        let extra = extra_dir.path().join(".minimax");
         env.set("TOKSCALE_EXTRA_DIRS", format!("mcode:{}", extra.display()));
 
         let dirs = data_dirs(home.path().to_str().unwrap(), true);
