@@ -2875,43 +2875,106 @@ pub(crate) async fn read_reqwest_response_with_cap(
 }
 
 // Check the server side of this connected socket before writing any bytes.
-fn connected_peer_is_owned_by(stream: &TcpStream, pid: u32) -> Result<bool> {
-    let server = stream.peer_addr()?.to_string();
-    let client = stream.local_addr()?.to_string();
-    let pid_text = pid.to_string();
-
+fn peer_ownership_query(pid: &str) -> (&'static str, Vec<&str>) {
     #[cfg(not(target_os = "windows"))]
     {
-        let output = run_command_output(
+        (
             "lsof",
-            &[
-                "-nP",
-                "-a",
-                "-p",
-                &pid_text,
-                "-i4TCP",
-                "-sTCP:ESTABLISHED",
-                "-Fn",
-            ],
-        )?;
-        let pair = format!("n{server}->{client}");
-        Ok(output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == pair))
+            vec!["-nP", "-a", "-p", pid, "-i4TCP", "-sTCP:ESTABLISHED", "-Fn"],
+        )
     }
     #[cfg(target_os = "windows")]
     {
-        let output = run_command_required("netstat", &["-ano", "-p", "TCP"])?;
-        Ok(output.lines().any(|line| {
+        let _ = pid;
+        ("netstat", vec!["-ano", "-p", "TCP"])
+    }
+}
+
+fn owns_connected_peer(
+    output: &str,
+    server: std::net::SocketAddr,
+    client: std::net::SocketAddr,
+    pid: &str,
+) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        let pair = format!("n{server}->{client}");
+        output.lines().any(|line| line == pair)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let server = server.to_string();
+        let client = client.to_string();
+        output.lines().any(|line| {
             let mut columns = line.split_whitespace();
             columns.next() == Some("TCP")
                 && columns.next() == Some(server.as_str())
                 && columns.next() == Some(client.as_str())
                 && columns.next() == Some("ESTABLISHED")
-                && columns.next() == Some(pid_text.as_str())
-        }))
+                && columns.next() == Some(pid)
+        })
     }
+}
+
+fn connected_peer_is_owned_by(stream: &TcpStream, pid: u32) -> Result<bool> {
+    let pid = pid.to_string();
+    let (program, args) = peer_ownership_query(&pid);
+    let output = run_command_output(program, &args)?;
+    Ok(output.status.success()
+        && owns_connected_peer(
+            &String::from_utf8_lossy(&output.stdout),
+            stream.peer_addr()?,
+            stream.local_addr()?,
+            &pid,
+        ))
+}
+
+// The quota discovery round may drop this future. Its socket closes and its
+// ownership subprocess is terminated, so runtime shutdown cannot wait on I/O.
+pub(crate) async fn desktop_quota_rpc(
+    connection: &AntigravityConnection,
+    cap: usize,
+) -> Result<Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const METHOD: &str = "RetrieveUserQuotaSummary";
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], connection.port));
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+    let pid = connection.pid.to_string();
+    let (program, args) = peer_ownership_query(&pid);
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !output.status.success()
+        || !owns_connected_peer(
+            &String::from_utf8_lossy(&output.stdout),
+            stream.peer_addr()?,
+            stream.local_addr()?,
+            &pid,
+        )
+    {
+        anyhow::bail!("Antigravity no longer owns the connected RPC socket");
+    }
+    let request = plain_rpc_request(connection, METHOD, "{}");
+    stream.write_all(request.as_bytes()).await?;
+
+    // Connection: close bounds the response by EOF. Allow wire framing in
+    // addition to the decoded body, which the shared parser caps separately.
+    let wire_cap = cap.saturating_mul(8).saturating_add(64 * 1024);
+    let mut response = Vec::new();
+    stream
+        .take(wire_cap as u64 + 1)
+        .read_to_end(&mut response)
+        .await?;
+    if response.len() > wire_cap {
+        return Err(anyhow::Error::new(RpcBodyCapError {
+            length: response.len(),
+            cap: wire_cap,
+        }));
+    }
+    read_plain_rpc_response(std::io::Cursor::new(response), METHOD, cap)
 }
 
 pub(crate) fn rpc_request_plain_http(
@@ -2937,18 +3000,23 @@ pub(crate) fn rpc_request_plain_http(
     stream.set_write_timeout(Some(timeout.min(Duration::from_secs(5))))?;
 
     let body_text = serde_json::to_string(body)?;
-    let request = format!(
+    let request = plain_rpc_request(connection, method, &body_text);
+    stream.write_all(request.as_bytes())?;
+    read_plain_rpc_response(BufReader::new(stream), method, cap)
+}
+
+fn plain_rpc_request(connection: &AntigravityConnection, method: &str, body_text: &str) -> String {
+    format!(
         "POST /exa.language_server_pb.LanguageServerService/{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnect-Protocol-Version: 1\r\nX-Codeium-Csrf-Token: {}\r\nConnection: close\r\n\r\n{}",
         method,
         connection.port,
         body_text.len(),
         connection.csrf_token,
         body_text
-    );
+    )
+}
 
-    stream.write_all(request.as_bytes())?;
-
-    let mut reader = BufReader::new(stream);
+fn read_plain_rpc_response(mut reader: impl BufRead, method: &str, cap: usize) -> Result<Value> {
     let mut status_line = String::new();
     reader.read_line(&mut status_line)?;
 
@@ -3038,10 +3106,7 @@ fn read_chunked_body_prefix(
     Ok(String::from_utf8(body)?)
 }
 
-fn read_chunked_body_with_cap(
-    reader: &mut BufReader<TcpStream>,
-    max_body_bytes: usize,
-) -> Result<String> {
+fn read_chunked_body_with_cap(reader: &mut impl BufRead, max_body_bytes: usize) -> Result<String> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
@@ -4252,6 +4317,50 @@ mod tests {
         );
         assert_eq!(listeners, vec![4321]);
         assert_eq!(candidate_probe_ports(&candidates[0], listeners), vec![4321]);
+    }
+
+    #[tokio::test]
+    async fn desktop_quota_cancellation_closes_a_stalled_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (program, _) = peer_ownership_query("");
+        if run_command_output(program, &[]).is_err_and(|error| is_command_not_found(&error)) {
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n{}") {
+                request.push(peer.read_u8().await.unwrap());
+            }
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{")
+                .await
+                .unwrap();
+            started_tx.send(()).unwrap();
+            assert_eq!(peer.read(&mut [0_u8; 1]).await.unwrap(), 0);
+        });
+        let connection = AntigravityConnection {
+            pid: std::process::id(),
+            port,
+            verify_peer: true,
+            csrf_token: "fixture-token".into(),
+            fingerprint: "fixture".into(),
+        };
+        let mut request = Box::pin(desktop_quota_rpc(&connection, 1024));
+        tokio::select! {
+            result = &mut request => panic!("quota request finished before the server stalled: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), started_rx) => result.unwrap().unwrap(),
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), request)
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

@@ -425,16 +425,8 @@ async fn call_rpc(
 ) -> Result<QuotaSummary> {
     let token: Option<String> = match csrf_token {
         TargetCsrfToken::VerifiedDesktop(connection) => {
-            let body = tokio::task::spawn_blocking(move || {
-                crate::antigravity::rpc_request_plain_http(
-                    &connection,
-                    "RetrieveUserQuotaSummary",
-                    &serde_json::json!({}),
-                    DISCOVERY_ROUND_TIMEOUT,
-                    MAX_QUOTA_BODY_BYTES,
-                )
-            })
-            .await??;
+            let body =
+                crate::antigravity::desktop_quota_rpc(&connection, MAX_QUOTA_BODY_BYTES).await?;
             return Ok(serde_json::from_value::<QuotaSummaryEnvelope>(body)?.response);
         }
         TargetCsrfToken::Token(t) => Some(t),
