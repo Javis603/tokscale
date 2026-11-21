@@ -2526,7 +2526,7 @@ fn run_models_report(
     hide_zero: bool,
 ) -> Result<()> {
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_model_report_with_entry_pricing, GroupBy};
+    use tokscale_core::{get_model_report_v2, GroupBy};
 
     let mut context = LocalReportContext::new_in_timezone(
         home_dir,
@@ -2536,9 +2536,9 @@ fn run_models_report(
         bucket_timezone,
     );
     let rt = Runtime::new()?;
-    let (report, mut unpriced_tokens) = rt
+    let report = rt
         .block_on(async {
-            get_model_report_with_entry_pricing(
+            get_model_report_v2(
                 context.report_options_with_rollup(group_by.clone(), worktree_rollup),
             )
             .await
@@ -2552,20 +2552,15 @@ fn run_models_report(
     if hide_zero {
         // Display-only filter: totals were computed in core over the full
         // entry set and intentionally still include the hidden rows.
-        (report.entries, unpriced_tokens) = report
-            .entries
-            .into_iter()
-            .zip(unpriced_tokens)
-            .filter(|(e, _)| {
-                e.input != 0
-                    || e.output != 0
-                    || e.cache_read != 0
-                    || e.cache_write != 0
-                    || e.reasoning != 0
-                    || e.cost != 0.0
-                    || e.performance.total_duration_ms != 0
-            })
-            .unzip();
+        report.entries.retain(|e| {
+            e.input != 0
+                || e.output != 0
+                || e.cache_read != 0
+                || e.cache_write != 0
+                || e.reasoning != 0
+                || e.cost != 0.0
+                || e.performance.total_duration_ms != 0
+        });
     }
     let report = report;
 
@@ -2620,8 +2615,6 @@ fn run_models_report(
             reasoning: i64,
             message_count: i32,
             cost: f64,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            unpriced_tokens: Option<i64>,
             performance: tokscale_core::ModelPerformance,
         }
 
@@ -2704,8 +2697,7 @@ fn run_models_report(
             entries: report
                 .entries
                 .into_iter()
-                .zip(unpriced_tokens)
-                .map(|(e, unpriced_tokens)| ModelUsageJson {
+                .map(|e| ModelUsageJson {
                     workspace_key: if matches!(
                         group_by,
                         GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
@@ -2750,7 +2742,6 @@ fn run_models_report(
                     reasoning: e.reasoning,
                     message_count: e.message_count,
                     cost: e.cost,
-                    unpriced_tokens,
                     performance: e.performance,
                 })
                 .collect(),
