@@ -6448,7 +6448,10 @@ fn aggregate_model_usage_entries_with_rollup(
     for msg in &messages {
         fold.add(msg);
     }
-    fold.finish()
+    fold.finish_with_labeler(&mut WorkspaceLabeler::default())
+        .into_iter()
+        .map(|row| row.usage)
+        .collect()
 }
 
 #[cfg(test)]
@@ -6464,11 +6467,15 @@ fn aggregate_model_usage_entries_with_labeler(
         fold.add(message);
     }
     fold.finish_with_labeler(labeler)
+        .into_iter()
+        .map(|row| row.usage)
+        .collect()
 }
 
 /// A model-report row while messages are still being folded into it.
 struct ModelUsageRow {
     usage: ModelUsage,
+    unpriced_tokens: Option<i64>,
     /// Workspace grouping key of the message that opened the row. Its
     /// disambiguated label is only known once every message has been seen.
     workspace_group_key: String,
@@ -6591,6 +6598,7 @@ impl ModelUsageFold {
                 cost: 0.0,
                 performance: ModelPerformance::default(),
             },
+            unpriced_tokens: None,
             workspace_group_key: workspace_group_key.clone(),
         });
         let entry = &mut row.usage;
@@ -6622,16 +6630,20 @@ impl ModelUsageFold {
         entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
+        if msg.cost_source == CostSource::Unknown
+            && pricing::lookup::antigravity_orchestrator_model_part(&msg.model_id).is_some()
+        {
+            let tokens = positive_token_total(&msg.tokens);
+            if tokens > 0 {
+                row.unpriced_tokens = Some(row.unpriced_tokens.unwrap_or(0).saturating_add(tokens));
+            }
+        }
         entry
             .performance
             .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
     }
 
-    fn finish(self) -> Vec<ModelUsage> {
-        self.finish_with_labeler(&mut WorkspaceLabeler::default())
-    }
-
-    fn finish_with_labeler(mut self, labeler: &mut WorkspaceLabeler) -> Vec<ModelUsage> {
+    fn finish_with_labeler(mut self, labeler: &mut WorkspaceLabeler) -> Vec<ModelUsageRow> {
         let label_overrides = if matches!(
             self.group_by,
             GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
@@ -6641,11 +6653,11 @@ impl ModelUsageFold {
             HashMap::new()
         };
 
-        let mut entries: Vec<ModelUsage> = self
+        let mut entries: Vec<ModelUsageRow> = self
             .rows
             .into_values()
-            .map(|row| {
-                let mut entry = row.usage;
+            .map(|mut row| {
+                let entry = &mut row.usage;
                 if let Some(label) = label_overrides.get(&row.workspace_group_key) {
                     entry.workspace_label = Some(label.clone());
                 }
@@ -6661,17 +6673,17 @@ impl ModelUsageFold {
                 providers.sort_unstable();
                 providers.dedup();
                 entry.provider = providers.join(", ");
-                entry
+                row
             })
             .collect();
-        entries.sort_by(|a, b| match (a.cost.is_nan(), b.cost.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => b
-                .cost
-                .partial_cmp(&a.cost)
-                .unwrap_or(std::cmp::Ordering::Equal),
+        entries.sort_by(|a, b| {
+            let (a, b) = (a.usage.cost, b.usage.cost);
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
+            }
         });
 
         *labeler = self.labeler;
@@ -6739,8 +6751,12 @@ impl<'a> ModelReportSink<'a> {
     }
 
     /// The report rows, and the Claude Desktop usage that has no known date.
-    fn finish(self) -> (Vec<ModelUsage>, TokenBreakdown) {
-        (self.fold.finish(), self.undated_tokens)
+    fn finish(self) -> (Vec<ModelUsageRow>, TokenBreakdown) {
+        (
+            self.fold
+                .finish_with_labeler(&mut WorkspaceLabeler::default()),
+            self.undated_tokens,
+        )
     }
 }
 
@@ -6762,6 +6778,14 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
 
 /// Generate model totals together with undated usage and Desktop coverage.
 pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2, String> {
+    Ok(get_model_report_with_entry_pricing(options).await?.0)
+}
+
+/// Report data plus unpriced token counts in the same order as its entries.
+/// The CLI can add price coverage without changing the existing Rust row type.
+pub async fn get_model_report_with_entry_pricing(
+    options: ReportOptions,
+) -> Result<(ModelReportV2, Vec<Option<i64>>), String> {
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -6818,7 +6842,11 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
         )
         .coverage
     };
-    let (entries, undated_tokens) = sink.finish();
+    let (rows, undated_tokens) = sink.finish();
+    let (entries, unpriced_tokens): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .map(|row| (row.usage, row.unpriced_tokens))
+        .unzip();
     let workspaces = workspace_metadata_for_entries(&entries, &mut WorkspaceLabeler::default());
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
@@ -6829,7 +6857,7 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
     // any non-zero total.
     let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
 
-    Ok(ModelReportV2 {
+    let report = ModelReportV2 {
         undated_tokens,
         claude_desktop_cache,
         report: ModelReport {
@@ -6844,7 +6872,8 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
             total_cost,
             processing_time_ms: start.elapsed().as_millis() as u32,
         },
-    })
+    };
+    Ok((report, unpriced_tokens))
 }
 
 #[derive(Default)]
@@ -13457,6 +13486,48 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].input, i64::MAX);
         assert_eq!(entries[0].cache_read, i64::MAX);
+    }
+
+    #[test]
+    fn model_report_marks_unpriced_orchestrator_tokens_alongside_known_cost() {
+        let make = |model: &str, input, cost, source| {
+            let mut message = UnifiedMessage::new(
+                "antigravity-cli",
+                model,
+                "google",
+                "session",
+                0,
+                TokenBreakdown {
+                    input,
+                    ..Default::default()
+                },
+                cost,
+            );
+            message.cost_source = source;
+            message
+        };
+        let orchestrator = "gemini-pro-orchestrator-neon";
+        let mut fold =
+            super::ModelUsageFold::new(&GroupBy::ClientSession, WorktreeRollup::default());
+        for message in [
+            make(orchestrator, 10, 0.0, CostSource::Unknown),
+            make(orchestrator, 20, 0.0, CostSource::Unknown),
+            make(orchestrator, 40, 0.25, CostSource::Estimated),
+            make("gemini-4-neon", 50, 0.5, CostSource::Estimated),
+        ] {
+            fold.add(&message);
+        }
+        let entries = fold.finish_with_labeler(&mut super::WorkspaceLabeler::default());
+        let row = entries
+            .iter()
+            .find(|row| row.usage.model == orchestrator)
+            .unwrap();
+        assert_eq!(row.usage.input, 70);
+        assert_eq!(row.usage.message_count, 3);
+        assert_eq!(row.usage.cost, 0.25);
+        assert_eq!(row.unpriced_tokens, Some(30));
+        assert_eq!(entries[0].usage.model, "gemini-4-neon");
+        assert_eq!(entries[0].unpriced_tokens, None);
     }
 
     #[test]
@@ -33678,7 +33749,8 @@ mod tests {
                     for message in messages.clone() {
                         sink.accept(message);
                     }
-                    let (entries, undated_tokens) = sink.finish();
+                    let (rows, undated_tokens) = sink.finish();
+                    let entries: Vec<_> = rows.into_iter().map(|row| row.usage).collect();
 
                     let filtered = filter_messages_for_report(messages.clone(), &options);
                     let mut expected_undated = TokenBreakdown::default();
