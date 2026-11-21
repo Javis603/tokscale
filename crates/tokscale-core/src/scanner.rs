@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 
 use crate::clients::{ClientId, PathRoot};
 use crate::sessions::{normalize_workspace_key, workspace_label_from_key};
+use crate::token_monitor::{is_mcode_runtime_history, mcode_runtime_session_roots};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -3283,6 +3284,7 @@ fn scan_all_clients_with_env_strategy_inner(
     // its path selection until V2 can win over a V1 counterpart.
     let mut seen: HashSet<(ClientId, PathBuf)> = HashSet::new();
     let mut cherry_files: Vec<(bool, String, PathBuf)> = Vec::new();
+    let mut mcode_runtime_roots = None;
     for (client_id, root, files) in scan_results {
         for file in files {
             if client_id == ClientId::CherryStudio {
@@ -3295,6 +3297,19 @@ fn scan_all_clients_with_env_strategy_inner(
                 cherry_files.push((is_v2, rel, file));
             } else {
                 let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                // An extra mcode root can feed both parsers. Route runtime
+                // history exclusively through the store's cached reader.
+                if client_id == ClientId::Mcode
+                    && is_mcode_runtime_history(
+                        &file,
+                        &key,
+                        mcode_runtime_roots.get_or_insert_with(|| {
+                            mcode_runtime_session_roots(home_dir, use_env_roots)
+                        }),
+                    )
+                {
+                    continue;
+                }
                 if seen.insert((client_id, key)) {
                     result.get_mut(client_id).push(file);
                 }

@@ -28,6 +28,11 @@ mod js;
 mod mcode;
 mod qodercn;
 
+pub(crate) use mcode::{
+    is_runtime_history as is_mcode_runtime_history,
+    runtime_session_roots as mcode_runtime_session_roots,
+};
+
 use crate::sessions::UnifiedMessage;
 use crate::{ClientCounts, ClientId};
 use std::collections::HashMap;
