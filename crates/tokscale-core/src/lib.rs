@@ -6710,14 +6710,14 @@ fn unpriced_antigravity_tokens(
     }
 
     let tokens = &message.tokens;
-    if message.cost_source == CostSource::Unknown {
-        return positive_token_total(tokens);
-    }
-
     let Some(rate) =
         pricing.and_then(|pricing| pricing.resolve_context(&message.pricing_context(), tokens))
     else {
-        return 0;
+        return if message.cost_source == CostSource::Unknown {
+            positive_token_total(tokens)
+        } else {
+            0
+        };
     };
     rate.pricing
         .uncovered_buckets(tokens)
@@ -13563,15 +13563,18 @@ mod tests {
         partial.tokens.cache_read = 500;
         let mut fold =
             super::ModelUsageFold::new(&GroupBy::ClientSession, WorktreeRollup::default());
-        for message in [
-            make(orchestrator, 10, 0.0, CostSource::Unknown),
-            make(orchestrator, 20, 0.0, CostSource::Unknown),
-            partial,
-            make("gemini-4-neon", 50, 0.5, CostSource::Estimated),
+        for (message, tariff) in [
+            (make(orchestrator, 10, 0.0, CostSource::Unknown), None),
+            (make(orchestrator, 20, 0.0, CostSource::Unknown), None),
+            (partial, Some(&pricing)),
+            (
+                make("gemini-4-neon", 50, 0.5, CostSource::Estimated),
+                Some(&pricing),
+            ),
         ] {
             fold.add(
                 &message,
-                super::unpriced_antigravity_tokens(&message, Some(&pricing)),
+                super::unpriced_antigravity_tokens(&message, tariff),
             );
         }
         let entries = fold.finish_with_labeler(&mut super::WorkspaceLabeler::default());
@@ -13585,6 +13588,23 @@ mod tests {
         assert_eq!(row.unpriced_tokens, Some(530));
         assert_eq!(entries[0].usage.model, "gemini-4-neon");
         assert_eq!(entries[0].unpriced_tokens, None);
+
+        let zero_cache_pricing = pricing::PricingService::new(
+            std::collections::HashMap::from([(
+                "gemini-4-neon".into(),
+                pricing::litellm::ModelPricing {
+                    cache_read_input_token_cost: Some(0.0),
+                    ..Default::default()
+                },
+            )]),
+            std::collections::HashMap::new(),
+        );
+        let mut zero_subtotal = make(orchestrator, 40, 0.0, CostSource::Unknown);
+        zero_subtotal.tokens.cache_read = 500;
+        assert_eq!(
+            super::unpriced_antigravity_tokens(&zero_subtotal, Some(&zero_cache_pricing)),
+            40
+        );
     }
 
     #[test]
