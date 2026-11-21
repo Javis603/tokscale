@@ -250,7 +250,10 @@ impl ResolutionEvidence {
                 return Some(SubmissionSafetyGap::UnverifiedProviderIdentity);
             }
             ResolutionKind::Fuzzy | ResolutionKind::ProviderScoped => {}
-            _ => return None,
+            _ => {
+                return (!self.exact_model_identity)
+                    .then_some(SubmissionSafetyGap::UnverifiedModelIdentity);
+            }
         }
         if !self.price_consensus {
             return Some(SubmissionSafetyGap::PriceDisagreement);
@@ -832,11 +835,28 @@ impl PricingLookup {
         };
 
         let direct = do_lookup(lower_ref).map(annotate_direct);
-        // Antigravity's orchestrator labels identify a route. Without a rate
-        // for that exact label, we cannot tell which model's price to apply.
-        if let Some(requested_model) = antigravity_orchestrator_model_part(lower_ref) {
-            return direct
-                .filter(|result| terminal_model_identity(&result.matched_key) == requested_model);
+        if let Some(requested_model) = antigravity_pricing_route_model_part(lower_ref) {
+            if let Some(exact) =
+                direct.filter(|row| terminal_model_identity(&row.matched_key) == requested_model)
+            {
+                return Some(exact);
+            }
+            // These recorded Antigravity routes have verified planner and
+            // executor roles. Use those models for local API-equivalent cost,
+            // while keeping the route IDs in reports and requiring separate
+            // billing evidence for submission.
+            let pricing_model = match requested_model {
+                "gemini-pro-orchestrator-neon" => "gemini-4-neon",
+                "gemini-flash-worker-agy" => "gemini-4-hydrogen",
+                _ => return None,
+            };
+            return do_lookup(pricing_model)
+                .filter(|row| terminal_model_identity(&row.matched_key) == pricing_model)
+                .map(|row| {
+                    let mut row = row.with_alias();
+                    row.evidence.exact_model_identity = false;
+                    row
+                });
         }
 
         // 1. Try direct lookup
@@ -3979,9 +3999,12 @@ fn pricing_rows_equal(left: &ModelPricing, right: &ModelPricing) -> bool {
         })
 }
 
-pub(crate) fn antigravity_orchestrator_model_part(model_id: &str) -> Option<&str> {
+pub(crate) fn antigravity_pricing_route_model_part(model_id: &str) -> Option<&str> {
     const STEM: &str = "gemini-pro-orchestrator";
     let model = model_id.rsplit('/').next()?;
+    if model.eq_ignore_ascii_case("gemini-flash-worker-agy") {
+        return Some(model);
+    }
     let (stem, suffix) = model.split_at_checked(STEM.len())?;
     (stem.eq_ignore_ascii_case(STEM) && (suffix.is_empty() || suffix.starts_with('-')))
         .then_some(model)
@@ -7490,25 +7513,44 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_orchestrator_requires_its_own_catalog_price() {
+    fn antigravity_routes_use_verified_pricing_aliases_without_fuzzy_fallback() {
         let rate = ModelPricing {
             input_cost_per_token: Some(2e-6),
             output_cost_per_token: Some(12e-6),
             cache_read_input_token_cost: Some(2e-7),
             ..Default::default()
         };
-        let mut litellm = HashMap::from([("gemini/gemini-pro-latest".into(), rate.clone())]);
-        let openrouter = HashMap::from([("google/gemini-4-neon".into(), rate.clone())]);
+        let mut litellm = HashMap::from([
+            ("gemini/gemini-pro-latest".into(), rate.clone()),
+            ("gemini/gemini-flash-lite-latest".into(), rate.clone()),
+        ]);
+        let openrouter = HashMap::from([
+            ("google/gemini-4-neon".into(), rate.clone()),
+            ("google/gemini-4-hydrogen".into(), rate.clone()),
+        ]);
         let lookup = PricingLookup::new(litellm.clone(), openrouter.clone(), HashMap::new());
 
         for model in [
             "gemini-pro-orchestrator",
-            "gemini-pro-orchestrator-neon",
             "gemini-pro-orchestrator-carbon",
             "gemini-pro-orchestrator-argon",
+            "gemini-pro-orchestrator-neon-high",
         ] {
             assert!(lookup.lookup(model).is_none(), "{model}");
             assert!(lookup.lookup_with_source(model, Some("litellm")).is_none());
+        }
+        for (raw, expected) in [
+            ("gemini-pro-orchestrator-neon", "google/gemini-4-neon"),
+            ("gemini-flash-worker-agy", "google/gemini-4-hydrogen"),
+        ] {
+            for hint in [None, Some("google")] {
+                let result = lookup.lookup_with_provider(raw, hint).unwrap();
+                assert_eq!(result.matched_key, expected);
+                assert!(result.evidence.alias_applied);
+                assert!(!result.evidence.exact_model_identity);
+                assert!(!result.evidence.is_submission_safe());
+            }
+            assert!(lookup.lookup_with_source(raw, Some("litellm")).is_none());
         }
         assert_eq!(
             lookup.lookup("gemini-4-neon").unwrap().matched_key,
@@ -7519,7 +7561,6 @@ mod tests {
         litellm.insert(neon.into(), rate);
         let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
         assert_eq!(lookup.lookup(neon).unwrap().matched_key, neon);
-        assert!(lookup.lookup("gemini-pro-orchestrator-neon-high").is_none());
     }
 
     #[test]

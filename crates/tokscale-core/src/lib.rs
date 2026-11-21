@@ -6631,7 +6631,7 @@ impl ModelUsageFold {
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
         if msg.cost_source == CostSource::Unknown
-            && pricing::lookup::antigravity_orchestrator_model_part(&msg.model_id).is_some()
+            && pricing::lookup::antigravity_pricing_route_model_part(&msg.model_id).is_some()
         {
             let tokens = positive_token_total(&msg.tokens);
             if tokens > 0 {
