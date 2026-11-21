@@ -70,7 +70,7 @@ const RPC_PATH: &str = "/exa.language_server_pb.LanguageServerService/RetrieveUs
 /// second an expired deadline, and `tokio::time::timeout_at` resolves an
 /// expired deadline by polling once and dropping the task set, so the second
 /// source's requests were abandoned before a socket was opened. Neither round
-/// covers [`crate::antigravity::detect_antigravity_connections`], which is
+/// covers [`crate::antigravity::detect_legacy_antigravity_connections`], which is
 /// synchronous and carries per-socket timeouts of its own.
 ///
 /// Bounded at all because usage providers share a fan-out: whatever this
@@ -805,7 +805,7 @@ fn register_antigravity_hook_with(before_replace: impl FnOnce()) -> Result<PathB
 ///    when populated by an Antigravity `SessionStart` lifecycle hook.
 /// 3. The CLI log, which records `listening on random port at NNNN for HTTP`
 ///    on every start. Reading one file beats enumerating processes.
-/// 4. [`crate::antigravity::detect_antigravity_connections`], which finds the
+/// 4. [`crate::antigravity::detect_legacy_antigravity_connections`], which finds the
 ///    IDE's language server. That path extracts `--csrf_token` and the declared
 ///    or listening port from the running process.
 ///
@@ -948,7 +948,7 @@ fn targets_from_cli_log() -> Vec<CandidateTarget> {
 
 /// Candidate targets of IDE language servers found by scanning processes.
 fn detected_targets() -> Vec<CandidateTarget> {
-    crate::antigravity::detect_antigravity_connections()
+    crate::antigravity::detect_legacy_antigravity_connections()
         .map(|connections| {
             connections
                 .into_iter()

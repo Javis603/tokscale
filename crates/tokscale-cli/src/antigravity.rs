@@ -69,8 +69,7 @@ impl SyncDeadline {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-static HTTPS_RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[cfg(not(target_os = "windows"))]
 static HTTPS_RPC_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -152,10 +151,11 @@ pub struct AntigravityManifest {
     pub sessions: Vec<ManifestSessionEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityConnection {
     pub pid: u32,
     pub port: u16,
+    pub(crate) verify_peer: bool,
     pub csrf_token: String,
     pub fingerprint: String,
 }
@@ -165,7 +165,58 @@ struct ProcessCandidate {
     pid: u32,
     ppid: u32,
     declared_port: Option<u16>,
+    daemon_port: Option<u16>,
     csrf_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopHub {
+    pid: u32,
+    http_port: u16,
+    csrf_token: String,
+}
+
+fn read_desktop_hubs(directory: &Path) -> HashMap<u32, DesktopHub> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return HashMap::new();
+    };
+    let mut hubs = HashMap::new();
+    for entry in entries.flatten() {
+        let Some(port) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("hub_"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+        else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > 4096 {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(hub) = serde_json::from_slice::<DesktopHub>(&bytes) else {
+            continue;
+        };
+        if hub.http_port != port || !valid_csrf_token(&hub.csrf_token) {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        if hubs
+            .get(&hub.pid)
+            .is_none_or(|(previous, _)| modified > *previous)
+        {
+            hubs.insert(hub.pid, (modified, hub));
+        }
+    }
+    hubs.into_iter().map(|(pid, (_, hub))| (pid, hub)).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,8 +422,11 @@ fn sync_antigravity_cache_impl_with_deadline(
 
     let manifest = load_antigravity_manifest()?;
     let mut outcome = SyncCacheOutcome::default();
-    let (summaries, list_errors) =
-        list_trajectory_summaries_with_errors(connections, deadline.as_ref());
+    let mut rpc = SyncRpc {
+        deadline: deadline.as_ref(),
+        ..SyncRpc::default()
+    };
+    let (summaries, list_errors) = list_trajectory_summaries_with_errors(connections, &mut rpc);
     outcome.failed_sessions += list_errors.len();
     if let Some(err) = list_errors.into_iter().next() {
         outcome.partial_error = Some(err);
@@ -399,7 +453,7 @@ fn sync_antigravity_cache_impl_with_deadline(
 
     for candidate in &export_candidates {
         if let Some(summary) = find_summary_for_candidate(&summaries, &candidate.session_id) {
-            match fetch_session_artifact(summary, connections, &mut enrichment, deadline.as_ref()) {
+            match fetch_session_artifact(summary, connections, &mut enrichment, &mut rpc) {
                 Ok(Some(artifact)) => {
                     let path = write_session_artifact(&summary.session_id, &artifact.contents)?;
                     let relative_path = to_relative_artifact_path(&path)?;
@@ -467,7 +521,7 @@ fn sync_antigravity_cache_impl_with_deadline(
             connections,
             candidate,
             &mut enrichment,
-            deadline.as_ref(),
+            &mut rpc,
         ) {
             Ok(Some(entry)) => {
                 next_manifest.sessions.push(entry);
@@ -568,6 +622,8 @@ pub fn run_antigravity_status(json: bool) -> Result<()> {
     let cache_dir = get_antigravity_cache_dir()?;
     let sessions_dir = get_antigravity_sessions_dir()?;
     let manifest_path = get_antigravity_manifest_path()?;
+    // Report exactly the live servers available to usage sync. This
+    // uses sync discovery (including its authenticated desktop heartbeat).
     let connections = detect_antigravity_connections()?;
     let manifest = load_antigravity_manifest()?;
 
@@ -1260,19 +1316,49 @@ fn bool_label(value: bool) -> &'static str {
 }
 
 pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
-    let candidates = detect_process_candidates()?;
+    connections_from_candidates(detect_process_candidates(true)?, true)
+}
+
+pub(crate) fn detect_legacy_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
+    connections_from_candidates(detect_process_candidates(false)?, false)
+}
+
+fn connections_from_candidates(
+    candidates: Vec<ProcessCandidate>,
+    include_desktop_descriptors: bool,
+) -> Result<Vec<AntigravityConnection>> {
     let mut connections = Vec::new();
 
     for candidate in candidates {
-        let ports = candidate_probe_ports(&candidate, find_listening_ports(candidate.pid)?);
+        // The legacy quota client does not verify ownership of its socket.
+        if !include_desktop_descriptors && candidate.daemon_port.is_some() {
+            continue;
+        }
+        let listeners = find_listening_ports(candidate.pid, candidate.daemon_port.is_some())?;
+        let ports = candidate_probe_ports(&candidate, listeners);
         for port in ports {
-            if probe_heartbeat(port, &candidate.csrf_token) {
-                connections.push(AntigravityConnection {
-                    pid: candidate.pid,
-                    port,
-                    csrf_token: candidate.csrf_token.clone(),
-                    fingerprint: format!("pid:{}:port:{}", candidate.pid, port),
-                });
+            let connection = AntigravityConnection {
+                pid: candidate.pid,
+                port,
+                verify_peer: candidate.daemon_port.is_some(),
+                csrf_token: candidate.csrf_token.clone(),
+                fingerprint: format!("pid:{}:port:{}", candidate.pid, port),
+            };
+            let reachable = if connection.verify_peer {
+                let body = serde_json::json!({ "uuid": "00000000-0000-0000-0000-000000000000" });
+                rpc_request_plain_http(
+                    &connection,
+                    "Heartbeat",
+                    &body,
+                    DEFAULT_RPC_TIMEOUT,
+                    MAX_IDENTITY_PROBE_BYTES,
+                )
+                .is_ok_and(|response| heartbeat_value_looks_well_formed(&response))
+            } else {
+                probe_heartbeat(port, &candidate.csrf_token)
+            };
+            if reachable {
+                connections.push(connection);
                 break;
             }
         }
@@ -1290,6 +1376,10 @@ pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
 }
 
 fn candidate_probe_ports(candidate: &ProcessCandidate, mut ports: Vec<u16>) -> Vec<u16> {
+    if let Some(port) = candidate.daemon_port {
+        // A stale descriptor must not send its credential to a recycled port.
+        return ports.contains(&port).then_some(port).into_iter().collect();
+    }
     if let Some(declared_port) = candidate.declared_port {
         if !ports.contains(&declared_port) {
             ports.push(declared_port);
@@ -1301,20 +1391,29 @@ fn candidate_probe_ports(candidate: &ProcessCandidate, mut ports: Vec<u16>) -> V
     ports
 }
 
-fn detect_process_candidates() -> Result<Vec<ProcessCandidate>> {
+fn detect_process_candidates(include_desktop_descriptors: bool) -> Result<Vec<ProcessCandidate>> {
+    let desktop_hubs = if include_desktop_descriptors {
+        home_dir()
+            .map(|home| read_desktop_hubs(&home.join(".gemini/antigravity/daemon")))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     #[cfg(target_os = "windows")]
     {
-        return detect_windows_process_candidates();
+        return detect_windows_process_candidates(&desktop_hubs);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        detect_unix_process_candidates()
+        detect_unix_process_candidates(&desktop_hubs)
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn detect_unix_process_candidates() -> Result<Vec<ProcessCandidate>> {
+fn detect_unix_process_candidates(
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Result<Vec<ProcessCandidate>> {
     let output = run_command("ps", &["-ww", "-eo", "pid,ppid,args"])?;
     let mut candidates = Vec::new();
 
@@ -1352,24 +1451,16 @@ fn detect_unix_process_candidates() -> Result<Vec<ProcessCandidate>> {
         let exe_ok = process_executable_path(pid)
             .map(|path| {
                 let lower = path.to_string_lossy().to_lowercase();
-                lower.contains("antigravity") || lower.contains("language_server")
+                lower.contains("antigravity") || is_language_server_text(&lower)
             })
             .unwrap_or(true);
         if !exe_ok {
             continue;
         }
 
-        let Some(csrf_token) = extract_csrf_token(&command) else {
-            continue;
-        };
-        let declared_port = extract_declared_port(&command);
-
-        candidates.push(ProcessCandidate {
-            pid,
-            ppid,
-            declared_port,
-            csrf_token,
-        });
+        if let Some(candidate) = process_candidate(pid, ppid, &command, desktop_hubs) {
+            candidates.push(candidate);
+        }
     }
 
     candidates.sort_by(|left, right| {
@@ -1385,7 +1476,9 @@ fn detect_unix_process_candidates() -> Result<Vec<ProcessCandidate>> {
 }
 
 #[cfg(target_os = "windows")]
-fn detect_windows_process_candidates() -> Result<Vec<ProcessCandidate>> {
+fn detect_windows_process_candidates(
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Result<Vec<ProcessCandidate>> {
     let script = "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress";
     let output = run_windows_powershell(script)?;
     if output.trim().is_empty() {
@@ -1393,11 +1486,14 @@ fn detect_windows_process_candidates() -> Result<Vec<ProcessCandidate>> {
             "Windows process discovery returned no data; cannot discover Antigravity language servers"
         );
     }
-    parse_windows_process_candidates(&output)
+    parse_windows_process_candidates(&output, desktop_hubs)
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn parse_windows_process_candidates(output: &str) -> Result<Vec<ProcessCandidate>> {
+fn parse_windows_process_candidates(
+    output: &str,
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Result<Vec<ProcessCandidate>> {
     let value: Value = serde_json::from_str(output.trim())
         .context("Failed to parse Windows process discovery JSON")?;
     let items: Vec<&Value> = match &value {
@@ -1436,17 +1532,9 @@ fn parse_windows_process_candidates(output: &str) -> Result<Vec<ProcessCandidate
             continue;
         }
 
-        let Some(csrf_token) = extract_csrf_token(command) else {
-            continue;
-        };
-        let declared_port = extract_declared_port(command);
-
-        candidates.push(ProcessCandidate {
-            pid,
-            ppid,
-            declared_port,
-            csrf_token,
-        });
+        if let Some(candidate) = process_candidate(pid, ppid, command, desktop_hubs) {
+            candidates.push(candidate);
+        }
     }
 
     candidates.sort_by(|left, right| {
@@ -1472,7 +1560,7 @@ fn windows_candidate_executable_ok(executable_path: Option<&str>, command: &str)
 #[cfg(any(test, target_os = "windows"))]
 fn executable_path_looks_antigravity(path: &str) -> bool {
     let lower = path.to_lowercase();
-    lower.contains("antigravity") || lower.contains("language_server")
+    lower.contains("antigravity") || is_language_server_text(&lower)
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -1485,9 +1573,13 @@ fn command_line_executable_looks_antigravity(command: &str) -> bool {
     executable_path_looks_antigravity(first)
 }
 
+fn is_language_server_text(lower: &str) -> bool {
+    lower.contains("language_server") || lower.contains("language-server")
+}
+
 fn is_antigravity_process(command: &str) -> bool {
     let lower = command.to_lowercase();
-    (lower.contains("language_server")
+    (is_language_server_text(&lower)
         && (lower.contains("antigravity") || lower.contains("--app_data_dir antigravity")))
         || lower.contains("/antigravity/")
         || lower.contains("\\antigravity\\")
@@ -1520,13 +1612,44 @@ fn process_executable_path(pid: u32) -> Option<PathBuf> {
     }
 }
 
-fn extract_csrf_token(command: &str) -> Option<String> {
-    let token = extract_flag_value(command, "--csrf_token")?;
-    if token.len() >= 32 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-') {
-        Some(token)
+fn process_candidate(
+    pid: u32,
+    ppid: u32,
+    command: &str,
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Option<ProcessCandidate> {
+    let (csrf_token, daemon_port) = if let Some(token) = extract_csrf_token(command) {
+        (token, None)
     } else {
-        None
-    }
+        // Bind a desktop descriptor to a live desktop language-server process.
+        // CLI and editor-extension processes can coexist under the same home.
+        let lower = command.to_ascii_lowercase();
+        if !is_language_server_text(&lower)
+            || !lower
+                .split_whitespace()
+                .any(|arg| arg == "--read_host_bridge_token_from_stdin")
+            || extract_flag_value(&lower, "--app_data_dir").as_deref() != Some("antigravity")
+        {
+            return None;
+        }
+        let hub = desktop_hubs.get(&pid)?;
+        (hub.csrf_token.clone(), Some(hub.http_port))
+    };
+    Some(ProcessCandidate {
+        pid,
+        ppid,
+        declared_port: extract_declared_port(command),
+        daemon_port,
+        csrf_token,
+    })
+}
+
+fn valid_csrf_token(token: &str) -> bool {
+    token.len() >= 32 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+}
+
+fn extract_csrf_token(command: &str) -> Option<String> {
+    extract_flag_value(command, "--csrf_token").filter(|token| valid_csrf_token(token))
 }
 
 fn extract_declared_port(command: &str) -> Option<u16> {
@@ -1552,21 +1675,29 @@ fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-fn find_listening_ports(pid: u32) -> Result<Vec<u16>> {
+fn find_listening_ports(pid: u32, ipv4_loopback_only: bool) -> Result<Vec<u16>> {
     #[cfg(target_os = "windows")]
     {
-        return find_windows_listening_ports(pid);
+        return find_windows_listening_ports(pid, ipv4_loopback_only);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        find_unix_listening_ports(pid)
+        find_unix_listening_ports(pid, ipv4_loopback_only)
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn find_unix_listening_ports(pid: u32) -> Result<Vec<u16>> {
+fn find_unix_listening_ports(pid: u32, ipv4_loopback_only: bool) -> Result<Vec<u16>> {
     let pid_str = pid.to_string();
+    if ipv4_loopback_only {
+        return run_port_query_with_parser(
+            "lsof",
+            "lsof",
+            &["-nP", "-a", "-p", &pid_str, "-i4TCP", "-sTCP:LISTEN", "-Fn"],
+            parse_ipv4_loopback_lsof_ports,
+        );
+    }
     let mut ports = run_port_query(
         "lsof",
         "lsof",
@@ -1583,14 +1714,18 @@ fn find_unix_listening_ports(pid: u32) -> Result<Vec<u16>> {
 }
 
 #[cfg(target_os = "windows")]
-fn find_windows_listening_ports(pid: u32) -> Result<Vec<u16>> {
+fn find_windows_listening_ports(pid: u32, ipv4_loopback_only: bool) -> Result<Vec<u16>> {
     let output = run_command_required("netstat", &["-ano", "-p", "TCP"])
         .context("Failed to discover Windows TCP listeners with netstat")?;
-    Ok(parse_windows_netstat_ports(&output, pid))
+    Ok(parse_windows_netstat_ports(
+        &output,
+        pid,
+        ipv4_loopback_only,
+    ))
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn parse_windows_netstat_ports(output: &str, pid: u32) -> Vec<u16> {
+fn parse_windows_netstat_ports(output: &str, pid: u32, ipv4_loopback_only: bool) -> Vec<u16> {
     let mut ports = Vec::new();
     let pid_text = pid.to_string();
 
@@ -1603,6 +1738,9 @@ fn parse_windows_netstat_ports(output: &str, pid: u32) -> Vec<u16> {
             continue;
         }
         if !parts[3].eq_ignore_ascii_case("LISTENING") || parts[4] != pid_text {
+            continue;
+        }
+        if ipv4_loopback_only && !parts[1].starts_with("127.0.0.1:") {
             continue;
         }
         if let Some(port) = parse_port_from_windows_address(parts[1]) {
@@ -1623,8 +1761,18 @@ fn parse_port_from_windows_address(address: &str) -> Option<u16> {
 
 #[cfg(not(target_os = "windows"))]
 fn run_port_query(program: &str, warning_label: &str, args: &[&str]) -> Result<Vec<u16>> {
+    run_port_query_with_parser(program, warning_label, args, parse_ports)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_port_query_with_parser(
+    program: &str,
+    warning_label: &str,
+    args: &[&str],
+    parse: fn(&str) -> Vec<u16>,
+) -> Result<Vec<u16>> {
     match run_command(program, args) {
-        Ok(output) => Ok(parse_ports(&output)),
+        Ok(output) => Ok(parse(&output)),
         Err(err) if is_command_not_found(&err) => {
             eprintln!(
                 "Warning: {} is unavailable; skipping port discovery",
@@ -1642,6 +1790,14 @@ fn is_command_not_found(err: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn parse_ipv4_loopback_lsof_ports(output: &str) -> Vec<u16> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix("n127.0.0.1:")?.parse().ok())
+        .collect()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1702,6 +1858,7 @@ fn probe_https_heartbeat(port: u16, csrf_token: &str) -> bool {
     let connection = AntigravityConnection {
         pid: 0,
         port,
+        verify_peer: false,
         csrf_token: csrf_token.to_string(),
         fingerprint: format!("port:{port}"),
     };
@@ -1815,6 +1972,7 @@ fn https_identity_probe_request(port: u16, csrf_token: &str, method: &str) -> Op
     let connection = AntigravityConnection {
         pid: 0,
         port,
+        verify_peer: false,
         csrf_token: csrf_token.to_string(),
         fingerprint: format!("port:{port}"),
     };
@@ -2039,17 +2197,16 @@ fn run_command_output(program: &str, args: &[&str]) -> Result<std::process::Outp
 
 fn list_trajectory_summaries_with_errors(
     connections: &[AntigravityConnection],
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> (Vec<TrajectorySummary>, Vec<anyhow::Error>) {
     let mut merged: HashMap<String, TrajectorySummary> = HashMap::new();
     let mut errors = Vec::new();
 
     for connection in connections {
-        let response = match rpc_request_with_deadline(
+        let response = match rpc.request(
             connection,
             "GetAllCascadeTrajectories",
             &serde_json::json!({}),
-            deadline,
         ) {
             Ok(response) => response,
             Err(err) => {
@@ -2256,7 +2413,7 @@ fn fetch_historical_session_artifact(
     connections: &[AntigravityConnection],
     candidate: &SessionCandidate,
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<Option<ManifestSessionEntry>> {
     let fallback_summary = TrajectorySummary {
         session_id: session_id.to_string(),
@@ -2268,9 +2425,7 @@ fn fetch_historical_session_artifact(
             .unwrap_or_default(),
     };
 
-    if let Some(artifact) =
-        fetch_session_artifact(&fallback_summary, connections, budget, deadline)?
-    {
+    if let Some(artifact) = fetch_session_artifact(&fallback_summary, connections, budget, rpc)? {
         let path = write_session_artifact(session_id, &artifact.contents)?;
         return Ok(Some(ManifestSessionEntry {
             session_id: session_id.to_string(),
@@ -2287,10 +2442,65 @@ fn fetch_historical_session_artifact(
 
 #[cfg(test)]
 fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -> Result<Value> {
-    rpc_request_with_deadline(connection, method, body, None)
+    SyncRpc::default().request(connection, method, body)
 }
 
-fn rpc_request_with_deadline(
+#[derive(Default)]
+struct SyncRpc<'a> {
+    deadline: Option<&'a SyncDeadline>,
+    // Owned by one sync. Only the exact socket verified before the first
+    // request is reusable, never the earlier result for a port or PID.
+    desktop_sockets: HashMap<(u32, u16), BufReader<TcpStream>>,
+}
+
+impl SyncRpc<'_> {
+    fn request(
+        &mut self,
+        connection: &AntigravityConnection,
+        method: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        if !connection.verify_peer {
+            return legacy_rpc_request(connection, method, body, self.deadline);
+        }
+
+        let expires_at = Instant::now() + rpc_timeout_for_deadline(self.deadline)?;
+        let key = (connection.pid, connection.port);
+        let request = plain_rpc_request(connection, method, &serde_json::to_string(body)?, true);
+        let cap = max_rpc_body_bytes();
+
+        // The server can close an idle socket without a Connection header.
+        // These sync RPCs are read-only, so retry a disconnect once on a
+        // freshly connected and independently verified socket.
+        if let Some(mut reader) = self.desktop_sockets.remove(&key) {
+            match exchange_desktop_rpc(&mut reader, &request, expires_at, cap, true) {
+                Ok(message) => return self.finish_desktop_rpc(key, reader, message, method),
+                Err(err) if rpc_socket_disconnected(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        let stream = connect_desktop_rpc(connection, expires_at)?;
+        let mut reader = BufReader::new(stream);
+        let message = exchange_desktop_rpc(&mut reader, &request, expires_at, cap, true)?;
+        self.finish_desktop_rpc(key, reader, message, method)
+    }
+
+    fn finish_desktop_rpc(
+        &mut self,
+        key: (u32, u16),
+        reader: BufReader<TcpStream>,
+        message: PlainRpcMessage,
+        method: &str,
+    ) -> Result<Value> {
+        if message.reusable {
+            self.desktop_sockets.insert(key, reader);
+        }
+        message.into_value(method)
+    }
+}
+
+fn legacy_rpc_request(
     connection: &AntigravityConnection,
     method: &str,
     body: &Value,
@@ -2313,6 +2523,7 @@ fn rpc_request_with_deadline(
         method,
         body,
         rpc_timeout_for_deadline(deadline)?,
+        max_rpc_body_bytes(),
     ) {
         Ok(value) => {
             remember_rpc_transport(connection.port, RpcTransport::PlainHttp);
@@ -2611,7 +2822,7 @@ fn https_rpc_request(
             std::thread::scope(|scope| {
                 scope
                     .spawn(|| {
-                        antigravity_https_runtime()
+                        antigravity_rpc_runtime()
                             .block_on(https_rpc_once(connection, method, body, timeout))
                     })
                     .join()
@@ -2661,13 +2872,12 @@ async fn https_rpc_once(
     Ok(serde_json::from_str(&response_body)?)
 }
 
-#[cfg(not(target_os = "windows"))]
-fn antigravity_https_runtime() -> &'static tokio::runtime::Runtime {
-    HTTPS_RPC_RUNTIME.get_or_init(|| {
+fn antigravity_rpc_runtime() -> &'static tokio::runtime::Runtime {
+    RPC_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to create Antigravity HTTPS RPC runtime")
+            .expect("failed to create Antigravity RPC runtime")
     })
 }
 
@@ -2728,12 +2938,173 @@ pub(crate) async fn read_reqwest_response_with_cap(
     Ok(String::from_utf8(body)?)
 }
 
+// Check the server side of this connected socket before writing any bytes.
+fn peer_ownership_query(pid: &str) -> (&'static str, Vec<&str>) {
+    #[cfg(not(target_os = "windows"))]
+    {
+        (
+            "lsof",
+            vec!["-nP", "-a", "-p", pid, "-i4TCP", "-sTCP:ESTABLISHED", "-Fn"],
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = pid;
+        ("netstat", vec!["-ano", "-p", "TCP"])
+    }
+}
+
+fn owns_connected_peer(
+    output: &str,
+    server: std::net::SocketAddr,
+    client: std::net::SocketAddr,
+    pid: &str,
+) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        let pair = format!("n{server}->{client}");
+        output.lines().any(|line| line == pair)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let server = server.to_string();
+        let client = client.to_string();
+        output.lines().any(|line| {
+            let mut columns = line.split_whitespace();
+            columns.next() == Some("TCP")
+                && columns.next() == Some(server.as_str())
+                && columns.next() == Some(client.as_str())
+                && columns.next() == Some("ESTABLISHED")
+                && columns.next() == Some(pid)
+        })
+    }
+}
+
+async fn peer_ownership_output(
+    program: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await
+}
+
+fn peer_ownership_output_before(
+    program: &str,
+    args: &[&str],
+    expires_at: Instant,
+) -> Result<std::process::Output> {
+    // Desktop discovery can run inside the quota provider's Tokio runtime.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                antigravity_rpc_runtime().block_on(async {
+                    let timeout = desktop_rpc_time_remaining(expires_at)?;
+                    tokio::time::timeout(timeout, peer_ownership_output(program, args))
+                        .await
+                        .context("Antigravity RPC socket ownership check timed out")?
+                        .with_context(|| format!("Failed to run {program}"))
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Antigravity RPC ownership worker panicked")))
+    })
+}
+
+fn desktop_rpc_time_remaining(expires_at: Instant) -> Result<Duration> {
+    let remaining = expires_at.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("Antigravity desktop RPC timed out");
+    }
+    Ok(remaining)
+}
+
+fn connect_desktop_rpc(
+    connection: &AntigravityConnection,
+    expires_at: Instant,
+) -> Result<TcpStream> {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], connection.port));
+    let stream = TcpStream::connect_timeout(&address, desktop_rpc_time_remaining(expires_at)?)?;
+    let pid = connection.pid.to_string();
+    let (program, args) = peer_ownership_query(&pid);
+    let server = stream.peer_addr()?;
+    let client = stream.local_addr()?;
+    for attempt in 0..2 {
+        let output = peer_ownership_output_before(program, &args, expires_at)?;
+        if output.status.success()
+            && owns_connected_peer(
+                &String::from_utf8_lossy(&output.stdout),
+                server,
+                client,
+                &pid,
+            )
+        {
+            return Ok(stream);
+        }
+        // The handshake can finish before accept() creates the server's FD.
+        // Recheck only this socket, within the original RPC deadline.
+        if attempt == 0 && desktop_rpc_time_remaining(expires_at)? > Duration::from_millis(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        } else {
+            break;
+        }
+    }
+    anyhow::bail!("Antigravity no longer owns the connected RPC socket")
+}
+
+fn exchange_desktop_rpc(
+    reader: &mut BufReader<TcpStream>,
+    request: &str,
+    expires_at: Instant,
+    cap: usize,
+    keep_alive: bool,
+) -> Result<PlainRpcMessage> {
+    let stream = reader.get_mut();
+    let remaining = desktop_rpc_time_remaining(expires_at)?;
+    stream.set_write_timeout(Some(remaining.min(Duration::from_secs(5))))?;
+    stream.write_all(request.as_bytes())?;
+    stream.set_read_timeout(Some(desktop_rpc_time_remaining(expires_at)?))?;
+    read_plain_rpc_message(reader, cap, keep_alive)
+}
+
+fn rpc_socket_disconnected(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+        )
+    })
+}
+
 fn rpc_request_plain_http(
     connection: &AntigravityConnection,
     method: &str,
     body: &Value,
     timeout: Duration,
+    cap: usize,
 ) -> Result<Value> {
+    let body_text = serde_json::to_string(body)?;
+    let request = plain_rpc_request(connection, method, &body_text, false);
+    if connection.verify_peer {
+        let expires_at = Instant::now() + timeout;
+        let stream = connect_desktop_rpc(connection, expires_at)?;
+        return exchange_desktop_rpc(
+            &mut BufReader::new(stream),
+            &request,
+            expires_at,
+            cap,
+            false,
+        )?
+        .into_value(method);
+    }
+
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], connection.port));
     let mut stream = TcpStream::connect_timeout(&address, timeout).with_context(|| {
         format!(
@@ -2744,51 +3115,100 @@ fn rpc_request_plain_http(
 
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout.min(Duration::from_secs(5))))?;
+    stream.write_all(request.as_bytes())?;
+    read_plain_rpc_response(BufReader::new(stream), method, cap)
+}
 
-    let body_text = serde_json::to_string(body)?;
-    let request = format!(
-        "POST /exa.language_server_pb.LanguageServerService/{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnect-Protocol-Version: 1\r\nX-Codeium-Csrf-Token: {}\r\nConnection: close\r\n\r\n{}",
+fn plain_rpc_request(
+    connection: &AntigravityConnection,
+    method: &str,
+    body_text: &str,
+    keep_alive: bool,
+) -> String {
+    let connection_header = if keep_alive { "keep-alive" } else { "close" };
+    format!(
+        "POST /exa.language_server_pb.LanguageServerService/{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnect-Protocol-Version: 1\r\nX-Codeium-Csrf-Token: {}\r\nConnection: {connection_header}\r\n\r\n{}",
         method,
         connection.port,
         body_text.len(),
         connection.csrf_token,
         body_text
-    );
+    )
+}
 
-    stream.write_all(request.as_bytes())?;
+fn read_plain_rpc_response(mut reader: impl BufRead, method: &str, cap: usize) -> Result<Value> {
+    read_plain_rpc_message(&mut reader, cap, false)?.into_value(method)
+}
 
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
+struct PlainRpcMessage {
+    status: u16,
+    body: String,
+    reusable: bool,
+}
 
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| anyhow::anyhow!("Malformed HTTP response from Antigravity RPC"))?;
-
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-    loop {
-        let mut header = String::new();
-        reader.read_line(&mut header)?;
-        let trimmed = header.trim();
-        if trimmed.is_empty() {
-            break;
+impl PlainRpcMessage {
+    fn into_value(self, method: &str) -> Result<Value> {
+        if self.status != 200 {
+            return Err(rpc_status_error(method, self.status, &self.body, false));
         }
-
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            content_length = value.trim().parse::<usize>().ok();
-        }
-        if lower.contains("transfer-encoding") && lower.contains("chunked") {
-            chunked = true;
-        }
+        Ok(serde_json::from_str(&self.body)?)
     }
+}
 
-    let cap = max_rpc_body_bytes();
+fn read_plain_rpc_message(
+    reader: &mut impl BufRead,
+    cap: usize,
+    keep_alive: bool,
+) -> Result<PlainRpcMessage> {
+    let (status, mut reusable, content_length, chunked) = loop {
+        let mut status_line = String::new();
+        if reader.read_line(&mut status_line)? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+
+        let mut status_fields = status_line.split_whitespace();
+        let version = status_fields.next();
+        let mut reusable = keep_alive && version == Some("HTTP/1.1");
+        let status = status_fields
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| anyhow::anyhow!("Malformed HTTP response from Antigravity RPC"))?;
+        if status == 101 {
+            anyhow::bail!("Antigravity RPC does not support switching protocols");
+        }
+
+        let mut content_length: Option<usize> = None;
+        let mut chunked = false;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            let trimmed = header.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse::<usize>().ok();
+            }
+            if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+                chunked |= value.split(',').any(|token| token.trim() == "chunked");
+            }
+            if let Some(value) = lower.strip_prefix("connection:") {
+                reusable &= !value.split(',').any(|token| token.trim() == "close");
+            }
+        }
+
+        if !(100..200).contains(&status) {
+            break (status, reusable, content_length, chunked);
+        }
+    };
+
+    reusable &= chunked || content_length.is_some();
     let response_body = if chunked {
-        read_chunked_body(&mut reader)?
+        read_chunked_body_with_cap(reader, cap, reusable)?
     } else if let Some(length) = content_length {
         if length > cap {
             return Err(anyhow::Error::new(RpcBodyCapError { length, cap }));
@@ -2811,15 +3231,11 @@ fn rpc_request_plain_http(
         text
     };
 
-    if status_code != 200 {
-        return Err(rpc_status_error(method, status_code, &response_body, false));
-    }
-
-    Ok(serde_json::from_str(&response_body)?)
-}
-
-fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> Result<String> {
-    read_chunked_body_with_cap(reader, max_rpc_body_bytes())
+    Ok(PlainRpcMessage {
+        status,
+        body: response_body,
+        reusable,
+    })
 }
 
 fn read_chunked_body_prefix(
@@ -2853,15 +3269,31 @@ fn read_chunked_body_prefix(
 }
 
 fn read_chunked_body_with_cap(
-    reader: &mut BufReader<TcpStream>,
+    reader: &mut impl BufRead,
     max_body_bytes: usize,
+    consume_trailers: bool,
 ) -> Result<String> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
         reader.read_line(&mut size_line)?;
+        if !size_line.ends_with('\n') {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
         let chunk_size = parse_chunk_size_line(&size_line)?;
         if chunk_size == 0 {
+            if consume_trailers {
+                // Leave the reader at the start of the next response.
+                loop {
+                    size_line.clear();
+                    if reader.read_line(&mut size_line)? == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                    }
+                    if size_line == "\r\n" {
+                        break;
+                    }
+                }
+            }
             break;
         }
 
@@ -2935,7 +3367,7 @@ fn fetch_session_artifact(
     summary: &TrajectorySummary,
     connections: &[AntigravityConnection],
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<Option<SessionArtifact>> {
     let preferred = connections
         .iter()
@@ -2953,7 +3385,7 @@ fn fetch_session_artifact(
 
     let mut last_error: Option<anyhow::Error> = None;
     for connection in ordered {
-        match try_fetch_session_artifact(summary, connection, budget, deadline) {
+        match try_fetch_session_artifact(summary, connection, budget, rpc) {
             Ok(Some(artifact)) => return Ok(Some(artifact)),
             Ok(None) => {}
             Err(err) => last_error = Some(err),
@@ -3116,7 +3548,7 @@ fn fetch_usage_timestamps(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<HashMap<String, i64>> {
     if !budget.should_attempt(&connection.fingerprint) {
         let err = anyhow::anyhow!(
@@ -3127,11 +3559,10 @@ fn fetch_usage_timestamps(
     }
 
     let started = Instant::now();
-    match rpc_request_with_deadline(
+    match rpc.request(
         connection,
         "GetCascadeTrajectory",
         &serde_json::json!({ "cascadeId": summary.session_id }),
-        deadline,
     ) {
         Ok(trajectory) => {
             budget.record_success(&connection.fingerprint);
@@ -3200,7 +3631,7 @@ fn try_fetch_session_artifact(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<Option<SessionArtifact>> {
     if !budget.metadata_should_attempt(&connection.fingerprint) {
         let err = anyhow::anyhow!(
@@ -3211,11 +3642,10 @@ fn try_fetch_session_artifact(
     }
 
     let metadata_started = Instant::now();
-    let response = match rpc_request_with_deadline(
+    let response = match rpc.request(
         connection,
         "GetCascadeTrajectoryGeneratorMetadata",
         &serde_json::json!({ "cascadeId": summary.session_id }),
-        deadline,
     ) {
         Ok(value) => {
             budget.record_metadata_success(&connection.fingerprint);
@@ -3249,7 +3679,7 @@ fn try_fetch_session_artifact(
     }
 
     let usage_timestamps = if session_metadata_needs_trajectory_timestamps(&metadata) {
-        match fetch_usage_timestamps(summary, connection, budget, deadline) {
+        match fetch_usage_timestamps(summary, connection, budget, rpc) {
             Ok(timestamps) => timestamps,
             Err(err) => {
                 let cached = cached_usage_timestamps(&summary.session_id);
@@ -3781,7 +4211,7 @@ mod tests {
             }
         ]"#;
 
-        let candidates = parse_windows_process_candidates(output).unwrap();
+        let candidates = parse_windows_process_candidates(output, &HashMap::new()).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].pid, 4242);
         assert_eq!(candidates[0].ppid, 100);
@@ -3798,7 +4228,7 @@ mod tests {
             "CommandLine": "\"C:\\Antigravity\\language_server.exe\" --extension_server_port 49323 --csrf_token abcdef0123456789abcdef0123456789"
         }"#;
 
-        let candidates = parse_windows_process_candidates(output).unwrap();
+        let candidates = parse_windows_process_candidates(output, &HashMap::new()).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].pid, 4243);
         assert_eq!(candidates[0].declared_port, Some(49323));
@@ -3815,7 +4245,7 @@ mod tests {
 "#;
 
         assert_eq!(
-            parse_windows_netstat_ports(output, 4242),
+            parse_windows_netstat_ports(output, 4242, false),
             vec![49321, 49322]
         );
     }
@@ -4029,12 +4459,254 @@ mod tests {
         assert!(ports.is_empty());
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn desktop_listener_discovery_accepts_only_the_ipv4_loopback_endpoint() {
+        assert_eq!(
+            parse_ipv4_loopback_lsof_ports(
+                "p123\nn[::1]:4242\nn192.0.2.1:4242\nn127.0.0.1:4300->127.0.0.1:4242\nn127.0.0.1:4321"
+            ),
+            vec![4321]
+        );
+    }
+
+    #[test]
+    fn desktop_descriptor_matches_hyphenated_windows_language_server() {
+        let token = "ea1dbb2a-65a8-4766-a155-8e70f032f4ac";
+        let hubs = HashMap::from([(
+            123,
+            DesktopHub {
+                pid: 123,
+                http_port: 4321,
+                csrf_token: token.into(),
+            },
+        )]);
+        let processes = serde_json::json!({
+            "ProcessId": 123,
+            "ParentProcessId": 1,
+            "ExecutablePath": r"C:\Program Files\Antigravity\language-server.exe",
+            "CommandLine": r#""C:\Program Files\Antigravity\language-server.exe" --app_data_dir antigravity --read_host_bridge_token_from_stdin"#
+        });
+        let candidates = parse_windows_process_candidates(&processes.to_string(), &hubs).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let listeners = parse_windows_netstat_ports(
+            "TCP [::1]:4242 [::]:0 LISTENING 123\nTCP 127.0.0.1:4321 0.0.0.0:0 LISTENING 123",
+            123,
+            true,
+        );
+        assert_eq!(listeners, vec![4321]);
+        assert_eq!(candidate_probe_ports(&candidates[0], listeners), vec![4321]);
+    }
+
+    #[test]
+    fn plain_rpc_reads_the_final_response_after_early_hints() {
+        let response = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        let message = read_plain_rpc_message(&mut &response[..], 1024, true).unwrap();
+        assert!(message.reusable);
+        assert_eq!(
+            message.into_value("Heartbeat").unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn truncated_chunk_size_is_a_retryable_disconnect() {
+        for mut bytes in [b"2\r\n{}\r\n".as_slice(), b"2\r\n{}\r\n0".as_slice()] {
+            let error = read_chunked_body_with_cap(&mut bytes, 1024, true).unwrap_err();
+            assert!(rpc_socket_disconnected(&error), "{error:#}");
+        }
+        let error = read_chunked_body_with_cap(&mut &b"zz\r\n"[..], 1024, true).unwrap_err();
+        assert!(!rpc_socket_disconnected(&error));
+    }
+
+    #[test]
+    fn legacy_discovery_excludes_descriptor_credentials() {
+        let pid = std::process::id();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = connections_from_candidates(
+            vec![ProcessCandidate {
+                pid,
+                ppid: 0,
+                declared_port: None,
+                daemon_port: Some(port),
+                csrf_token: "fixture-token".into(),
+            }],
+            false,
+        )
+        .unwrap();
+
+        assert!(connections.is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_ownership_query_obeys_the_request_deadline() {
+        let started = Instant::now();
+        let error = peer_ownership_output_before(
+            "/bin/sleep",
+            &["10"],
+            started + Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("socket ownership check timed out"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn desktop_sync_reuses_the_verified_socket_and_reconnects_after_close() {
+        use std::net::TcpListener;
+
+        let pid = std::process::id().to_string();
+        let (program, args) = peer_ownership_query(&pid);
+        if run_command_output(program, &args).is_err_and(|error| is_command_not_found(&error)) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let read_request = |peer: &mut BufReader<TcpStream>| {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n{}") {
+                    let mut byte = [0_u8; 1];
+                    peer.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(String::from_utf8(request)
+                    .unwrap()
+                    .contains("X-Codeium-Csrf-Token: fixture-token\r\n"));
+            };
+            let mut first = BufReader::new(listener.accept().unwrap().0);
+            first
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            read_request(&mut first);
+            first
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"n\":1}\r\n0\r\nX-Trailer: done\r\n\r\n")
+                .unwrap();
+            read_request(&mut first);
+            first
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"n\":2}")
+                .unwrap();
+            drop(first); // An idle peer may close without advertising it.
+
+            let mut second = BufReader::new(listener.accept().unwrap().0);
+            second
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            read_request(&mut second);
+            second
+                .get_mut()
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"n\":3}",
+                )
+                .unwrap();
+        });
+        let connection = AntigravityConnection {
+            pid: std::process::id(),
+            port,
+            verify_peer: true,
+            csrf_token: "fixture-token".into(),
+            fingerprint: "fixture".into(),
+        };
+        let mut rpc = SyncRpc::default();
+        for n in 1..=3 {
+            assert_eq!(
+                rpc.request(
+                    &connection,
+                    "GetAllCascadeTrajectories",
+                    &serde_json::json!({})
+                )
+                .unwrap(),
+                serde_json::json!({ "n": n })
+            );
+        }
+        assert!(rpc.desktop_sockets.is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn desktop_rpc_sends_no_bytes_to_an_unowned_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream.read(&mut [0_u8; 1]).unwrap()
+        });
+        let connection = AntigravityConnection {
+            pid: i32::MAX as u32,
+            port,
+            verify_peer: true,
+            csrf_token: "fixture-token".into(),
+            fingerprint: "fixture".into(),
+        };
+        assert!(rpc_request_plain_http(
+            &connection,
+            "Heartbeat",
+            &serde_json::json!({}),
+            Duration::from_secs(5),
+            MAX_IDENTITY_PROBE_BYTES,
+        )
+        .is_err());
+        assert_eq!(received.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn desktop_hub_requires_a_matching_process_and_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "ea1dbb2a-65a8-4766-a155-8e70f032f4ac";
+        fs::write(
+            dir.path().join("hub_4242.json"),
+            serde_json::json!({"pid": 123, "httpPort": 4242, "csrfToken": token}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("hub_4243.json"),
+            serde_json::json!({"pid": 456, "httpPort": 4244, "csrfToken": token}).to_string(),
+        )
+        .unwrap();
+        let hubs = read_desktop_hubs(dir.path());
+        let command = "/Applications/Antigravity.app/Contents/Resources/bin/language_server --app_data_dir antigravity --read_host_bridge_token_from_stdin";
+        let candidate = process_candidate(123, 1, command, &hubs).unwrap();
+        assert_eq!(candidate.csrf_token, token);
+        assert_eq!(
+            candidate_probe_ports(&candidate, vec![4242, 9000]),
+            vec![4242]
+        );
+        assert!(candidate_probe_ports(&candidate, vec![9000]).is_empty());
+        assert!(process_candidate(456, 1, command, &hubs).is_none());
+        assert!(process_candidate(456, 1, command, &HashMap::new()).is_none());
+        let extension = command.replace(
+            "--app_data_dir antigravity",
+            "--app_data_dir antigravity-ide",
+        );
+        assert!(process_candidate(123, 1, &extension, &hubs).is_none());
+    }
+
     #[test]
     fn candidate_probe_ports_falls_back_to_declared_port() {
         let candidate = ProcessCandidate {
             pid: 1,
             ppid: 0,
             declared_port: Some(4242),
+            daemon_port: None,
             csrf_token: "token".to_string(),
         };
 
@@ -4750,6 +5422,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -4777,6 +5450,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -4810,6 +5484,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -4952,6 +5627,7 @@ mod tests {
         AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         }
@@ -5138,11 +5814,14 @@ mod tests {
         };
         let mut budget = TrajectoryEnrichmentBudget::with_limits(Duration::from_secs(60), 2);
         budget.record_metadata_failure(&connection.fingerprint, Duration::ZERO);
-        assert!(
-            try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .unwrap()
-                .is_none()
-        );
+        assert!(try_fetch_session_artifact(
+            &summary,
+            &connection,
+            &mut budget,
+            &mut SyncRpc::default()
+        )
+        .unwrap()
+        .is_none());
         budget.record_metadata_failure(&connection.fingerprint, Duration::ZERO);
         assert!(budget.metadata_should_attempt(&connection.fingerprint));
         assert_eq!(cached_rpc_transport(port), Some(RpcTransport::PlainHttp));
@@ -5189,7 +5868,7 @@ mod tests {
             &summary,
             &[missing.clone(), broken],
             &mut TrajectoryEnrichmentBudget::new(),
-            None,
+            &mut SyncRpc::default(),
         );
         assert!(
             result.is_err(),
@@ -5202,7 +5881,7 @@ mod tests {
             &summary,
             &[missing, healthy],
             &mut TrajectoryEnrichmentBudget::new(),
-            None,
+            &mut SyncRpc::default(),
         )
         .unwrap()
         .expect("another connection can still hold this session");
@@ -5348,9 +6027,14 @@ mod tests {
                 step_count: Some(1),
                 connection_fingerprint: connection.fingerprint.clone(),
             };
-            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .expect("a failed enrichment must never fail the sync")
-                .expect("the session must still be written from its metadata");
+            let artifact = try_fetch_session_artifact(
+                &summary,
+                &connection,
+                &mut budget,
+                &mut SyncRpc::default(),
+            )
+            .expect("a failed enrichment must never fail the sync")
+            .expect("the session must still be written from its metadata");
             assert!(
                 artifact.contents.contains(&format!("session-{index}")),
                 "the metadata-derived artifact is the documented fallback: {}",
@@ -5412,9 +6096,14 @@ mod tests {
                 step_count: Some(1),
                 connection_fingerprint: connection.fingerprint.clone(),
             };
-            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .unwrap()
-                .expect("the session must be written");
+            let artifact = try_fetch_session_artifact(
+                &summary,
+                &connection,
+                &mut budget,
+                &mut SyncRpc::default(),
+            )
+            .unwrap()
+            .expect("the session must be written");
             let usage: Value = artifact
                 .contents
                 .lines()
@@ -5501,6 +6190,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -5525,6 +6215,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -5755,9 +6446,10 @@ mod tests {
             connection_fingerprint: connection.fingerprint.clone(),
         };
 
-        let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-            .unwrap()
-            .expect("enrichment failure must still regenerate the artifact");
+        let artifact =
+            try_fetch_session_artifact(&summary, &connection, &mut budget, &mut SyncRpc::default())
+                .unwrap()
+                .expect("enrichment failure must still regenerate the artifact");
         let usage: Vec<Value> = artifact
             .contents
             .lines()
@@ -5854,11 +6546,16 @@ mod tests {
         };
 
         for round in 1..=2 {
-            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .unwrap()
-                .unwrap_or_else(|| {
-                    panic!("round {round}: a grown session must still produce an artifact")
-                });
+            let artifact = try_fetch_session_artifact(
+                &summary,
+                &connection,
+                &mut budget,
+                &mut SyncRpc::default(),
+            )
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!("round {round}: a grown session must still produce an artifact")
+            });
             let usage: Vec<(Option<String>, Option<i64>)> = artifact
                 .contents
                 .lines()
@@ -5976,9 +6673,10 @@ mod tests {
 
         // Round 1: enrichment succeeds and the usage is timestamped through
         // its messageId. `sync` writes that artifact back.
-        let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-            .unwrap()
-            .expect("round 1 must produce an artifact");
+        let artifact =
+            try_fetch_session_artifact(&summary, &connection, &mut budget, &mut SyncRpc::default())
+                .unwrap()
+                .expect("round 1 must produce an artifact");
         let usage = usage_rows(&artifact);
         assert_eq!(usage.len(), 1, "round 1: {}", artifact.contents);
         assert_eq!(usage[0]["timestamp"], 1700000000000_i64, "round 1");
@@ -5988,9 +6686,10 @@ mod tests {
         // Round 2: the trajectory has grown past the cap, so enrichment
         // fails; the timestamp recovered last time must survive.
         trajectory_over_cap.store(true, Ordering::SeqCst);
-        let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-            .unwrap()
-            .expect("round 2 must still regenerate the artifact");
+        let artifact =
+            try_fetch_session_artifact(&summary, &connection, &mut budget, &mut SyncRpc::default())
+                .unwrap()
+                .expect("round 2 must still regenerate the artifact");
         let usage = usage_rows(&artifact);
         assert_eq!(usage.len(), 1, "round 2: {}", artifact.contents);
         assert_eq!(
