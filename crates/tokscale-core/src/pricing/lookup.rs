@@ -839,6 +839,7 @@ impl PricingLookup {
         // select standard model rates for local estimates only.
         let pricing_alias = match lower_ref {
             "gemini-pro-orchestrator-neon" => Some("gemini-4-neon"),
+            "gemini-pro-orchestrator-g1-pro" => Some("gemini-4-argon"),
             "gemini-flash-worker-agy" => Some("gemini-4-hydrogen"),
             _ => None,
         };
@@ -7513,6 +7514,7 @@ mod tests {
         ]);
         let openrouter = HashMap::from([
             ("google/gemini-4-neon".into(), rate.clone()),
+            ("google/gemini-4-argon".into(), rate.clone()),
             ("google/gemini-4-hydrogen".into(), rate.clone()),
         ]);
         let lookup = PricingLookup::new(litellm.clone(), openrouter.clone(), HashMap::new());
@@ -7531,6 +7533,7 @@ mod tests {
         }
         for (raw, expected) in [
             ("gemini-pro-orchestrator-neon", "google/gemini-4-neon"),
+            ("gemini-pro-orchestrator-g1-pro", "google/gemini-4-argon"),
             ("gemini-flash-worker-agy", "google/gemini-4-hydrogen"),
         ] {
             for hint in [None, Some("google")] {
