@@ -165,7 +165,58 @@ struct ProcessCandidate {
     pid: u32,
     ppid: u32,
     declared_port: Option<u16>,
+    daemon_port: Option<u16>,
     csrf_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopHub {
+    pid: u32,
+    http_port: u16,
+    csrf_token: String,
+}
+
+fn read_desktop_hubs(directory: &Path) -> HashMap<u32, DesktopHub> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return HashMap::new();
+    };
+    let mut hubs = HashMap::new();
+    for entry in entries.flatten() {
+        let Some(port) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("hub_"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+        else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > 4096 {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(hub) = serde_json::from_slice::<DesktopHub>(&bytes) else {
+            continue;
+        };
+        if hub.http_port != port || !valid_csrf_token(&hub.csrf_token) {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        if hubs
+            .get(&hub.pid)
+            .is_none_or(|(previous, _)| modified > *previous)
+        {
+            hubs.insert(hub.pid, (modified, hub));
+        }
+    }
+    hubs.into_iter().map(|(pid, (_, hub))| (pid, hub)).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1264,7 +1315,8 @@ pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
     let mut connections = Vec::new();
 
     for candidate in candidates {
-        let ports = candidate_probe_ports(&candidate, find_listening_ports(candidate.pid)?);
+        let listeners = find_listening_ports(candidate.pid, candidate.daemon_port.is_some())?;
+        let ports = candidate_probe_ports(&candidate, listeners);
         for port in ports {
             if probe_heartbeat(port, &candidate.csrf_token) {
                 connections.push(AntigravityConnection {
@@ -1290,6 +1342,10 @@ pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
 }
 
 fn candidate_probe_ports(candidate: &ProcessCandidate, mut ports: Vec<u16>) -> Vec<u16> {
+    if let Some(port) = candidate.daemon_port {
+        // A stale descriptor must not send its credential to a recycled port.
+        return ports.contains(&port).then_some(port).into_iter().collect();
+    }
     if let Some(declared_port) = candidate.declared_port {
         if !ports.contains(&declared_port) {
             ports.push(declared_port);
@@ -1302,19 +1358,24 @@ fn candidate_probe_ports(candidate: &ProcessCandidate, mut ports: Vec<u16>) -> V
 }
 
 fn detect_process_candidates() -> Result<Vec<ProcessCandidate>> {
+    let desktop_hubs = home_dir()
+        .map(|home| read_desktop_hubs(&home.join(".gemini/antigravity/daemon")))
+        .unwrap_or_default();
     #[cfg(target_os = "windows")]
     {
-        return detect_windows_process_candidates();
+        return detect_windows_process_candidates(&desktop_hubs);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        detect_unix_process_candidates()
+        detect_unix_process_candidates(&desktop_hubs)
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn detect_unix_process_candidates() -> Result<Vec<ProcessCandidate>> {
+fn detect_unix_process_candidates(
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Result<Vec<ProcessCandidate>> {
     let output = run_command("ps", &["-ww", "-eo", "pid,ppid,args"])?;
     let mut candidates = Vec::new();
 
@@ -1352,24 +1413,16 @@ fn detect_unix_process_candidates() -> Result<Vec<ProcessCandidate>> {
         let exe_ok = process_executable_path(pid)
             .map(|path| {
                 let lower = path.to_string_lossy().to_lowercase();
-                lower.contains("antigravity") || lower.contains("language_server")
+                lower.contains("antigravity") || is_language_server_text(&lower)
             })
             .unwrap_or(true);
         if !exe_ok {
             continue;
         }
 
-        let Some(csrf_token) = extract_csrf_token(&command) else {
-            continue;
-        };
-        let declared_port = extract_declared_port(&command);
-
-        candidates.push(ProcessCandidate {
-            pid,
-            ppid,
-            declared_port,
-            csrf_token,
-        });
+        if let Some(candidate) = process_candidate(pid, ppid, &command, desktop_hubs) {
+            candidates.push(candidate);
+        }
     }
 
     candidates.sort_by(|left, right| {
@@ -1385,7 +1438,9 @@ fn detect_unix_process_candidates() -> Result<Vec<ProcessCandidate>> {
 }
 
 #[cfg(target_os = "windows")]
-fn detect_windows_process_candidates() -> Result<Vec<ProcessCandidate>> {
+fn detect_windows_process_candidates(
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Result<Vec<ProcessCandidate>> {
     let script = "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress";
     let output = run_windows_powershell(script)?;
     if output.trim().is_empty() {
@@ -1393,11 +1448,14 @@ fn detect_windows_process_candidates() -> Result<Vec<ProcessCandidate>> {
             "Windows process discovery returned no data; cannot discover Antigravity language servers"
         );
     }
-    parse_windows_process_candidates(&output)
+    parse_windows_process_candidates(&output, desktop_hubs)
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn parse_windows_process_candidates(output: &str) -> Result<Vec<ProcessCandidate>> {
+fn parse_windows_process_candidates(
+    output: &str,
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Result<Vec<ProcessCandidate>> {
     let value: Value = serde_json::from_str(output.trim())
         .context("Failed to parse Windows process discovery JSON")?;
     let items: Vec<&Value> = match &value {
@@ -1436,17 +1494,9 @@ fn parse_windows_process_candidates(output: &str) -> Result<Vec<ProcessCandidate
             continue;
         }
 
-        let Some(csrf_token) = extract_csrf_token(command) else {
-            continue;
-        };
-        let declared_port = extract_declared_port(command);
-
-        candidates.push(ProcessCandidate {
-            pid,
-            ppid,
-            declared_port,
-            csrf_token,
-        });
+        if let Some(candidate) = process_candidate(pid, ppid, command, desktop_hubs) {
+            candidates.push(candidate);
+        }
     }
 
     candidates.sort_by(|left, right| {
@@ -1472,7 +1522,7 @@ fn windows_candidate_executable_ok(executable_path: Option<&str>, command: &str)
 #[cfg(any(test, target_os = "windows"))]
 fn executable_path_looks_antigravity(path: &str) -> bool {
     let lower = path.to_lowercase();
-    lower.contains("antigravity") || lower.contains("language_server")
+    lower.contains("antigravity") || is_language_server_text(&lower)
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -1485,9 +1535,13 @@ fn command_line_executable_looks_antigravity(command: &str) -> bool {
     executable_path_looks_antigravity(first)
 }
 
+fn is_language_server_text(lower: &str) -> bool {
+    lower.contains("language_server") || lower.contains("language-server")
+}
+
 fn is_antigravity_process(command: &str) -> bool {
     let lower = command.to_lowercase();
-    (lower.contains("language_server")
+    (is_language_server_text(&lower)
         && (lower.contains("antigravity") || lower.contains("--app_data_dir antigravity")))
         || lower.contains("/antigravity/")
         || lower.contains("\\antigravity\\")
@@ -1520,13 +1574,44 @@ fn process_executable_path(pid: u32) -> Option<PathBuf> {
     }
 }
 
-fn extract_csrf_token(command: &str) -> Option<String> {
-    let token = extract_flag_value(command, "--csrf_token")?;
-    if token.len() >= 32 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-') {
-        Some(token)
+fn process_candidate(
+    pid: u32,
+    ppid: u32,
+    command: &str,
+    desktop_hubs: &HashMap<u32, DesktopHub>,
+) -> Option<ProcessCandidate> {
+    let (csrf_token, daemon_port) = if let Some(token) = extract_csrf_token(command) {
+        (token, None)
     } else {
-        None
-    }
+        // Bind a desktop descriptor to a live desktop language-server process.
+        // CLI and editor-extension processes can coexist under the same home.
+        let lower = command.to_ascii_lowercase();
+        if !is_language_server_text(&lower)
+            || !lower
+                .split_whitespace()
+                .any(|arg| arg == "--read_host_bridge_token_from_stdin")
+            || extract_flag_value(&lower, "--app_data_dir").as_deref() != Some("antigravity")
+        {
+            return None;
+        }
+        let hub = desktop_hubs.get(&pid)?;
+        (hub.csrf_token.clone(), Some(hub.http_port))
+    };
+    Some(ProcessCandidate {
+        pid,
+        ppid,
+        declared_port: extract_declared_port(command),
+        daemon_port,
+        csrf_token,
+    })
+}
+
+fn valid_csrf_token(token: &str) -> bool {
+    token.len() >= 32 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+}
+
+fn extract_csrf_token(command: &str) -> Option<String> {
+    extract_flag_value(command, "--csrf_token").filter(|token| valid_csrf_token(token))
 }
 
 fn extract_declared_port(command: &str) -> Option<u16> {
@@ -1552,21 +1637,29 @@ fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-fn find_listening_ports(pid: u32) -> Result<Vec<u16>> {
+fn find_listening_ports(pid: u32, ipv4_loopback_only: bool) -> Result<Vec<u16>> {
     #[cfg(target_os = "windows")]
     {
-        return find_windows_listening_ports(pid);
+        return find_windows_listening_ports(pid, ipv4_loopback_only);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        find_unix_listening_ports(pid)
+        find_unix_listening_ports(pid, ipv4_loopback_only)
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn find_unix_listening_ports(pid: u32) -> Result<Vec<u16>> {
+fn find_unix_listening_ports(pid: u32, ipv4_loopback_only: bool) -> Result<Vec<u16>> {
     let pid_str = pid.to_string();
+    if ipv4_loopback_only {
+        return run_port_query_with_parser(
+            "lsof",
+            "lsof",
+            &["-nP", "-a", "-p", &pid_str, "-i4TCP", "-sTCP:LISTEN", "-Fn"],
+            parse_ipv4_loopback_lsof_ports,
+        );
+    }
     let mut ports = run_port_query(
         "lsof",
         "lsof",
@@ -1583,14 +1676,18 @@ fn find_unix_listening_ports(pid: u32) -> Result<Vec<u16>> {
 }
 
 #[cfg(target_os = "windows")]
-fn find_windows_listening_ports(pid: u32) -> Result<Vec<u16>> {
+fn find_windows_listening_ports(pid: u32, ipv4_loopback_only: bool) -> Result<Vec<u16>> {
     let output = run_command_required("netstat", &["-ano", "-p", "TCP"])
         .context("Failed to discover Windows TCP listeners with netstat")?;
-    Ok(parse_windows_netstat_ports(&output, pid))
+    Ok(parse_windows_netstat_ports(
+        &output,
+        pid,
+        ipv4_loopback_only,
+    ))
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn parse_windows_netstat_ports(output: &str, pid: u32) -> Vec<u16> {
+fn parse_windows_netstat_ports(output: &str, pid: u32, ipv4_loopback_only: bool) -> Vec<u16> {
     let mut ports = Vec::new();
     let pid_text = pid.to_string();
 
@@ -1603,6 +1700,9 @@ fn parse_windows_netstat_ports(output: &str, pid: u32) -> Vec<u16> {
             continue;
         }
         if !parts[3].eq_ignore_ascii_case("LISTENING") || parts[4] != pid_text {
+            continue;
+        }
+        if ipv4_loopback_only && !parts[1].starts_with("127.0.0.1:") {
             continue;
         }
         if let Some(port) = parse_port_from_windows_address(parts[1]) {
@@ -1623,8 +1723,18 @@ fn parse_port_from_windows_address(address: &str) -> Option<u16> {
 
 #[cfg(not(target_os = "windows"))]
 fn run_port_query(program: &str, warning_label: &str, args: &[&str]) -> Result<Vec<u16>> {
+    run_port_query_with_parser(program, warning_label, args, parse_ports)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_port_query_with_parser(
+    program: &str,
+    warning_label: &str,
+    args: &[&str],
+    parse: fn(&str) -> Vec<u16>,
+) -> Result<Vec<u16>> {
     match run_command(program, args) {
-        Ok(output) => Ok(parse_ports(&output)),
+        Ok(output) => Ok(parse(&output)),
         Err(err) if is_command_not_found(&err) => {
             eprintln!(
                 "Warning: {} is unavailable; skipping port discovery",
@@ -1642,6 +1752,14 @@ fn is_command_not_found(err: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn parse_ipv4_loopback_lsof_ports(output: &str) -> Vec<u16> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix("n127.0.0.1:")?.parse().ok())
+        .collect()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -3781,7 +3899,7 @@ mod tests {
             }
         ]"#;
 
-        let candidates = parse_windows_process_candidates(output).unwrap();
+        let candidates = parse_windows_process_candidates(output, &HashMap::new()).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].pid, 4242);
         assert_eq!(candidates[0].ppid, 100);
@@ -3798,7 +3916,7 @@ mod tests {
             "CommandLine": "\"C:\\Antigravity\\language_server.exe\" --extension_server_port 49323 --csrf_token abcdef0123456789abcdef0123456789"
         }"#;
 
-        let candidates = parse_windows_process_candidates(output).unwrap();
+        let candidates = parse_windows_process_candidates(output, &HashMap::new()).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].pid, 4243);
         assert_eq!(candidates[0].declared_port, Some(49323));
@@ -3815,7 +3933,7 @@ mod tests {
 "#;
 
         assert_eq!(
-            parse_windows_netstat_ports(output, 4242),
+            parse_windows_netstat_ports(output, 4242, false),
             vec![49321, 49322]
         );
     }
@@ -4029,12 +4147,84 @@ mod tests {
         assert!(ports.is_empty());
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn desktop_listener_discovery_accepts_only_the_ipv4_loopback_endpoint() {
+        assert_eq!(
+            parse_ipv4_loopback_lsof_ports(
+                "p123\nn[::1]:4242\nn192.0.2.1:4242\nn127.0.0.1:4300->127.0.0.1:4242\nn127.0.0.1:4321"
+            ),
+            vec![4321]
+        );
+    }
+
+    #[test]
+    fn desktop_descriptor_matches_hyphenated_windows_language_server() {
+        let token = "ea1dbb2a-65a8-4766-a155-8e70f032f4ac";
+        let hubs = HashMap::from([(
+            123,
+            DesktopHub {
+                pid: 123,
+                http_port: 4321,
+                csrf_token: token.into(),
+            },
+        )]);
+        let processes = serde_json::json!({
+            "ProcessId": 123,
+            "ParentProcessId": 1,
+            "ExecutablePath": r"C:\Program Files\Antigravity\language-server.exe",
+            "CommandLine": r#""C:\Program Files\Antigravity\language-server.exe" --app_data_dir antigravity --read_host_bridge_token_from_stdin"#
+        });
+        let candidates = parse_windows_process_candidates(&processes.to_string(), &hubs).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let listeners = parse_windows_netstat_ports(
+            "TCP [::1]:4242 [::]:0 LISTENING 123\nTCP 127.0.0.1:4321 0.0.0.0:0 LISTENING 123",
+            123,
+            true,
+        );
+        assert_eq!(listeners, vec![4321]);
+        assert_eq!(candidate_probe_ports(&candidates[0], listeners), vec![4321]);
+    }
+
+    #[test]
+    fn desktop_hub_requires_a_matching_process_and_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "ea1dbb2a-65a8-4766-a155-8e70f032f4ac";
+        fs::write(
+            dir.path().join("hub_4242.json"),
+            serde_json::json!({"pid": 123, "httpPort": 4242, "csrfToken": token}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("hub_4243.json"),
+            serde_json::json!({"pid": 456, "httpPort": 4244, "csrfToken": token}).to_string(),
+        )
+        .unwrap();
+        let hubs = read_desktop_hubs(dir.path());
+        let command = "/Applications/Antigravity.app/Contents/Resources/bin/language_server --app_data_dir antigravity --read_host_bridge_token_from_stdin";
+        let candidate = process_candidate(123, 1, command, &hubs).unwrap();
+        assert_eq!(candidate.csrf_token, token);
+        assert_eq!(
+            candidate_probe_ports(&candidate, vec![4242, 9000]),
+            vec![4242]
+        );
+        assert!(candidate_probe_ports(&candidate, vec![9000]).is_empty());
+        assert!(process_candidate(456, 1, command, &hubs).is_none());
+        assert!(process_candidate(456, 1, command, &HashMap::new()).is_none());
+        let extension = command.replace(
+            "--app_data_dir antigravity",
+            "--app_data_dir antigravity-ide",
+        );
+        assert!(process_candidate(123, 1, &extension, &hubs).is_none());
+    }
+
     #[test]
     fn candidate_probe_ports_falls_back_to_declared_port() {
         let candidate = ProcessCandidate {
             pid: 1,
             ppid: 0,
             declared_port: Some(4242),
+            daemon_port: None,
             csrf_token: "token".to_string(),
         };
 
