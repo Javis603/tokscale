@@ -152,10 +152,11 @@ pub struct AntigravityManifest {
     pub sessions: Vec<ManifestSessionEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityConnection {
     pub pid: u32,
     pub port: u16,
+    pub(crate) verify_peer: bool,
     pub csrf_token: String,
     pub fingerprint: String,
 }
@@ -1318,13 +1319,28 @@ pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
         let listeners = find_listening_ports(candidate.pid, candidate.daemon_port.is_some())?;
         let ports = candidate_probe_ports(&candidate, listeners);
         for port in ports {
-            if probe_heartbeat(port, &candidate.csrf_token) {
-                connections.push(AntigravityConnection {
-                    pid: candidate.pid,
-                    port,
-                    csrf_token: candidate.csrf_token.clone(),
-                    fingerprint: format!("pid:{}:port:{}", candidate.pid, port),
-                });
+            let connection = AntigravityConnection {
+                pid: candidate.pid,
+                port,
+                verify_peer: candidate.daemon_port.is_some(),
+                csrf_token: candidate.csrf_token.clone(),
+                fingerprint: format!("pid:{}:port:{}", candidate.pid, port),
+            };
+            let reachable = if connection.verify_peer {
+                let body = serde_json::json!({ "uuid": "00000000-0000-0000-0000-000000000000" });
+                rpc_request_plain_http(
+                    &connection,
+                    "Heartbeat",
+                    &body,
+                    DEFAULT_RPC_TIMEOUT,
+                    MAX_IDENTITY_PROBE_BYTES,
+                )
+                .is_ok_and(|response| heartbeat_value_looks_well_formed(&response))
+            } else {
+                probe_heartbeat(port, &candidate.csrf_token)
+            };
+            if reachable {
+                connections.push(connection);
                 break;
             }
         }
@@ -1820,6 +1836,7 @@ fn probe_https_heartbeat(port: u16, csrf_token: &str) -> bool {
     let connection = AntigravityConnection {
         pid: 0,
         port,
+        verify_peer: false,
         csrf_token: csrf_token.to_string(),
         fingerprint: format!("port:{port}"),
     };
@@ -1933,6 +1950,7 @@ fn https_identity_probe_request(port: u16, csrf_token: &str, method: &str) -> Op
     let connection = AntigravityConnection {
         pid: 0,
         port,
+        verify_peer: false,
         csrf_token: csrf_token.to_string(),
         fingerprint: format!("port:{port}"),
     };
@@ -2414,6 +2432,15 @@ fn rpc_request_with_deadline(
     body: &Value,
     deadline: Option<&SyncDeadline>,
 ) -> Result<Value> {
+    if connection.verify_peer {
+        return rpc_request_plain_http(
+            connection,
+            method,
+            body,
+            rpc_timeout_for_deadline(deadline)?,
+            max_rpc_body_bytes(),
+        );
+    }
     // A port already known to speak TLS will never answer plaintext, so the
     // plaintext leg here is pure latency — see [`RpcTransport`].
     if cached_rpc_transport(connection.port) == Some(RpcTransport::Https) {
@@ -2431,6 +2458,7 @@ fn rpc_request_with_deadline(
         method,
         body,
         rpc_timeout_for_deadline(deadline)?,
+        max_rpc_body_bytes(),
     ) {
         Ok(value) => {
             remember_rpc_transport(connection.port, RpcTransport::PlainHttp);
@@ -2846,11 +2874,52 @@ pub(crate) async fn read_reqwest_response_with_cap(
     Ok(String::from_utf8(body)?)
 }
 
-fn rpc_request_plain_http(
+// Check the server side of this connected socket before writing any bytes.
+fn connected_peer_is_owned_by(stream: &TcpStream, pid: u32) -> Result<bool> {
+    let server = stream.peer_addr()?.to_string();
+    let client = stream.local_addr()?.to_string();
+    let pid_text = pid.to_string();
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = run_command_output(
+            "lsof",
+            &[
+                "-nP",
+                "-a",
+                "-p",
+                &pid_text,
+                "-i4TCP",
+                "-sTCP:ESTABLISHED",
+                "-Fn",
+            ],
+        )?;
+        let pair = format!("n{server}->{client}");
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == pair))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = run_command_required("netstat", &["-ano", "-p", "TCP"])?;
+        Ok(output.lines().any(|line| {
+            let mut columns = line.split_whitespace();
+            columns.next() == Some("TCP")
+                && columns.next() == Some(server.as_str())
+                && columns.next() == Some(client.as_str())
+                && columns.next() == Some("ESTABLISHED")
+                && columns.next() == Some(pid_text.as_str())
+        }))
+    }
+}
+
+pub(crate) fn rpc_request_plain_http(
     connection: &AntigravityConnection,
     method: &str,
     body: &Value,
     timeout: Duration,
+    cap: usize,
 ) -> Result<Value> {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], connection.port));
     let mut stream = TcpStream::connect_timeout(&address, timeout).with_context(|| {
@@ -2859,6 +2928,10 @@ fn rpc_request_plain_http(
             connection.port
         )
     })?;
+
+    if connection.verify_peer && !connected_peer_is_owned_by(&stream, connection.pid)? {
+        anyhow::bail!("Antigravity no longer owns the connected RPC socket");
+    }
 
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout.min(Duration::from_secs(5))))?;
@@ -2904,9 +2977,8 @@ fn rpc_request_plain_http(
         }
     }
 
-    let cap = max_rpc_body_bytes();
     let response_body = if chunked {
-        read_chunked_body(&mut reader)?
+        read_chunked_body_with_cap(&mut reader, cap)?
     } else if let Some(length) = content_length {
         if length > cap {
             return Err(anyhow::Error::new(RpcBodyCapError { length, cap }));
@@ -2934,10 +3006,6 @@ fn rpc_request_plain_http(
     }
 
     Ok(serde_json::from_str(&response_body)?)
-}
-
-fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> Result<String> {
-    read_chunked_body_with_cap(reader, max_rpc_body_bytes())
 }
 
 fn read_chunked_body_prefix(
@@ -4187,6 +4255,35 @@ mod tests {
     }
 
     #[test]
+    fn desktop_rpc_sends_no_bytes_to_an_unowned_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream.read(&mut [0_u8; 1]).unwrap()
+        });
+        let connection = AntigravityConnection {
+            pid: i32::MAX as u32,
+            port,
+            verify_peer: true,
+            csrf_token: "fixture-token".into(),
+            fingerprint: "fixture".into(),
+        };
+        assert!(rpc_request_plain_http(
+            &connection,
+            "Heartbeat",
+            &serde_json::json!({}),
+            Duration::from_secs(5),
+            MAX_IDENTITY_PROBE_BYTES,
+        )
+        .is_err());
+        assert_eq!(received.join().unwrap(), 0);
+    }
+
+    #[test]
     fn desktop_hub_requires_a_matching_process_and_listener() {
         let dir = tempfile::tempdir().unwrap();
         let token = "ea1dbb2a-65a8-4766-a155-8e70f032f4ac";
@@ -4940,6 +5037,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -4967,6 +5065,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -5000,6 +5099,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -5142,6 +5242,7 @@ mod tests {
         AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         }
@@ -5691,6 +5792,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };
@@ -5715,6 +5817,7 @@ mod tests {
         let connection = AntigravityConnection {
             pid: 1,
             port,
+            verify_peer: false,
             csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
             fingerprint: format!("pid:1:port:{port}"),
         };

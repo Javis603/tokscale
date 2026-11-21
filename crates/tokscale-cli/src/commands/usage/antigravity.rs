@@ -342,6 +342,7 @@ fn quota_client(round: Duration) -> Result<reqwest::Client> {
 pub(crate) enum TargetCsrfToken {
     /// Explicit CSRF token to send via the `X-Codeium-Csrf-Token` header.
     Token(String),
+    VerifiedDesktop(crate::antigravity::AntigravityConnection),
     /// Explicitly unauthenticated: bypasses any environment or session fallback and sends no header.
     Unauthenticated,
     /// Fall back to `ANTIGRAVITY_CSRF_TOKEN` or active session file if available.
@@ -422,16 +423,27 @@ async fn call_rpc(
     port: u16,
     csrf_token: TargetCsrfToken,
 ) -> Result<QuotaSummary> {
-    let mut request = client
-        .post(format!("http://127.0.0.1:{port}{RPC_PATH}"))
-        // Connect-RPC rejects the request without this header.
-        .header("Connect-Protocol-Version", "1");
-
     let token: Option<String> = match csrf_token {
+        TargetCsrfToken::VerifiedDesktop(connection) => {
+            let body = tokio::task::spawn_blocking(move || {
+                crate::antigravity::rpc_request_plain_http(
+                    &connection,
+                    "RetrieveUserQuotaSummary",
+                    &serde_json::json!({}),
+                    DISCOVERY_ROUND_TIMEOUT,
+                    MAX_QUOTA_BODY_BYTES,
+                )
+            })
+            .await??;
+            return Ok(serde_json::from_value::<QuotaSummaryEnvelope>(body)?.response);
+        }
         TargetCsrfToken::Token(t) => Some(t),
         TargetCsrfToken::Unauthenticated => None,
         TargetCsrfToken::Fallback => resolve_csrf_token(None),
     };
+    let mut request = client
+        .post(format!("http://127.0.0.1:{port}{RPC_PATH}"))
+        .header("Connect-Protocol-Version", "1");
 
     if let Some(token) = token.filter(|t| !t.trim().is_empty()) {
         request = request.header("X-Codeium-Csrf-Token", token);
@@ -954,7 +966,11 @@ fn detected_targets() -> Vec<CandidateTarget> {
                 .into_iter()
                 .map(|connection| CandidateTarget {
                     port: connection.port,
-                    csrf_token: TargetCsrfToken::Token(connection.csrf_token),
+                    csrf_token: if connection.verify_peer {
+                        TargetCsrfToken::VerifiedDesktop(connection)
+                    } else {
+                        TargetCsrfToken::Token(connection.csrf_token)
+                    },
                 })
                 .collect()
         })
