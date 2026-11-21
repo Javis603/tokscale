@@ -6446,7 +6446,7 @@ fn aggregate_model_usage_entries_with_rollup(
 ) -> Vec<ModelUsage> {
     let mut fold = ModelUsageFold::new(group_by, rollup);
     for msg in &messages {
-        fold.add(msg);
+        fold.add(msg, 0);
     }
     fold.finish_with_labeler(&mut WorkspaceLabeler::default())
         .into_iter()
@@ -6464,7 +6464,7 @@ fn aggregate_model_usage_entries_with_labeler(
     let mut fold = ModelUsageFold::new(group_by, rollup);
     fold.labeler = std::mem::take(labeler);
     for message in &messages {
-        fold.add(message);
+        fold.add(message, 0);
     }
     fold.finish_with_labeler(labeler)
         .into_iter()
@@ -6512,7 +6512,7 @@ impl ModelUsageFold {
         }
     }
 
-    fn add(&mut self, msg: &UnifiedMessage) {
+    fn add(&mut self, msg: &UnifiedMessage, unpriced_tokens: i64) {
         let group_by = &self.group_by;
         // Bucketing a workspace resolves its label, which reads the filesystem. Every
         // other grouping discards that label a few lines below, so skip the work rather
@@ -6630,13 +6630,12 @@ impl ModelUsageFold {
         entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
-        if msg.cost_source == CostSource::Unknown
-            && pricing::lookup::antigravity_pricing_route_model_part(&msg.model_id).is_some()
-        {
-            let tokens = positive_token_total(&msg.tokens);
-            if tokens > 0 {
-                row.unpriced_tokens = Some(row.unpriced_tokens.unwrap_or(0).saturating_add(tokens));
-            }
+        if unpriced_tokens > 0 {
+            row.unpriced_tokens = Some(
+                row.unpriced_tokens
+                    .unwrap_or(0)
+                    .saturating_add(unpriced_tokens),
+            );
         }
         entry
             .performance
@@ -6700,6 +6699,44 @@ pub fn message_machine_label(message: &UnifiedMessage) -> &str {
         .unwrap_or(machine_label::DEFAULT_LOCAL_MACHINE_LABEL)
 }
 
+fn unpriced_antigravity_tokens(
+    message: &UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+) -> i64 {
+    if pricing::lookup::antigravity_pricing_route_model_part(&message.model_id).is_none()
+        || message.has_authoritative_cost()
+    {
+        return 0;
+    }
+
+    let tokens = &message.tokens;
+    if message.cost_source == CostSource::Unknown {
+        return positive_token_total(tokens);
+    }
+
+    let Some(rate) =
+        pricing.and_then(|pricing| pricing.resolve_context(&message.pricing_context(), tokens))
+    else {
+        return 0;
+    };
+    rate.pricing
+        .uncovered_buckets(tokens)
+        .into_iter()
+        .fold(0_i64, |sum, bucket| {
+            sum.saturating_add(match bucket {
+                "input" => tokens.input.max(0),
+                "output" => tokens.output.max(0).saturating_add(tokens.reasoning.max(0)),
+                "cache_read" => tokens.cache_read.max(0),
+                "cache_write" => tokens
+                    .cache_write
+                    .saturating_sub(tokens.cache_write_1h)
+                    .max(0),
+                "cache_write_1h" => tokens.cache_write_1h.max(0).min(tokens.cache_write.max(0)),
+                _ => 0,
+            })
+        })
+}
+
 fn positive_token_total(tokens: &TokenBreakdown) -> i64 {
     // saturating so multiple clamped (i64::MAX) buckets can't overflow the sum.
     tokens
@@ -6737,14 +6774,16 @@ fn model_report_token_totals(entries: &[ModelUsage]) -> (i64, i64, i64, i64) {
 /// at a time, so each message is dropped as soon as it is counted.
 struct ModelReportSink<'a> {
     options: &'a ReportOptions,
+    pricing: Option<&'a pricing::PricingService>,
     fold: ModelUsageFold,
     undated_tokens: TokenBreakdown,
 }
 
 impl<'a> ModelReportSink<'a> {
-    fn new(options: &'a ReportOptions) -> Self {
+    fn new(options: &'a ReportOptions, pricing: Option<&'a pricing::PricingService>) -> Self {
         Self {
             options,
+            pricing,
             fold: ModelUsageFold::new(&options.group_by, options.worktree_rollup),
             undated_tokens: TokenBreakdown::default(),
         }
@@ -6768,7 +6807,10 @@ impl MessageSink for ModelReportSink<'_> {
         if claude_desktop::is_undated_balance(&message) {
             self.undated_tokens.add_assign_saturating(&message.tokens);
         }
-        self.fold.add(&message);
+        self.fold.add(
+            &message,
+            unpriced_antigravity_tokens(&message, self.pricing),
+        );
     }
 }
 
@@ -6804,7 +6846,7 @@ pub async fn get_model_report_with_entry_pricing(
         options.group_by,
         GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
     );
-    let mut sink = ModelReportSink::new(&options);
+    let mut sink = ModelReportSink::new(&options, pricing.as_deref());
     let mut sessions = Vec::new();
     let claude_desktop_cache = if recovery::applicable(&home_dir) || session_grouped {
         let (messages, coverage) = parse_all_messages_with_coverage(
@@ -13507,15 +13549,30 @@ mod tests {
             message
         };
         let orchestrator = "gemini-pro-orchestrator-neon";
+        let pricing = pricing::PricingService::new(
+            std::collections::HashMap::from([(
+                "gemini-4-neon".into(),
+                pricing::litellm::ModelPricing {
+                    input_cost_per_token: Some(3e-6),
+                    ..Default::default()
+                },
+            )]),
+            std::collections::HashMap::new(),
+        );
+        let mut partial = make(orchestrator, 40, 0.25, CostSource::Estimated);
+        partial.tokens.cache_read = 500;
         let mut fold =
             super::ModelUsageFold::new(&GroupBy::ClientSession, WorktreeRollup::default());
         for message in [
             make(orchestrator, 10, 0.0, CostSource::Unknown),
             make(orchestrator, 20, 0.0, CostSource::Unknown),
-            make(orchestrator, 40, 0.25, CostSource::Estimated),
+            partial,
             make("gemini-4-neon", 50, 0.5, CostSource::Estimated),
         ] {
-            fold.add(&message);
+            fold.add(
+                &message,
+                super::unpriced_antigravity_tokens(&message, Some(&pricing)),
+            );
         }
         let entries = fold.finish_with_labeler(&mut super::WorkspaceLabeler::default());
         let row = entries
@@ -13525,7 +13582,7 @@ mod tests {
         assert_eq!(row.usage.input, 70);
         assert_eq!(row.usage.message_count, 3);
         assert_eq!(row.usage.cost, 0.25);
-        assert_eq!(row.unpriced_tokens, Some(30));
+        assert_eq!(row.unpriced_tokens, Some(530));
         assert_eq!(entries[0].usage.model, "gemini-4-neon");
         assert_eq!(entries[0].unpriced_tokens, None);
     }
@@ -33745,7 +33802,7 @@ mod tests {
                         group_by: group_by.clone(),
                         ..Default::default()
                     };
-                    let mut sink = ModelReportSink::new(&options);
+                    let mut sink = ModelReportSink::new(&options, None);
                     for message in messages.clone() {
                         sink.accept(message);
                     }

@@ -845,7 +845,7 @@ impl PricingLookup {
             // executor roles. Use those models for local API-equivalent cost,
             // while keeping the route IDs in reports and requiring separate
             // billing evidence for submission.
-            let pricing_model = match requested_model {
+            let pricing_model = match lower_ref {
                 "gemini-pro-orchestrator-neon" => "gemini-4-neon",
                 "gemini-flash-worker-agy" => "gemini-4-hydrogen",
                 _ => return None,
@@ -7556,6 +7556,10 @@ mod tests {
             lookup.lookup("gemini-4-neon").unwrap().matched_key,
             "google/gemini-4-neon"
         );
+
+        assert!(lookup
+            .lookup("accounts/fireworks/models/gemini-flash-worker-agy")
+            .is_none());
 
         let neon = "gemini-pro-orchestrator-neon";
         litellm.insert(neon.into(), rate);
