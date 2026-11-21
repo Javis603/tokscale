@@ -4672,7 +4672,12 @@ mod tests {
                 .await
                 .unwrap();
             started_tx.send(()).unwrap();
-            assert_eq!(peer.read(&mut [0_u8; 1]).await.unwrap(), 0);
+            match peer.read(&mut [0_u8; 1]).await {
+                // Closing with an unread partial response can reset the peer.
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("expected the cancelled quota socket to close, got {result:?}"),
+            }
         });
         let connection = AntigravityConnection {
             pid: std::process::id(),
