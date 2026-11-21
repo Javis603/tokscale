@@ -1314,25 +1314,24 @@ fn bool_label(value: bool) -> &'static str {
 }
 
 pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
-    connections_from_candidates(detect_process_candidates()?, DesktopProbe::Heartbeat)
+    connections_from_candidates(detect_process_candidates()?, true)
 }
 
-pub(crate) fn detect_antigravity_quota_candidates() -> Result<Vec<AntigravityConnection>> {
-    connections_from_candidates(detect_process_candidates()?, DesktopProbe::Quota)
-}
-
-enum DesktopProbe {
-    Heartbeat,
-    Quota,
+pub(crate) fn detect_legacy_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
+    connections_from_candidates(detect_process_candidates()?, false)
 }
 
 fn connections_from_candidates(
     candidates: Vec<ProcessCandidate>,
-    desktop_probe: DesktopProbe,
+    include_desktop_descriptors: bool,
 ) -> Result<Vec<AntigravityConnection>> {
     let mut connections = Vec::new();
 
     for candidate in candidates {
+        // The legacy quota client does not verify ownership of its socket.
+        if !include_desktop_descriptors && candidate.daemon_port.is_some() {
+            continue;
+        }
         let listeners = find_listening_ports(candidate.pid, candidate.daemon_port.is_some())?;
         let ports = candidate_probe_ports(&candidate, listeners);
         for port in ports {
@@ -1344,23 +1343,15 @@ fn connections_from_candidates(
                 fingerprint: format!("pid:{}:port:{}", candidate.pid, port),
             };
             let reachable = if connection.verify_peer {
-                match desktop_probe {
-                    DesktopProbe::Heartbeat => {
-                        let body =
-                            serde_json::json!({ "uuid": "00000000-0000-0000-0000-000000000000" });
-                        rpc_request_plain_http(
-                            &connection,
-                            "Heartbeat",
-                            &body,
-                            DEFAULT_RPC_TIMEOUT,
-                            MAX_IDENTITY_PROBE_BYTES,
-                        )
-                        .is_ok_and(|response| heartbeat_value_looks_well_formed(&response))
-                    }
-                    // The quota round establishes reachability and verifies the
-                    // connected peer before sending the descriptor credential.
-                    DesktopProbe::Quota => true,
-                }
+                let body = serde_json::json!({ "uuid": "00000000-0000-0000-0000-000000000000" });
+                rpc_request_plain_http(
+                    &connection,
+                    "Heartbeat",
+                    &body,
+                    DEFAULT_RPC_TIMEOUT,
+                    MAX_IDENTITY_PROBE_BYTES,
+                )
+                .is_ok_and(|response| heartbeat_value_looks_well_formed(&response))
             } else {
                 probe_heartbeat(port, &candidate.csrf_token)
             };
@@ -3075,50 +3066,7 @@ fn rpc_socket_disconnected(err: &anyhow::Error) -> bool {
     })
 }
 
-// The quota discovery round may drop this future. Its socket closes and its
-// ownership subprocess is terminated, so runtime shutdown cannot wait on I/O.
-pub(crate) async fn desktop_quota_rpc(
-    connection: &AntigravityConnection,
-    cap: usize,
-) -> Result<Value> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    const METHOD: &str = "RetrieveUserQuotaSummary";
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], connection.port));
-    let mut stream = tokio::net::TcpStream::connect(addr).await?;
-    let pid = connection.pid.to_string();
-    let (program, args) = peer_ownership_query(&pid);
-    let output = peer_ownership_output(program, &args).await?;
-    if !output.status.success()
-        || !owns_connected_peer(
-            &String::from_utf8_lossy(&output.stdout),
-            stream.peer_addr()?,
-            stream.local_addr()?,
-            &pid,
-        )
-    {
-        anyhow::bail!("Antigravity no longer owns the connected RPC socket");
-    }
-    let request = plain_rpc_request(connection, METHOD, "{}", false);
-    stream.write_all(request.as_bytes()).await?;
-
-    // Connection: close bounds the response by EOF. Allow wire framing in
-    // addition to the decoded body, which the shared parser caps separately.
-    let wire_cap = cap.saturating_mul(8).saturating_add(64 * 1024);
-    let mut response = Vec::new();
-    stream
-        .take(wire_cap as u64 + 1)
-        .read_to_end(&mut response)
-        .await?;
-    if response.len() > wire_cap {
-        return Err(anyhow::Error::new(RpcBodyCapError {
-            length: response.len(),
-            cap: wire_cap,
-        }));
-    }
-    read_plain_rpc_response(std::io::Cursor::new(response), METHOD, cap)
-}
-
-pub(crate) fn rpc_request_plain_http(
+fn rpc_request_plain_http(
     connection: &AntigravityConnection,
     method: &str,
     body: &Value,
@@ -4523,14 +4471,8 @@ mod tests {
     }
 
     #[test]
-    fn desktop_quota_discovery_does_not_connect_before_the_quota_round() {
+    fn legacy_discovery_excludes_descriptor_credentials() {
         let pid = std::process::id();
-        let pid_text = pid.to_string();
-        let (program, args) = peer_ownership_query(&pid_text);
-        if run_command_output(program, &args).is_err_and(|error| is_command_not_found(&error)) {
-            return;
-        }
-
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4542,13 +4484,11 @@ mod tests {
                 daemon_port: Some(port),
                 csrf_token: "fixture-token".into(),
             }],
-            DesktopProbe::Quota,
+            false,
         )
         .unwrap();
 
-        assert_eq!(connections.len(), 1);
-        assert_eq!(connections[0].port, port);
-        assert!(connections[0].verify_peer);
+        assert!(connections.is_empty());
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -4648,56 +4588,6 @@ mod tests {
         }
         assert!(rpc.desktop_sockets.is_empty());
         server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn desktop_quota_cancellation_closes_a_stalled_socket() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let pid = std::process::id().to_string();
-        let (program, args) = peer_ownership_query(&pid);
-        if run_command_output(program, &args).is_err_and(|error| is_command_not_found(&error)) {
-            return;
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n{}") {
-                request.push(peer.read_u8().await.unwrap());
-            }
-            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{")
-                .await
-                .unwrap();
-            started_tx.send(()).unwrap();
-            match peer.read(&mut [0_u8; 1]).await {
-                // Closing with an unread partial response can reset the peer.
-                Ok(0) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-                result => panic!("expected the cancelled quota socket to close, got {result:?}"),
-            }
-        });
-        let connection = AntigravityConnection {
-            pid: std::process::id(),
-            port,
-            verify_peer: true,
-            csrf_token: "fixture-token".into(),
-            fingerprint: "fixture".into(),
-        };
-        let mut request = Box::pin(desktop_quota_rpc(&connection, 1024));
-        tokio::select! {
-            result = &mut request => panic!("quota request finished before the server stalled: {result:?}"),
-            result = tokio::time::timeout(Duration::from_secs(5), started_rx) => result.unwrap().unwrap(),
-        }
-        assert!(tokio::time::timeout(Duration::from_millis(50), request)
-            .await
-            .is_err());
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap();
     }
 
     #[test]
