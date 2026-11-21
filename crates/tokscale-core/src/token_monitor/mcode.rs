@@ -38,6 +38,10 @@ use std::path::{Path, PathBuf};
 
 pub const CLIENT_ID: &str = "mcode";
 const CACHE_VERSION: u32 = 3;
+const SESSIONS_PATH: &str = "v2/sessions";
+const SESSION_DEPTH: usize = 4;
+const ACTIVE_HISTORY: &str = "messages.jsonl";
+const SNAPSHOTS_DIR: &str = "snapshots";
 
 const ENV_OVERRIDES: [&str; 2] = ["MINIMAX_DATA_DIR", "MAVIS_DATA_DIR"];
 /// The current default data directory and the one earlier releases used. A
@@ -46,29 +50,82 @@ const DATA_DIR_BASENAMES: [&str; 2] = [".minimax", ".mavis"];
 
 /// Data directories to read, in the order MiniMax Code would choose them.
 ///
-/// A non-empty override is the only directory, as it is for MiniMax Code
-/// itself; it is ignored when the scan targets another home (`--home`), whose
-/// environment it does not describe. Otherwise every default and profile
-/// directory under the home is read, since the desktop app and each profile
-/// can write to a different one.
+/// A non-empty override replaces the home directories, as it does for MiniMax
+/// Code itself; extra `mcode:` data directories from `TOKSCALE_EXTRA_DIRS` are
+/// appended afterward so the original and a relocated store are read together.
+/// Both environment inputs are ignored when targeting another home (`--home`).
+/// Otherwise every default and profile directory under the home is read, since
+/// the desktop app and each profile can write to a different one.
 pub fn data_dirs(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut dirs = if use_env_roots {
+        ENV_OVERRIDES
+            .iter()
+            .find_map(|name| non_empty(std::env::var(name).ok()))
+            .map(|dir| vec![PathBuf::from(dir)])
+            .unwrap_or_else(|| named_data_dirs(Path::new(home_dir)))
+    } else {
+        named_data_dirs(Path::new(home_dir))
+    };
     if use_env_roots {
-        for name in ENV_OVERRIDES {
-            if let Some(value) = std::env::var(name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-            {
-                return vec![PathBuf::from(value)];
+        if let Some(extra) = non_empty(std::env::var("TOKSCALE_EXTRA_DIRS").ok()) {
+            let enabled = HashSet::from([crate::ClientId::Mcode]);
+            for (_, path) in crate::scanner::parse_extra_dirs(&extra, &enabled) {
+                dirs.push(PathBuf::from(path));
             }
         }
     }
-    let home = Path::new(home_dir);
+    dirs
+}
+
+pub(crate) fn runtime_session_roots(home_dir: &str, use_env_roots: bool) -> HashSet<PathBuf> {
+    data_dirs(home_dir, use_env_roots)
+        .into_iter()
+        .filter_map(|dir| std::fs::canonicalize(dir.join(SESSIONS_PATH)).ok())
+        .collect()
+}
+
+/// Runtime history follows the store layout, even when an extra scan root
+/// exposes both store files and genuine headless captures.
+pub(crate) fn is_runtime_history(path: &Path, resolved: &Path, roots: &HashSet<PathBuf>) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    matches_history_layout(resolved, |_, root| roots.contains(root))
+        || (path != resolved
+            && matches_history_layout(path, |session_dir, root| {
+                // The store reader follows history-file links but skips
+                // directory links when discovering sessions below its root.
+                std::fs::canonicalize(root).is_ok_and(|root| roots.contains(&root))
+                    && session_dir
+                        .ancestors()
+                        .take(SESSION_DEPTH)
+                        .all(|dir| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
+            }))
+}
+
+fn matches_history_layout(path: &Path, owns_session: impl Fn(&Path, &Path) -> bool) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let in_store = |session_dir: &Path| {
+        session_dir
+            .ancestors()
+            .nth(SESSION_DEPTH)
+            .is_some_and(|root| owns_session(session_dir, root))
+    };
+    (path.file_name().is_some_and(|name| name == ACTIVE_HISTORY) && in_store(parent))
+        || (path.extension().is_some_and(|ext| ext == "jsonl")
+            && parent.file_name().is_some_and(|name| name == SNAPSHOTS_DIR)
+            && parent.parent().is_some_and(in_store))
+}
+
+/// Default and profile data directories directly under `root`.
+fn named_data_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = DATA_DIR_BASENAMES
         .iter()
-        .map(|name| home.join(name))
+        .map(|name| root.join(name))
         .collect();
-    let mut profiles: Vec<PathBuf> = std::fs::read_dir(home)
+    let mut profiles: Vec<PathBuf> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
@@ -145,7 +202,7 @@ fn parse_with(scope: &Scope, cache_path: &Path) -> Vec<UnifiedMessage> {
     let mut seen_messages = HashSet::new();
     let mut messages = Vec::new();
     for data_dir in data_dirs(scope.home_dir, scope.use_env_roots) {
-        let sessions_root = data_dir.join("v2").join("sessions");
+        let sessions_root = data_dir.join(SESSIONS_PATH);
         // `.mavis` is often a link to `.minimax`; read each store once.
         let Ok(canonical) = std::fs::canonicalize(&sessions_root) else {
             continue;
@@ -195,7 +252,7 @@ fn headless_turn(key: &str) -> Option<(String, String)> {
 /// `<sessions>/<yyyy>/<mm>/<dd>/<dir>`, sorted so output order is stable.
 fn session_dirs(sessions_root: &Path) -> Vec<PathBuf> {
     let mut level = vec![sessions_root.to_path_buf()];
-    for _ in 0..4 {
+    for _ in 0..SESSION_DEPTH {
         level = level
             .iter()
             .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten())
@@ -288,7 +345,7 @@ fn manifest_session_id(session_dir: &Path) -> Option<String> {
 /// Snapshots oldest generation first, then the active history, so a message
 /// keeps the place it was first committed in when it reappears later.
 fn history_files(session_dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(session_dir.join("snapshots"))
+    let mut files: Vec<PathBuf> = std::fs::read_dir(session_dir.join(SNAPSHOTS_DIR))
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
@@ -296,7 +353,7 @@ fn history_files(session_dir: &Path) -> Vec<PathBuf> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
     files.sort();
-    files.push(session_dir.join("messages.jsonl"));
+    files.push(session_dir.join(ACTIVE_HISTORY));
     files
 }
 
@@ -1022,5 +1079,23 @@ mod tests {
             ),
             (0, 9, 2, 1)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn extra_scan_paths_append_another_data_dir() {
+        let mut env = clear_env();
+        let home = tempfile::tempdir().unwrap();
+        let extra_dir = tempfile::tempdir().unwrap();
+        let extra = extra_dir.path().join(".minimax");
+        env.set("TOKSCALE_EXTRA_DIRS", format!("mcode:{}", extra.display()));
+
+        let dirs = data_dirs(home.path().to_str().unwrap(), true);
+        assert!(dirs.contains(&home.path().join(".minimax")));
+        assert!(dirs.contains(&extra));
+
+        // --home scans ignore host TOKSCALE_EXTRA_DIRS just like MINIMAX_DATA_DIR.
+        let scoped = data_dirs(home.path().to_str().unwrap(), false);
+        assert!(!scoped.contains(&extra));
     }
 }
