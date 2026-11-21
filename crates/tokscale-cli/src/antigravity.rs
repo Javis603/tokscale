@@ -1314,7 +1314,22 @@ fn bool_label(value: bool) -> &'static str {
 }
 
 pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
-    let candidates = detect_process_candidates()?;
+    connections_from_candidates(detect_process_candidates()?, DesktopProbe::Heartbeat)
+}
+
+pub(crate) fn detect_antigravity_quota_candidates() -> Result<Vec<AntigravityConnection>> {
+    connections_from_candidates(detect_process_candidates()?, DesktopProbe::Quota)
+}
+
+enum DesktopProbe {
+    Heartbeat,
+    Quota,
+}
+
+fn connections_from_candidates(
+    candidates: Vec<ProcessCandidate>,
+    desktop_probe: DesktopProbe,
+) -> Result<Vec<AntigravityConnection>> {
     let mut connections = Vec::new();
 
     for candidate in candidates {
@@ -1329,15 +1344,23 @@ pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
                 fingerprint: format!("pid:{}:port:{}", candidate.pid, port),
             };
             let reachable = if connection.verify_peer {
-                let body = serde_json::json!({ "uuid": "00000000-0000-0000-0000-000000000000" });
-                rpc_request_plain_http(
-                    &connection,
-                    "Heartbeat",
-                    &body,
-                    DEFAULT_RPC_TIMEOUT,
-                    MAX_IDENTITY_PROBE_BYTES,
-                )
-                .is_ok_and(|response| heartbeat_value_looks_well_formed(&response))
+                match desktop_probe {
+                    DesktopProbe::Heartbeat => {
+                        let body =
+                            serde_json::json!({ "uuid": "00000000-0000-0000-0000-000000000000" });
+                        rpc_request_plain_http(
+                            &connection,
+                            "Heartbeat",
+                            &body,
+                            DEFAULT_RPC_TIMEOUT,
+                            MAX_IDENTITY_PROBE_BYTES,
+                        )
+                        .is_ok_and(|response| heartbeat_value_looks_well_formed(&response))
+                    }
+                    // The quota round establishes reachability and verifies the
+                    // connected peer before sending the descriptor credential.
+                    DesktopProbe::Quota => true,
+                }
             } else {
                 probe_heartbeat(port, &candidate.csrf_token)
             };
@@ -4497,6 +4520,39 @@ mod tests {
         );
         assert_eq!(listeners, vec![4321]);
         assert_eq!(candidate_probe_ports(&candidates[0], listeners), vec![4321]);
+    }
+
+    #[test]
+    fn desktop_quota_discovery_does_not_connect_before_the_quota_round() {
+        let pid = std::process::id();
+        let pid_text = pid.to_string();
+        let (program, args) = peer_ownership_query(&pid_text);
+        if run_command_output(program, &args).is_err_and(|error| is_command_not_found(&error)) {
+            return;
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = connections_from_candidates(
+            vec![ProcessCandidate {
+                pid,
+                ppid: 0,
+                declared_port: None,
+                daemon_port: Some(port),
+                csrf_token: "fixture-token".into(),
+            }],
+            DesktopProbe::Quota,
+        )
+        .unwrap();
+
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].port, port);
+        assert!(connections[0].verify_peer);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[cfg(unix)]

@@ -70,8 +70,9 @@ const RPC_PATH: &str = "/exa.language_server_pb.LanguageServerService/RetrieveUs
 /// second an expired deadline, and `tokio::time::timeout_at` resolves an
 /// expired deadline by polling once and dropping the task set, so the second
 /// source's requests were abandoned before a socket was opened. Neither round
-/// covers [`crate::antigravity::detect_antigravity_connections`], which is
-/// synchronous and carries per-socket timeouts of its own.
+/// covers synchronous process and listener discovery or legacy Heartbeats.
+/// Descriptor-backed desktop targets verify their socket and query quota
+/// within the round itself.
 ///
 /// Bounded at all because usage providers share a fan-out: whatever this
 /// spends is spent by the whole `tokscale usage` report. 10s across both
@@ -809,9 +810,8 @@ fn register_antigravity_hook_with(before_replace: impl FnOnce()) -> Result<PathB
 ///    when populated by an Antigravity `SessionStart` lifecycle hook.
 /// 3. The CLI log, which records `listening on random port at NNNN for HTTP`
 ///    on every start. Reading one file beats enumerating processes.
-/// 4. [`crate::antigravity::detect_antigravity_connections`], which finds the
-///    IDE's language server. That path extracts `--csrf_token` and the declared
-///    or listening port from the running process.
+/// 4. [`crate::antigravity::detect_antigravity_quota_candidates`], which finds
+///    language servers through desktop descriptors or legacy process flags.
 ///
 /// Candidates are asked rather than trusted: the process listens on both an
 /// HTTPS (gRPC) port and an HTTP one, and only the latter speaks plain JSON.
@@ -952,7 +952,7 @@ fn targets_from_cli_log() -> Vec<CandidateTarget> {
 
 /// Candidate targets of IDE language servers found by scanning processes.
 fn detected_targets() -> Vec<CandidateTarget> {
-    crate::antigravity::detect_antigravity_connections()
+    crate::antigravity::detect_antigravity_quota_candidates()
         .map(|connections| {
             connections
                 .into_iter()
