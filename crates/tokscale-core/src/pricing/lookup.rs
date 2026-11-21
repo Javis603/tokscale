@@ -250,7 +250,10 @@ impl ResolutionEvidence {
                 return Some(SubmissionSafetyGap::UnverifiedProviderIdentity);
             }
             ResolutionKind::Fuzzy | ResolutionKind::ProviderScoped => {}
-            _ => return None,
+            _ => {
+                return (!self.exact_model_identity)
+                    .then_some(SubmissionSafetyGap::UnverifiedModelIdentity);
+            }
         }
         if !self.price_consensus {
             return Some(SubmissionSafetyGap::PriceDisagreement);
@@ -831,8 +834,32 @@ impl PricingLookup {
             result
         };
 
+        let direct = do_lookup(lower_ref).map(annotate_direct);
+        // Antigravity route IDs remain intact in reports. These aliases
+        // select standard model rates for local estimates only.
+        let pricing_alias = match lower_ref {
+            "gemini-pro-orchestrator-neon" => Some("gemini-4-neon"),
+            "gemini-pro-orchestrator-g1-pro" => Some("gemini-4-argon"),
+            "gemini-flash-worker-agy" => Some("gemini-4-hydrogen"),
+            _ => None,
+        };
+        if let Some(row) = pricing_alias
+            .filter(|_| {
+                !direct
+                    .as_ref()
+                    .is_some_and(|row| terminal_model_identity(&row.matched_key) == lower_ref)
+            })
+            .and_then(|model| {
+                do_lookup(model).filter(|row| terminal_model_identity(&row.matched_key) == model)
+            })
+        {
+            let mut row = row.with_alias();
+            row.evidence.exact_model_identity = false;
+            return Some(row);
+        }
+
         // 1. Try direct lookup
-        if let Some(result) = do_lookup(lower_ref).map(annotate_direct) {
+        if let Some(result) = direct {
             if unsafe_claude_resolution(&result) {
                 return None;
             }
@@ -7471,6 +7498,72 @@ mod tests {
         let result = lookup.lookup("gemini-3-pro").unwrap();
         assert_eq!(result.matched_key, "openrouter/google/gemini-3-pro-preview");
         assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn antigravity_routes_prefer_verified_pricing_aliases() {
+        let rate = ModelPricing {
+            input_cost_per_token: Some(2e-6),
+            output_cost_per_token: Some(12e-6),
+            cache_read_input_token_cost: Some(2e-7),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::from([
+            ("gemini/gemini-pro-latest".into(), rate.clone()),
+            ("gemini/gemini-flash-lite-latest".into(), rate.clone()),
+        ]);
+        let openrouter = HashMap::from([
+            ("google/gemini-4-neon".into(), rate.clone()),
+            ("google/gemini-4-argon".into(), rate.clone()),
+            ("google/gemini-4-hydrogen".into(), rate.clone()),
+        ]);
+        let lookup = PricingLookup::new(litellm.clone(), openrouter.clone(), HashMap::new());
+
+        let fallback = PricingLookup::new(litellm.clone(), HashMap::new(), HashMap::new());
+        for model in [
+            "gemini-pro-orchestrator-argon",
+            "gemini-pro-orchestrator-carbon",
+        ] {
+            let result = lookup.lookup(model).unwrap();
+            assert_eq!(
+                result.matched_key,
+                fallback.lookup(model).unwrap().matched_key
+            );
+            assert!(!result.evidence.alias_applied);
+        }
+        for (raw, expected) in [
+            ("gemini-pro-orchestrator-neon", "google/gemini-4-neon"),
+            ("gemini-pro-orchestrator-g1-pro", "google/gemini-4-argon"),
+            ("gemini-flash-worker-agy", "google/gemini-4-hydrogen"),
+        ] {
+            for hint in [None, Some("google")] {
+                let result = lookup.lookup_with_provider(raw, hint).unwrap();
+                assert_eq!(result.matched_key, expected);
+                assert!(result.evidence.alias_applied);
+                assert!(!result.evidence.exact_model_identity);
+                assert!(!result.evidence.is_submission_safe());
+            }
+            assert_eq!(
+                lookup
+                    .lookup_with_source(raw, Some("litellm"))
+                    .unwrap()
+                    .matched_key,
+                fallback.lookup(raw).unwrap().matched_key,
+            );
+        }
+        assert_eq!(
+            lookup.lookup("gemini-4-neon").unwrap().matched_key,
+            "google/gemini-4-neon"
+        );
+
+        assert!(lookup
+            .lookup("accounts/fireworks/models/gemini-flash-worker-agy")
+            .is_none());
+
+        let neon = "gemini-pro-orchestrator-neon";
+        litellm.insert(neon.into(), rate);
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        assert_eq!(lookup.lookup(neon).unwrap().matched_key, neon);
     }
 
     #[test]
