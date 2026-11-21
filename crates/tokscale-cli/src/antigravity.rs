@@ -69,8 +69,7 @@ impl SyncDeadline {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-static HTTPS_RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[cfg(not(target_os = "windows"))]
 static HTTPS_RPC_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -423,8 +422,11 @@ fn sync_antigravity_cache_impl_with_deadline(
 
     let manifest = load_antigravity_manifest()?;
     let mut outcome = SyncCacheOutcome::default();
-    let (summaries, list_errors) =
-        list_trajectory_summaries_with_errors(connections, deadline.as_ref());
+    let mut rpc = SyncRpc {
+        deadline: deadline.as_ref(),
+        ..SyncRpc::default()
+    };
+    let (summaries, list_errors) = list_trajectory_summaries_with_errors(connections, &mut rpc);
     outcome.failed_sessions += list_errors.len();
     if let Some(err) = list_errors.into_iter().next() {
         outcome.partial_error = Some(err);
@@ -451,7 +453,7 @@ fn sync_antigravity_cache_impl_with_deadline(
 
     for candidate in &export_candidates {
         if let Some(summary) = find_summary_for_candidate(&summaries, &candidate.session_id) {
-            match fetch_session_artifact(summary, connections, &mut enrichment, deadline.as_ref()) {
+            match fetch_session_artifact(summary, connections, &mut enrichment, &mut rpc) {
                 Ok(Some(artifact)) => {
                     let path = write_session_artifact(&summary.session_id, &artifact.contents)?;
                     let relative_path = to_relative_artifact_path(&path)?;
@@ -519,7 +521,7 @@ fn sync_antigravity_cache_impl_with_deadline(
             connections,
             candidate,
             &mut enrichment,
-            deadline.as_ref(),
+            &mut rpc,
         ) {
             Ok(Some(entry)) => {
                 next_manifest.sessions.push(entry);
@@ -2175,17 +2177,16 @@ fn run_command_output(program: &str, args: &[&str]) -> Result<std::process::Outp
 
 fn list_trajectory_summaries_with_errors(
     connections: &[AntigravityConnection],
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> (Vec<TrajectorySummary>, Vec<anyhow::Error>) {
     let mut merged: HashMap<String, TrajectorySummary> = HashMap::new();
     let mut errors = Vec::new();
 
     for connection in connections {
-        let response = match rpc_request_with_deadline(
+        let response = match rpc.request(
             connection,
             "GetAllCascadeTrajectories",
             &serde_json::json!({}),
-            deadline,
         ) {
             Ok(response) => response,
             Err(err) => {
@@ -2392,7 +2393,7 @@ fn fetch_historical_session_artifact(
     connections: &[AntigravityConnection],
     candidate: &SessionCandidate,
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<Option<ManifestSessionEntry>> {
     let fallback_summary = TrajectorySummary {
         session_id: session_id.to_string(),
@@ -2404,9 +2405,7 @@ fn fetch_historical_session_artifact(
             .unwrap_or_default(),
     };
 
-    if let Some(artifact) =
-        fetch_session_artifact(&fallback_summary, connections, budget, deadline)?
-    {
+    if let Some(artifact) = fetch_session_artifact(&fallback_summary, connections, budget, rpc)? {
         let path = write_session_artifact(session_id, &artifact.contents)?;
         return Ok(Some(ManifestSessionEntry {
             session_id: session_id.to_string(),
@@ -2423,24 +2422,70 @@ fn fetch_historical_session_artifact(
 
 #[cfg(test)]
 fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -> Result<Value> {
-    rpc_request_with_deadline(connection, method, body, None)
+    SyncRpc::default().request(connection, method, body)
 }
 
-fn rpc_request_with_deadline(
+#[derive(Default)]
+struct SyncRpc<'a> {
+    deadline: Option<&'a SyncDeadline>,
+    // Owned by one sync. Only the exact socket verified before the first
+    // request is reusable, never the earlier result for a port or PID.
+    desktop_sockets: HashMap<(u32, u16), BufReader<TcpStream>>,
+}
+
+impl SyncRpc<'_> {
+    fn request(
+        &mut self,
+        connection: &AntigravityConnection,
+        method: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        if !connection.verify_peer {
+            return legacy_rpc_request(connection, method, body, self.deadline);
+        }
+
+        let expires_at = Instant::now() + rpc_timeout_for_deadline(self.deadline)?;
+        let key = (connection.pid, connection.port);
+        let request = plain_rpc_request(connection, method, &serde_json::to_string(body)?, true);
+        let cap = max_rpc_body_bytes();
+
+        // The server can close an idle socket without a Connection header.
+        // These sync RPCs are read-only, so retry a disconnect once on a
+        // freshly connected and independently verified socket.
+        if let Some(mut reader) = self.desktop_sockets.remove(&key) {
+            match exchange_desktop_rpc(&mut reader, &request, expires_at, cap, true) {
+                Ok(message) => return self.finish_desktop_rpc(key, reader, message, method),
+                Err(err) if rpc_socket_disconnected(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        let stream = connect_desktop_rpc(connection, expires_at)?;
+        let mut reader = BufReader::new(stream);
+        let message = exchange_desktop_rpc(&mut reader, &request, expires_at, cap, true)?;
+        self.finish_desktop_rpc(key, reader, message, method)
+    }
+
+    fn finish_desktop_rpc(
+        &mut self,
+        key: (u32, u16),
+        reader: BufReader<TcpStream>,
+        message: PlainRpcMessage,
+        method: &str,
+    ) -> Result<Value> {
+        if message.reusable {
+            self.desktop_sockets.insert(key, reader);
+        }
+        message.into_value(method)
+    }
+}
+
+fn legacy_rpc_request(
     connection: &AntigravityConnection,
     method: &str,
     body: &Value,
     deadline: Option<&SyncDeadline>,
 ) -> Result<Value> {
-    if connection.verify_peer {
-        return rpc_request_plain_http(
-            connection,
-            method,
-            body,
-            rpc_timeout_for_deadline(deadline)?,
-            max_rpc_body_bytes(),
-        );
-    }
     // A port already known to speak TLS will never answer plaintext, so the
     // plaintext leg here is pure latency — see [`RpcTransport`].
     if cached_rpc_transport(connection.port) == Some(RpcTransport::Https) {
@@ -2757,7 +2802,7 @@ fn https_rpc_request(
             std::thread::scope(|scope| {
                 scope
                     .spawn(|| {
-                        antigravity_https_runtime()
+                        antigravity_rpc_runtime()
                             .block_on(https_rpc_once(connection, method, body, timeout))
                     })
                     .join()
@@ -2807,13 +2852,12 @@ async fn https_rpc_once(
     Ok(serde_json::from_str(&response_body)?)
 }
 
-#[cfg(not(target_os = "windows"))]
-fn antigravity_https_runtime() -> &'static tokio::runtime::Runtime {
-    HTTPS_RPC_RUNTIME.get_or_init(|| {
+fn antigravity_rpc_runtime() -> &'static tokio::runtime::Runtime {
+    RPC_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to create Antigravity HTTPS RPC runtime")
+            .expect("failed to create Antigravity RPC runtime")
     })
 }
 
@@ -2917,17 +2961,95 @@ fn owns_connected_peer(
     }
 }
 
-fn connected_peer_is_owned_by(stream: &TcpStream, pid: u32) -> Result<bool> {
-    let pid = pid.to_string();
+async fn peer_ownership_output(
+    program: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await
+}
+
+fn peer_ownership_output_before(
+    program: &str,
+    args: &[&str],
+    expires_at: Instant,
+) -> Result<std::process::Output> {
+    // Desktop discovery can run inside the quota provider's Tokio runtime.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                antigravity_rpc_runtime().block_on(async {
+                    let timeout = desktop_rpc_time_remaining(expires_at)?;
+                    tokio::time::timeout(timeout, peer_ownership_output(program, args))
+                        .await
+                        .context("Antigravity RPC socket ownership check timed out")?
+                        .with_context(|| format!("Failed to run {program}"))
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Antigravity RPC ownership worker panicked")))
+    })
+}
+
+fn desktop_rpc_time_remaining(expires_at: Instant) -> Result<Duration> {
+    let remaining = expires_at.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("Antigravity desktop RPC timed out");
+    }
+    Ok(remaining)
+}
+
+fn connect_desktop_rpc(
+    connection: &AntigravityConnection,
+    expires_at: Instant,
+) -> Result<TcpStream> {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], connection.port));
+    let stream = TcpStream::connect_timeout(&address, desktop_rpc_time_remaining(expires_at)?)?;
+    let pid = connection.pid.to_string();
     let (program, args) = peer_ownership_query(&pid);
-    let output = run_command_output(program, &args)?;
-    Ok(output.status.success()
-        && owns_connected_peer(
+    let output = peer_ownership_output_before(program, &args, expires_at)?;
+    if !output.status.success()
+        || !owns_connected_peer(
             &String::from_utf8_lossy(&output.stdout),
             stream.peer_addr()?,
             stream.local_addr()?,
             &pid,
-        ))
+        )
+    {
+        anyhow::bail!("Antigravity no longer owns the connected RPC socket");
+    }
+    Ok(stream)
+}
+
+fn exchange_desktop_rpc(
+    reader: &mut BufReader<TcpStream>,
+    request: &str,
+    expires_at: Instant,
+    cap: usize,
+    keep_alive: bool,
+) -> Result<PlainRpcMessage> {
+    let stream = reader.get_mut();
+    let remaining = desktop_rpc_time_remaining(expires_at)?;
+    stream.set_write_timeout(Some(remaining.min(Duration::from_secs(5))))?;
+    stream.write_all(request.as_bytes())?;
+    stream.set_read_timeout(Some(desktop_rpc_time_remaining(expires_at)?))?;
+    read_plain_rpc_message(reader, cap, keep_alive)
+}
+
+fn rpc_socket_disconnected(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+        )
+    })
 }
 
 // The quota discovery round may drop this future. Its socket closes and its
@@ -2942,11 +3064,7 @@ pub(crate) async fn desktop_quota_rpc(
     let mut stream = tokio::net::TcpStream::connect(addr).await?;
     let pid = connection.pid.to_string();
     let (program, args) = peer_ownership_query(&pid);
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .kill_on_drop(true)
-        .output()
-        .await?;
+    let output = peer_ownership_output(program, &args).await?;
     if !output.status.success()
         || !owns_connected_peer(
             &String::from_utf8_lossy(&output.stdout),
@@ -2957,7 +3075,7 @@ pub(crate) async fn desktop_quota_rpc(
     {
         anyhow::bail!("Antigravity no longer owns the connected RPC socket");
     }
-    let request = plain_rpc_request(connection, METHOD, "{}");
+    let request = plain_rpc_request(connection, METHOD, "{}", false);
     stream.write_all(request.as_bytes()).await?;
 
     // Connection: close bounds the response by EOF. Allow wire framing in
@@ -2984,6 +3102,21 @@ pub(crate) fn rpc_request_plain_http(
     timeout: Duration,
     cap: usize,
 ) -> Result<Value> {
+    let body_text = serde_json::to_string(body)?;
+    let request = plain_rpc_request(connection, method, &body_text, false);
+    if connection.verify_peer {
+        let expires_at = Instant::now() + timeout;
+        let stream = connect_desktop_rpc(connection, expires_at)?;
+        return exchange_desktop_rpc(
+            &mut BufReader::new(stream),
+            &request,
+            expires_at,
+            cap,
+            false,
+        )?
+        .into_value(method);
+    }
+
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], connection.port));
     let mut stream = TcpStream::connect_timeout(&address, timeout).with_context(|| {
         format!(
@@ -2992,22 +3125,21 @@ pub(crate) fn rpc_request_plain_http(
         )
     })?;
 
-    if connection.verify_peer && !connected_peer_is_owned_by(&stream, connection.pid)? {
-        anyhow::bail!("Antigravity no longer owns the connected RPC socket");
-    }
-
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout.min(Duration::from_secs(5))))?;
-
-    let body_text = serde_json::to_string(body)?;
-    let request = plain_rpc_request(connection, method, &body_text);
     stream.write_all(request.as_bytes())?;
     read_plain_rpc_response(BufReader::new(stream), method, cap)
 }
 
-fn plain_rpc_request(connection: &AntigravityConnection, method: &str, body_text: &str) -> String {
+fn plain_rpc_request(
+    connection: &AntigravityConnection,
+    method: &str,
+    body_text: &str,
+    keep_alive: bool,
+) -> String {
+    let connection_header = if keep_alive { "keep-alive" } else { "close" };
     format!(
-        "POST /exa.language_server_pb.LanguageServerService/{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnect-Protocol-Version: 1\r\nX-Codeium-Csrf-Token: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /exa.language_server_pb.LanguageServerService/{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnect-Protocol-Version: 1\r\nX-Codeium-Csrf-Token: {}\r\nConnection: {connection_header}\r\n\r\n{}",
         method,
         connection.port,
         body_text.len(),
@@ -3017,12 +3149,39 @@ fn plain_rpc_request(connection: &AntigravityConnection, method: &str, body_text
 }
 
 fn read_plain_rpc_response(mut reader: impl BufRead, method: &str, cap: usize) -> Result<Value> {
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
+    read_plain_rpc_message(&mut reader, cap, false)?.into_value(method)
+}
 
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
+struct PlainRpcMessage {
+    status: u16,
+    body: String,
+    reusable: bool,
+}
+
+impl PlainRpcMessage {
+    fn into_value(self, method: &str) -> Result<Value> {
+        if self.status != 200 {
+            return Err(rpc_status_error(method, self.status, &self.body, false));
+        }
+        Ok(serde_json::from_str(&self.body)?)
+    }
+}
+
+fn read_plain_rpc_message(
+    reader: &mut impl BufRead,
+    cap: usize,
+    keep_alive: bool,
+) -> Result<PlainRpcMessage> {
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line)? == 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    }
+
+    let mut status_fields = status_line.split_whitespace();
+    let version = status_fields.next();
+    let mut reusable = keep_alive && version == Some("HTTP/1.1");
+    let status = status_fields
+        .next()
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| anyhow::anyhow!("Malformed HTTP response from Antigravity RPC"))?;
 
@@ -3030,7 +3189,10 @@ fn read_plain_rpc_response(mut reader: impl BufRead, method: &str, cap: usize) -
     let mut chunked = false;
     loop {
         let mut header = String::new();
-        reader.read_line(&mut header)?;
+        if reader.read_line(&mut header)? == 0 {
+            reusable = false;
+            break;
+        }
         let trimmed = header.trim();
         if trimmed.is_empty() {
             break;
@@ -3040,13 +3202,17 @@ fn read_plain_rpc_response(mut reader: impl BufRead, method: &str, cap: usize) -
         if let Some(value) = lower.strip_prefix("content-length:") {
             content_length = value.trim().parse::<usize>().ok();
         }
-        if lower.contains("transfer-encoding") && lower.contains("chunked") {
-            chunked = true;
+        if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+            chunked |= value.split(',').any(|token| token.trim() == "chunked");
+        }
+        if let Some(value) = lower.strip_prefix("connection:") {
+            reusable &= !value.split(',').any(|token| token.trim() == "close");
         }
     }
 
+    reusable &= chunked || content_length.is_some();
     let response_body = if chunked {
-        read_chunked_body_with_cap(&mut reader, cap)?
+        read_chunked_body_with_cap(reader, cap, reusable)?
     } else if let Some(length) = content_length {
         if length > cap {
             return Err(anyhow::Error::new(RpcBodyCapError { length, cap }));
@@ -3069,11 +3235,11 @@ fn read_plain_rpc_response(mut reader: impl BufRead, method: &str, cap: usize) -
         text
     };
 
-    if status_code != 200 {
-        return Err(rpc_status_error(method, status_code, &response_body, false));
-    }
-
-    Ok(serde_json::from_str(&response_body)?)
+    Ok(PlainRpcMessage {
+        status,
+        body: response_body,
+        reusable,
+    })
 }
 
 fn read_chunked_body_prefix(
@@ -3106,13 +3272,29 @@ fn read_chunked_body_prefix(
     Ok(String::from_utf8(body)?)
 }
 
-fn read_chunked_body_with_cap(reader: &mut impl BufRead, max_body_bytes: usize) -> Result<String> {
+fn read_chunked_body_with_cap(
+    reader: &mut impl BufRead,
+    max_body_bytes: usize,
+    consume_trailers: bool,
+) -> Result<String> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
         reader.read_line(&mut size_line)?;
         let chunk_size = parse_chunk_size_line(&size_line)?;
         if chunk_size == 0 {
+            if consume_trailers {
+                // Leave the reader at the start of the next response.
+                loop {
+                    size_line.clear();
+                    if reader.read_line(&mut size_line)? == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                    }
+                    if size_line == "\r\n" {
+                        break;
+                    }
+                }
+            }
             break;
         }
 
@@ -3186,7 +3368,7 @@ fn fetch_session_artifact(
     summary: &TrajectorySummary,
     connections: &[AntigravityConnection],
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<Option<SessionArtifact>> {
     let preferred = connections
         .iter()
@@ -3204,7 +3386,7 @@ fn fetch_session_artifact(
 
     let mut last_error: Option<anyhow::Error> = None;
     for connection in ordered {
-        match try_fetch_session_artifact(summary, connection, budget, deadline) {
+        match try_fetch_session_artifact(summary, connection, budget, rpc) {
             Ok(Some(artifact)) => return Ok(Some(artifact)),
             Ok(None) => {}
             Err(err) => last_error = Some(err),
@@ -3367,7 +3549,7 @@ fn fetch_usage_timestamps(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<HashMap<String, i64>> {
     if !budget.should_attempt(&connection.fingerprint) {
         let err = anyhow::anyhow!(
@@ -3378,11 +3560,10 @@ fn fetch_usage_timestamps(
     }
 
     let started = Instant::now();
-    match rpc_request_with_deadline(
+    match rpc.request(
         connection,
         "GetCascadeTrajectory",
         &serde_json::json!({ "cascadeId": summary.session_id }),
-        deadline,
     ) {
         Ok(trajectory) => {
             budget.record_success(&connection.fingerprint);
@@ -3451,7 +3632,7 @@ fn try_fetch_session_artifact(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
     budget: &mut TrajectoryEnrichmentBudget,
-    deadline: Option<&SyncDeadline>,
+    rpc: &mut SyncRpc<'_>,
 ) -> Result<Option<SessionArtifact>> {
     if !budget.metadata_should_attempt(&connection.fingerprint) {
         let err = anyhow::anyhow!(
@@ -3462,11 +3643,10 @@ fn try_fetch_session_artifact(
     }
 
     let metadata_started = Instant::now();
-    let response = match rpc_request_with_deadline(
+    let response = match rpc.request(
         connection,
         "GetCascadeTrajectoryGeneratorMetadata",
         &serde_json::json!({ "cascadeId": summary.session_id }),
-        deadline,
     ) {
         Ok(value) => {
             budget.record_metadata_success(&connection.fingerprint);
@@ -3500,7 +3680,7 @@ fn try_fetch_session_artifact(
     }
 
     let usage_timestamps = if session_metadata_needs_trajectory_timestamps(&metadata) {
-        match fetch_usage_timestamps(summary, connection, budget, deadline) {
+        match fetch_usage_timestamps(summary, connection, budget, rpc) {
             Ok(timestamps) => timestamps,
             Err(err) => {
                 let cached = cached_usage_timestamps(&summary.session_id);
@@ -4319,12 +4499,108 @@ mod tests {
         assert_eq!(candidate_probe_ports(&candidates[0], listeners), vec![4321]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn desktop_ownership_query_obeys_the_request_deadline() {
+        let started = Instant::now();
+        let error = peer_ownership_output_before(
+            "/bin/sleep",
+            &["10"],
+            started + Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("socket ownership check timed out"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn desktop_sync_reuses_the_verified_socket_and_reconnects_after_close() {
+        use std::net::TcpListener;
+
+        let pid = std::process::id().to_string();
+        let (program, args) = peer_ownership_query(&pid);
+        if run_command_output(program, &args).is_err_and(|error| is_command_not_found(&error)) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let read_request = |peer: &mut BufReader<TcpStream>| {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n{}") {
+                    let mut byte = [0_u8; 1];
+                    peer.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(String::from_utf8(request)
+                    .unwrap()
+                    .contains("X-Codeium-Csrf-Token: fixture-token\r\n"));
+            };
+            let mut first = BufReader::new(listener.accept().unwrap().0);
+            first
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            read_request(&mut first);
+            first
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"n\":1}\r\n0\r\nX-Trailer: done\r\n\r\n")
+                .unwrap();
+            read_request(&mut first);
+            first
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"n\":2}")
+                .unwrap();
+            drop(first); // An idle peer may close without advertising it.
+
+            let mut second = BufReader::new(listener.accept().unwrap().0);
+            second
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            read_request(&mut second);
+            second
+                .get_mut()
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"n\":3}",
+                )
+                .unwrap();
+        });
+        let connection = AntigravityConnection {
+            pid: std::process::id(),
+            port,
+            verify_peer: true,
+            csrf_token: "fixture-token".into(),
+            fingerprint: "fixture".into(),
+        };
+        let mut rpc = SyncRpc::default();
+        for n in 1..=3 {
+            assert_eq!(
+                rpc.request(
+                    &connection,
+                    "GetAllCascadeTrajectories",
+                    &serde_json::json!({})
+                )
+                .unwrap(),
+                serde_json::json!({ "n": n })
+            );
+        }
+        assert!(rpc.desktop_sockets.is_empty());
+        server.join().unwrap();
+    }
+
     #[tokio::test]
     async fn desktop_quota_cancellation_closes_a_stalled_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (program, _) = peer_ownership_query("");
-        if run_command_output(program, &[]).is_err_and(|error| is_command_not_found(&error)) {
+        let pid = std::process::id().to_string();
+        let (program, args) = peer_ownership_query(&pid);
+        if run_command_output(program, &args).is_err_and(|error| is_command_not_found(&error)) {
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5538,11 +5814,14 @@ mod tests {
         };
         let mut budget = TrajectoryEnrichmentBudget::with_limits(Duration::from_secs(60), 2);
         budget.record_metadata_failure(&connection.fingerprint, Duration::ZERO);
-        assert!(
-            try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .unwrap()
-                .is_none()
-        );
+        assert!(try_fetch_session_artifact(
+            &summary,
+            &connection,
+            &mut budget,
+            &mut SyncRpc::default()
+        )
+        .unwrap()
+        .is_none());
         budget.record_metadata_failure(&connection.fingerprint, Duration::ZERO);
         assert!(budget.metadata_should_attempt(&connection.fingerprint));
         assert_eq!(cached_rpc_transport(port), Some(RpcTransport::PlainHttp));
@@ -5589,7 +5868,7 @@ mod tests {
             &summary,
             &[missing.clone(), broken],
             &mut TrajectoryEnrichmentBudget::new(),
-            None,
+            &mut SyncRpc::default(),
         );
         assert!(
             result.is_err(),
@@ -5602,7 +5881,7 @@ mod tests {
             &summary,
             &[missing, healthy],
             &mut TrajectoryEnrichmentBudget::new(),
-            None,
+            &mut SyncRpc::default(),
         )
         .unwrap()
         .expect("another connection can still hold this session");
@@ -5748,9 +6027,14 @@ mod tests {
                 step_count: Some(1),
                 connection_fingerprint: connection.fingerprint.clone(),
             };
-            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .expect("a failed enrichment must never fail the sync")
-                .expect("the session must still be written from its metadata");
+            let artifact = try_fetch_session_artifact(
+                &summary,
+                &connection,
+                &mut budget,
+                &mut SyncRpc::default(),
+            )
+            .expect("a failed enrichment must never fail the sync")
+            .expect("the session must still be written from its metadata");
             assert!(
                 artifact.contents.contains(&format!("session-{index}")),
                 "the metadata-derived artifact is the documented fallback: {}",
@@ -5812,9 +6096,14 @@ mod tests {
                 step_count: Some(1),
                 connection_fingerprint: connection.fingerprint.clone(),
             };
-            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .unwrap()
-                .expect("the session must be written");
+            let artifact = try_fetch_session_artifact(
+                &summary,
+                &connection,
+                &mut budget,
+                &mut SyncRpc::default(),
+            )
+            .unwrap()
+            .expect("the session must be written");
             let usage: Value = artifact
                 .contents
                 .lines()
@@ -6157,9 +6446,10 @@ mod tests {
             connection_fingerprint: connection.fingerprint.clone(),
         };
 
-        let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-            .unwrap()
-            .expect("enrichment failure must still regenerate the artifact");
+        let artifact =
+            try_fetch_session_artifact(&summary, &connection, &mut budget, &mut SyncRpc::default())
+                .unwrap()
+                .expect("enrichment failure must still regenerate the artifact");
         let usage: Vec<Value> = artifact
             .contents
             .lines()
@@ -6256,11 +6546,16 @@ mod tests {
         };
 
         for round in 1..=2 {
-            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-                .unwrap()
-                .unwrap_or_else(|| {
-                    panic!("round {round}: a grown session must still produce an artifact")
-                });
+            let artifact = try_fetch_session_artifact(
+                &summary,
+                &connection,
+                &mut budget,
+                &mut SyncRpc::default(),
+            )
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!("round {round}: a grown session must still produce an artifact")
+            });
             let usage: Vec<(Option<String>, Option<i64>)> = artifact
                 .contents
                 .lines()
@@ -6378,9 +6673,10 @@ mod tests {
 
         // Round 1: enrichment succeeds and the usage is timestamped through
         // its messageId. `sync` writes that artifact back.
-        let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-            .unwrap()
-            .expect("round 1 must produce an artifact");
+        let artifact =
+            try_fetch_session_artifact(&summary, &connection, &mut budget, &mut SyncRpc::default())
+                .unwrap()
+                .expect("round 1 must produce an artifact");
         let usage = usage_rows(&artifact);
         assert_eq!(usage.len(), 1, "round 1: {}", artifact.contents);
         assert_eq!(usage[0]["timestamp"], 1700000000000_i64, "round 1");
@@ -6390,9 +6686,10 @@ mod tests {
         // Round 2: the trajectory has grown past the cap, so enrichment
         // fails; the timestamp recovered last time must survive.
         trajectory_over_cap.store(true, Ordering::SeqCst);
-        let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget, None)
-            .unwrap()
-            .expect("round 2 must still regenerate the artifact");
+        let artifact =
+            try_fetch_session_artifact(&summary, &connection, &mut budget, &mut SyncRpc::default())
+                .unwrap()
+                .expect("round 2 must still regenerate the artifact");
         let usage = usage_rows(&artifact);
         assert_eq!(usage.len(), 1, "round 2: {}", artifact.contents);
         assert_eq!(
