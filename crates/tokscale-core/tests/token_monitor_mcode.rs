@@ -312,3 +312,44 @@ async fn symlinked_runtime_history_stays_in_the_store_lane() {
         .unwrap();
     assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 7000);
 }
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn explicitly_scanned_symlinked_session_keeps_its_capture() {
+    let home = tempfile::tempdir().unwrap();
+    write_home(home.path());
+    let store = home.path().join(".minimax");
+    let linked_session = store.join(SESSION_PATH).with_file_name("linked-session");
+    let capture_dir = home.path().join("captures");
+    std::fs::create_dir(&capture_dir).unwrap();
+    let capture = std::fs::read_to_string(
+        home.path()
+            .join(".config/tokscale/headless/mcode/capture.jsonl"),
+    )
+    .unwrap();
+    std::fs::write(
+        capture_dir.join("messages.jsonl"),
+        capture.replace("turn-1", "linked-turn"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&capture_dir, &linked_session).unwrap();
+    let extra = format!("mcode:{}", linked_session.display());
+    let _env = EnvGuard::set(&[
+        (
+            "TOKSCALE_CONFIG_DIR",
+            home.path().join("config").as_os_str(),
+        ),
+        (
+            "TOKSCALE_HEADLESS_DIR",
+            home.path().join("empty-headless").as_os_str(),
+        ),
+        ("MINIMAX_DATA_DIR", store.as_os_str()),
+        ("TOKSCALE_EXTRA_DIRS", std::ffi::OsStr::new(&extra)),
+    ]);
+
+    let mut scan_options = options(home.path(), Some(vec!["mcode".into()]));
+    scan_options.use_env_roots = true;
+    let local = parse_local_clients(scan_options).unwrap();
+    assert_eq!(local.messages.iter().map(|m| m.input).sum::<i64>(), 4000);
+}

@@ -90,15 +90,20 @@ pub(crate) fn is_runtime_history(path: &Path, resolved: &Path, roots: &HashSet<P
     if roots.is_empty() {
         return false;
     }
-    matches_history_layout(resolved, |root| roots.contains(root))
+    matches_history_layout(resolved, |_, root| roots.contains(root))
         || (path != resolved
-            && matches_history_layout(path, |root| {
-                // The runtime reader follows history files linked outside the store.
+            && matches_history_layout(path, |session_dir, root| {
+                // The store reader follows history-file links but skips
+                // directory links when discovering sessions below its root.
                 std::fs::canonicalize(root).is_ok_and(|root| roots.contains(&root))
+                    && session_dir
+                        .ancestors()
+                        .take(SESSION_DEPTH)
+                        .all(|dir| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
             }))
 }
 
-fn matches_history_layout(path: &Path, owns_root: impl Fn(&Path) -> bool) -> bool {
+fn matches_history_layout(path: &Path, owns_session: impl Fn(&Path, &Path) -> bool) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
@@ -106,7 +111,7 @@ fn matches_history_layout(path: &Path, owns_root: impl Fn(&Path) -> bool) -> boo
         session_dir
             .ancestors()
             .nth(SESSION_DEPTH)
-            .is_some_and(&owns_root)
+            .is_some_and(|root| owns_session(session_dir, root))
     };
     (path.file_name().is_some_and(|name| name == ACTIVE_HISTORY) && in_store(parent))
         || (path.extension().is_some_and(|ext| ext == "jsonl")
