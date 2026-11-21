@@ -622,6 +622,8 @@ pub fn run_antigravity_status(json: bool) -> Result<()> {
     let cache_dir = get_antigravity_cache_dir()?;
     let sessions_dir = get_antigravity_sessions_dir()?;
     let manifest_path = get_antigravity_manifest_path()?;
+    // Report exactly the live servers available to usage sync. This
+    // uses sync discovery (including its authenticated desktop heartbeat).
     let connections = detect_antigravity_connections()?;
     let manifest = load_antigravity_manifest()?;
 
@@ -1314,11 +1316,11 @@ fn bool_label(value: bool) -> &'static str {
 }
 
 pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
-    connections_from_candidates(detect_process_candidates()?, true)
+    connections_from_candidates(detect_process_candidates(true)?, true)
 }
 
 pub(crate) fn detect_legacy_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
-    connections_from_candidates(detect_process_candidates()?, false)
+    connections_from_candidates(detect_process_candidates(false)?, false)
 }
 
 fn connections_from_candidates(
@@ -1389,10 +1391,14 @@ fn candidate_probe_ports(candidate: &ProcessCandidate, mut ports: Vec<u16>) -> V
     ports
 }
 
-fn detect_process_candidates() -> Result<Vec<ProcessCandidate>> {
-    let desktop_hubs = home_dir()
-        .map(|home| read_desktop_hubs(&home.join(".gemini/antigravity/daemon")))
-        .unwrap_or_default();
+fn detect_process_candidates(include_desktop_descriptors: bool) -> Result<Vec<ProcessCandidate>> {
+    let desktop_hubs = if include_desktop_descriptors {
+        home_dir()
+            .map(|home| read_desktop_hubs(&home.join(".gemini/antigravity/daemon")))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     #[cfg(target_os = "windows")]
     {
         return detect_windows_process_candidates(&desktop_hubs);
@@ -3024,18 +3030,29 @@ fn connect_desktop_rpc(
     let stream = TcpStream::connect_timeout(&address, desktop_rpc_time_remaining(expires_at)?)?;
     let pid = connection.pid.to_string();
     let (program, args) = peer_ownership_query(&pid);
-    let output = peer_ownership_output_before(program, &args, expires_at)?;
-    if !output.status.success()
-        || !owns_connected_peer(
-            &String::from_utf8_lossy(&output.stdout),
-            stream.peer_addr()?,
-            stream.local_addr()?,
-            &pid,
-        )
-    {
-        anyhow::bail!("Antigravity no longer owns the connected RPC socket");
+    let server = stream.peer_addr()?;
+    let client = stream.local_addr()?;
+    for attempt in 0..2 {
+        let output = peer_ownership_output_before(program, &args, expires_at)?;
+        if output.status.success()
+            && owns_connected_peer(
+                &String::from_utf8_lossy(&output.stdout),
+                server,
+                client,
+                &pid,
+            )
+        {
+            return Ok(stream);
+        }
+        // The handshake can finish before accept() creates the server's FD.
+        // Recheck only this socket, within the original RPC deadline.
+        if attempt == 0 && desktop_rpc_time_remaining(expires_at)? > Duration::from_millis(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        } else {
+            break;
+        }
     }
-    Ok(stream)
+    anyhow::bail!("Antigravity no longer owns the connected RPC socket")
 }
 
 fn exchange_desktop_rpc(
@@ -3143,43 +3160,51 @@ fn read_plain_rpc_message(
     cap: usize,
     keep_alive: bool,
 ) -> Result<PlainRpcMessage> {
-    let mut status_line = String::new();
-    if reader.read_line(&mut status_line)? == 0 {
-        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
-    }
-
-    let mut status_fields = status_line.split_whitespace();
-    let version = status_fields.next();
-    let mut reusable = keep_alive && version == Some("HTTP/1.1");
-    let status = status_fields
-        .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| anyhow::anyhow!("Malformed HTTP response from Antigravity RPC"))?;
-
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 {
-            reusable = false;
-            break;
-        }
-        let trimmed = header.trim();
-        if trimmed.is_empty() {
-            break;
+    let (status, mut reusable, content_length, chunked) = loop {
+        let mut status_line = String::new();
+        if reader.read_line(&mut status_line)? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
         }
 
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            content_length = value.trim().parse::<usize>().ok();
+        let mut status_fields = status_line.split_whitespace();
+        let version = status_fields.next();
+        let mut reusable = keep_alive && version == Some("HTTP/1.1");
+        let status = status_fields
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| anyhow::anyhow!("Malformed HTTP response from Antigravity RPC"))?;
+        if status == 101 {
+            anyhow::bail!("Antigravity RPC does not support switching protocols");
         }
-        if let Some(value) = lower.strip_prefix("transfer-encoding:") {
-            chunked |= value.split(',').any(|token| token.trim() == "chunked");
+
+        let mut content_length: Option<usize> = None;
+        let mut chunked = false;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            let trimmed = header.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse::<usize>().ok();
+            }
+            if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+                chunked |= value.split(',').any(|token| token.trim() == "chunked");
+            }
+            if let Some(value) = lower.strip_prefix("connection:") {
+                reusable &= !value.split(',').any(|token| token.trim() == "close");
+            }
         }
-        if let Some(value) = lower.strip_prefix("connection:") {
-            reusable &= !value.split(',').any(|token| token.trim() == "close");
+
+        if !(100..200).contains(&status) {
+            break (status, reusable, content_length, chunked);
         }
-    }
+    };
 
     reusable &= chunked || content_length.is_some();
     let response_body = if chunked {
@@ -3252,6 +3277,9 @@ fn read_chunked_body_with_cap(
     loop {
         let mut size_line = String::new();
         reader.read_line(&mut size_line)?;
+        if !size_line.ends_with('\n') {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
         let chunk_size = parse_chunk_size_line(&size_line)?;
         if chunk_size == 0 {
             if consume_trailers {
@@ -4468,6 +4496,27 @@ mod tests {
         );
         assert_eq!(listeners, vec![4321]);
         assert_eq!(candidate_probe_ports(&candidates[0], listeners), vec![4321]);
+    }
+
+    #[test]
+    fn plain_rpc_reads_the_final_response_after_early_hints() {
+        let response = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        let message = read_plain_rpc_message(&mut &response[..], 1024, true).unwrap();
+        assert!(message.reusable);
+        assert_eq!(
+            message.into_value("Heartbeat").unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn truncated_chunk_size_is_a_retryable_disconnect() {
+        for mut bytes in [b"2\r\n{}\r\n".as_slice(), b"2\r\n{}\r\n0".as_slice()] {
+            let error = read_chunked_body_with_cap(&mut bytes, 1024, true).unwrap_err();
+            assert!(rpc_socket_disconnected(&error), "{error:#}");
+        }
+        let error = read_chunked_body_with_cap(&mut &b"zz\r\n"[..], 1024, true).unwrap_err();
+        assert!(!rpc_socket_disconnected(&error));
     }
 
     #[test]
