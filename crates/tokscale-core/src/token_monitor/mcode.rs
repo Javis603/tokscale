@@ -46,29 +46,40 @@ const DATA_DIR_BASENAMES: [&str; 2] = [".minimax", ".mavis"];
 
 /// Data directories to read, in the order MiniMax Code would choose them.
 ///
-/// A non-empty override is the only directory, as it is for MiniMax Code
-/// itself; it is ignored when the scan targets another home (`--home`), whose
-/// environment it does not describe. Otherwise every default and profile
-/// directory under the home is read, since the desktop app and each profile
-/// can write to a different one.
+/// A non-empty override replaces the home directories, as it does for MiniMax
+/// Code itself; extra `mcode:` data directories from `TOKSCALE_EXTRA_DIRS` are
+/// appended afterward so the original and a relocated store are read together.
+/// Both environment inputs are ignored when targeting another home (`--home`).
+/// Otherwise every default and profile directory under the home is read, since
+/// the desktop app and each profile can write to a different one.
 pub fn data_dirs(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut dirs = if use_env_roots {
+        ENV_OVERRIDES
+            .iter()
+            .find_map(|name| non_empty(std::env::var(name).ok()))
+            .map(|dir| vec![PathBuf::from(dir)])
+            .unwrap_or_else(|| named_data_dirs(Path::new(home_dir)))
+    } else {
+        named_data_dirs(Path::new(home_dir))
+    };
     if use_env_roots {
-        for name in ENV_OVERRIDES {
-            if let Some(value) = std::env::var(name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-            {
-                return vec![PathBuf::from(value)];
+        if let Some(extra) = non_empty(std::env::var("TOKSCALE_EXTRA_DIRS").ok()) {
+            let enabled = HashSet::from([crate::ClientId::Mcode]);
+            for (_, path) in crate::scanner::parse_extra_dirs(&extra, &enabled) {
+                dirs.push(PathBuf::from(path));
             }
         }
     }
-    let home = Path::new(home_dir);
+    dirs
+}
+
+/// Default and profile data directories directly under `root`.
+fn named_data_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = DATA_DIR_BASENAMES
         .iter()
-        .map(|name| home.join(name))
+        .map(|name| root.join(name))
         .collect();
-    let mut profiles: Vec<PathBuf> = std::fs::read_dir(home)
+    let mut profiles: Vec<PathBuf> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
@@ -1022,5 +1033,23 @@ mod tests {
             ),
             (0, 9, 2, 1)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn extra_scan_paths_append_another_data_dir() {
+        let mut env = clear_env();
+        let home = tempfile::tempdir().unwrap();
+        let extra_dir = tempfile::tempdir().unwrap();
+        let extra = extra_dir.path().join(".minimax");
+        env.set("TOKSCALE_EXTRA_DIRS", format!("mcode:{}", extra.display()));
+
+        let dirs = data_dirs(home.path().to_str().unwrap(), true);
+        assert!(dirs.contains(&home.path().join(".minimax")));
+        assert!(dirs.contains(&extra));
+
+        // --home scans ignore host TOKSCALE_EXTRA_DIRS just like MINIMAX_DATA_DIR.
+        let scoped = data_dirs(home.path().to_str().unwrap(), false);
+        assert!(!scoped.contains(&extra));
     }
 }
