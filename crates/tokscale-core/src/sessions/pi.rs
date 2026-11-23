@@ -847,10 +847,10 @@ fn parse_pi_format_file_inner(
     // Title from the v3 `session` header — authoritative latest, since OMP
     // rewrites the header in place when the title changes.
     let mut header_title: Option<String> = None;
-    // Latest title record or explicit Pi session name, used when the header
-    // carries no title.
+    // Latest legacy title record, used when the header carries no title.
     let mut rolling_title: Option<String> = None;
-    let mut has_saved_session_name = false;
+    // Some(None) records an explicit clear of the saved Pi name.
+    let mut saved_session_name: Option<Option<String>> = None;
 
     for_each_json_line_with_bytes(path, &mut |line| {
         // Pi, Senpi and Kimchi keep the byte-strict record skipping of
@@ -960,9 +960,8 @@ fn parse_pi_format_file_inner(
                 name.and_then(pi_subagent_name)
             };
             if client == "pi" && agent.is_none() {
-                if let Some(title) = normalized_title(name) {
-                    rolling_title = Some(title);
-                    has_saved_session_name = true;
+                if let Some(name) = name {
+                    saved_session_name = Some(normalized_title(Some(name)));
                 }
             }
             observer.observe_entry(&entry, None);
@@ -1177,25 +1176,20 @@ fn parse_pi_format_file_inner(
         return Vec::new();
     }
 
-    // A rename after the last message has no later message to retitle,
-    // and a pre-v3 transcript has no header title to fall back on, so the
-    // rename would never surface. The Sessions bucket adopts the latest title
-    // from the latest message, so stamp the final title there.
-    if header_title.is_none() {
-        if let Some(title) = rolling_title {
-            let title = crate::sessions::SharedStr::from(title);
-            if has_saved_session_name {
-                // A report window may predate the rename or omit the final
-                // message. A saved Pi name labels the whole session.
-                for message in messages
-                    .iter_mut()
-                    .filter(|message| message.agent.is_none())
-                {
-                    message.session_title = Some(title.clone());
-                }
-            } else if let Some(last) = messages.last_mut() {
-                last.session_title = Some(title);
-            }
+    if let Some(saved_name) = saved_session_name {
+        // An empty title lets the JSON report distinguish a clear from a miss.
+        let title = crate::sessions::SharedStr::from(saved_name.unwrap_or_default());
+        // A saved name or clear applies even to windows ending before the change.
+        for message in messages
+            .iter_mut()
+            .filter(|message| message.agent.is_none())
+        {
+            message.session_title = Some(title.clone());
+        }
+    } else if header_title.is_none() {
+        // A trailing legacy rename has no later message to retitle.
+        if let (Some(title), Some(last)) = (rolling_title, messages.last_mut()) {
+            last.session_title = Some(title.into());
         }
     }
 
@@ -2082,13 +2076,12 @@ not valid json
     }
 
     #[test]
-    fn test_parse_pi_uses_the_latest_nonblank_session_name() {
+    fn test_parse_pi_uses_the_latest_saved_session_name() {
         let content = r#"{"type":"session","id":"named","timestamp":"2026-07-28T18:22:13.943Z"}
 {"type":"session_info","name":" First name "}
 {"type":"message","timestamp":"2026-07-28T18:23:00.000Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":10,"output":5}}}
 {"type":"message","timestamp":"2026-07-28T18:24:00.000Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":20,"output":6}}}
-{"type":"session_info","name":" Renamed "}
-{"type":"session_info","name":"   "}"#;
+{"type":"session_info","name":" Renamed "}"#;
         let file = create_test_file(content);
         let messages = parse_pi_file(file.path());
 

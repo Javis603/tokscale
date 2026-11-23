@@ -1762,7 +1762,8 @@ const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
             // `toolResult`), which version-6 caches omit entirely.
             // +1 more: use ordinary Pi session_info names as display titles.
             // +1 more: apply the saved title to all messages in report windows.
-            (ClientId::Pi, 5),
+            // +1 more: clear saved titles when Pi records an empty name.
+            (ClientId::Pi, 6),
             // +1: Kimchi's Pi-compatible messages now carry stable
             // namespaced deduplication keys.
             // +1 more: billed operations, as for Pi. The shared base did not
@@ -7081,7 +7082,7 @@ mod tests {
         ] {
             let current = CacheIdentity::for_client(client);
             let expected_diff = match client {
-                ClientId::Pi => 5,
+                ClientId::Pi => 6,
                 ClientId::Omp => 4,
                 _ => 3,
             };
@@ -7131,7 +7132,7 @@ mod tests {
         ] {
             let current = CacheIdentity::for_client(client);
             let expected_diff = match client {
-                ClientId::Pi => 3,
+                ClientId::Pi => 4,
                 ClientId::Omp => 2,
                 _ => 1,
             };
@@ -7181,7 +7182,7 @@ mod tests {
         ] {
             let current = CacheIdentity::for_client(client);
             let expected_diff = match client {
-                ClientId::Pi => 4,
+                ClientId::Pi => 5,
                 ClientId::Omp => 3,
                 _ => 2,
             };
@@ -9863,7 +9864,7 @@ mod tests {
             (
                 "pi-format",
                 &[
-                    (ClientId::Pi, 5),
+                    (ClientId::Pi, 6),
                     (ClientId::Kimchi, 2),
                     (ClientId::Omp, 3),
                     (ClientId::Senpi, 2),

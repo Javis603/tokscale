@@ -6408,7 +6408,7 @@ fn aggregate_session_metadata(messages: &[UnifiedMessage]) -> Vec<SessionMeta> {
 
         if entry.title.is_none() {
             if let Some(title) = msg.session_title.as_deref() {
-                if !title.trim().is_empty() {
+                if !title.trim().is_empty() || (msg.client == "pi" && title.is_empty()) {
                     entry.title = Some(title.to_string());
                 }
             }
