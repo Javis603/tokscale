@@ -4594,6 +4594,56 @@ fn test_models_json_output() {
 }
 
 #[test]
+fn test_pi_session_report_uses_saved_rename_in_cold_and_warm_windows() {
+    let home = TempDir::new().unwrap();
+    prime_pricing_cache(home.path());
+    let sessions = home.path().join(".pi/agent/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("named.jsonl"),
+        r#"{"type":"session","id":"named","timestamp":"2026-07-28T18:22:13Z","cwd":"/tmp/fixture"}
+{"type":"session_info","name":"First name"}
+{"type":"message","timestamp":"2026-07-28T18:23:00Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":10,"output":5}}}
+{"type":"message","timestamp":"2026-07-30T18:24:00Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":20,"output":6}}}
+{"type":"session_info","name":"Renamed"}
+{"type":"session_info","name":"   "}
+"#,
+    )
+    .unwrap();
+
+    for (window, expected_tokens) in [
+        (&[][..], 41),
+        (&["--since", "2026-07-28", "--until", "2026-07-28"][..], 15),
+        (&[][..], 41),
+    ] {
+        let output = cmd_with_home(home.path())
+            .args([
+                "--json",
+                "--client",
+                "pi",
+                "--no-spinner",
+                "--bucket-timezone",
+                "UTC",
+                "--group-by",
+                "client,workspace,session,model",
+            ])
+            .args(window)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["sessions"][0]["title"], "Renamed");
+        let entries = report["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(
+            entry["input"].as_i64().unwrap() + entry["output"].as_i64().unwrap(),
+            expected_tokens
+        );
+    }
+}
+
+#[test]
 fn test_models_json_mixed_timing_keeps_exact_output_and_reasoning_subtotals() {
     let tmp = TempDir::new().unwrap();
     prime_pricing_cache(tmp.path());

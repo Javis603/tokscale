@@ -850,6 +850,7 @@ fn parse_pi_format_file_inner(
     // Latest title record or explicit Pi session name, used when the header
     // carries no title.
     let mut rolling_title: Option<String> = None;
+    let mut has_saved_session_name = false;
 
     for_each_json_line_with_bytes(path, &mut |line| {
         // Pi, Senpi and Kimchi keep the byte-strict record skipping of
@@ -961,6 +962,7 @@ fn parse_pi_format_file_inner(
             if client == "pi" && agent.is_none() {
                 if let Some(title) = normalized_title(name) {
                     rolling_title = Some(title);
+                    has_saved_session_name = true;
                 }
             }
             observer.observe_entry(&entry, None);
@@ -1180,8 +1182,20 @@ fn parse_pi_format_file_inner(
     // rename would never surface. The Sessions bucket adopts the latest title
     // from the latest message, so stamp the final title there.
     if header_title.is_none() {
-        if let (Some(title), Some(last)) = (rolling_title, messages.last_mut()) {
-            last.session_title = Some(title.into());
+        if let Some(title) = rolling_title {
+            let title = crate::sessions::SharedStr::from(title);
+            if has_saved_session_name {
+                // A report window may predate the rename or omit the final
+                // message. A saved Pi name labels the whole session.
+                for message in messages
+                    .iter_mut()
+                    .filter(|message| message.agent.is_none())
+                {
+                    message.session_title = Some(title.clone());
+                }
+            } else if let Some(last) = messages.last_mut() {
+                last.session_title = Some(title);
+            }
         }
     }
 
@@ -2079,7 +2093,7 @@ not valid json
         let messages = parse_pi_file(file.path());
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].session_title.as_deref(), Some("First name"));
+        assert_eq!(messages[0].session_title.as_deref(), Some("Renamed"));
         assert_eq!(messages[1].session_title.as_deref(), Some("Renamed"));
     }
 
