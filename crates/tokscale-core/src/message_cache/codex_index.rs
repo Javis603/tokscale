@@ -4,8 +4,9 @@
 use super::*;
 use crate::sessions::codex::CodexTurnCoverage;
 use crate::SharedStr;
+use std::io::BufRead;
 
-const MAGIC: [u8; 8] = *b"TCXIDX01";
+const MAGIC: [u8; 8] = *b"TCXIDX03";
 const FOOTER_SIZE: u64 = 8 + 32 + MAGIC.len() as u64;
 
 #[derive(Serialize, Deserialize)]
@@ -153,7 +154,10 @@ pub(super) fn encode(
         .serialize(&index)
         .ok()?;
     let len = bytes.len() as u64;
-    let digest = Sha256::digest(&bytes);
+    let mut digest = Sha256::new();
+    digest.update(&envelope.payload);
+    digest.update(&bytes);
+    let digest = digest.finalize();
     bytes.extend_from_slice(&len.to_le_bytes());
     bytes.extend_from_slice(&digest);
     bytes.extend_from_slice(&MAGIC);
@@ -196,10 +200,21 @@ pub(super) fn read(
         .deserialize_from(&mut reader)
         .ok()?;
     let mut expected_offset = reader.stream_position().ok()?;
-    reader.seek(SeekFrom::Start(offset)).ok()?;
+    // Verify the payload without deserializing the old message rows.
+    reader.seek(SeekFrom::Start(payload_start)).ok()?;
+    let mut digest = Sha256::new();
+    {
+        let mut payload = (&mut reader).take(payload_len);
+        while let chunk @ [_, ..] = payload.fill_buf().ok()? {
+            let count = chunk.len();
+            digest.update(chunk);
+            payload.consume(count);
+        }
+    }
     let mut bytes = vec![0; len as usize];
     reader.read_exact(&mut bytes).ok()?;
-    if Sha256::digest(&bytes)[..] != footer[8..40] {
+    digest.update(&bytes);
+    if digest.finalize()[..] != footer[8..40] {
         return None;
     }
     let entries: Vec<IndexedEntry> = bincode::options()

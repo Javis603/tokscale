@@ -2517,6 +2517,17 @@ fn failed_codex_parse(
     }
 }
 
+fn warn_oversized_codex_records(path: &Path, max_bytes: usize, skipped_records: u64) {
+    if skipped_records > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            max_bytes,
+            skipped_records,
+            "Skipped oversized Codex JSONL records while retaining later usage"
+        );
+    }
+}
+
 pub(crate) fn parse_codex_file_incremental(
     path: &Path,
     start_offset: u64,
@@ -2538,6 +2549,12 @@ pub(crate) fn parse_codex_file_incremental(
         };
 
         let archive_limit = archive_limit_for_path(path);
+        // Large archives with no declared size can spend the entire decoded
+        // budget allocating JSON and usage rows that must then be discarded.
+        // Probe only when the compressed file itself reaches that budget.
+        let probe_size = file
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() >= archive_limit);
         let mut reader = BufReader::with_capacity(zstd::zstd_safe::DCtx::in_size(), file);
         let declared_size = match reader.fill_buf() {
             Ok(header) => zstd::zstd_safe::get_frame_content_size(header)
@@ -2562,7 +2579,12 @@ pub(crate) fn parse_codex_file_incremental(
             );
         }
 
-        let mut decoder = match zstd::stream::read::Decoder::with_buffer(reader) {
+        let make_decoder = |reader| {
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)?;
+            decoder.window_log_max(26)?;
+            Ok::<_, std::io::Error>(decoder)
+        };
+        let mut decoder = match make_decoder(reader) {
             Ok(decoder) => decoder,
             Err(error) => {
                 return failed_codex_parse(
@@ -2572,18 +2594,66 @@ pub(crate) fn parse_codex_file_incremental(
                 );
             }
         };
-        if let Err(error) = decoder.window_log_max(26) {
-            return failed_codex_parse(state, 0, Some(CodexArchiveFailure::decode(path, error)));
+
+        let max_decoded_bytes = archive_limit.saturating_add(1);
+        let max_record_bytes = record_limit_for_path(path);
+        if probe_size {
+            let mut probe = BufReader::new(decoder.by_ref().take(max_decoded_bytes));
+            let mut line = String::new();
+            let mut consumed = 0;
+            let mut skipped = 0;
+            // Use the same record reader as the parser so invalid UTF-8,
+            // truncated archives and oversized-record warnings keep their
+            // existing precedence over the decoded-size diagnostic.
+            loop {
+                match read_bounded_jsonl_line(&mut probe, &mut line, max_record_bytes) {
+                    Ok(BoundedJsonlRead::Line(bytes)) => consumed += bytes,
+                    Ok(BoundedJsonlRead::Oversized(bytes)) => {
+                        consumed += bytes;
+                        skipped += 1;
+                    }
+                    Ok(BoundedJsonlRead::Eof) | Err(_) => break,
+                }
+            }
+            if consumed > archive_limit {
+                warn_oversized_codex_records(path, max_record_bytes, skipped);
+                let mut failed = failed_codex_parse(
+                    state,
+                    consumed,
+                    Some(CodexArchiveFailure::decoded_size_limit(path, archive_limit)),
+                );
+                failed.skipped_oversized_records = skipped;
+                return failed;
+            }
+            // An in-budget or inconclusive probe uses the canonical parser.
+            let mut reader = decoder.finish();
+            if let Err(error) = reader.rewind() {
+                return failed_codex_parse(
+                    state,
+                    0,
+                    Some(CodexArchiveFailure::decode(path, error)),
+                );
+            }
+            decoder = match make_decoder(reader) {
+                Ok(decoder) => decoder,
+                Err(error) => {
+                    return failed_codex_parse(
+                        state,
+                        0,
+                        Some(CodexArchiveFailure::decode(path, error)),
+                    );
+                }
+            };
         }
 
-        let reader = BufReader::new(decoder.take(archive_limit.saturating_add(1)));
+        let reader = BufReader::new(decoder.take(max_decoded_bytes));
         let mut parsed = parse_codex_reader_with_record_limit(
             reader,
             &session_id,
             fallback_timestamp,
             0,
             state,
-            record_limit_for_path(path),
+            max_record_bytes,
         );
         parsed.archive_failure = if parsed.consumed_offset > archive_limit {
             Some(CodexArchiveFailure::decoded_size_limit(path, archive_limit))
@@ -2593,14 +2663,7 @@ pub(crate) fn parse_codex_file_incremental(
         } else {
             None
         };
-        if parsed.skipped_oversized_records > 0 {
-            tracing::warn!(
-                path = %path.display(),
-                max_bytes = record_limit_for_path(path),
-                skipped_records = parsed.skipped_oversized_records,
-                "Skipped oversized Codex JSONL records while retaining later usage"
-            );
-        }
+        warn_oversized_codex_records(path, max_record_bytes, parsed.skipped_oversized_records);
         if parsed.archive_failure.is_some() || !parsed.parse_succeeded {
             parsed.messages.clear();
             parsed.fallback_timestamp_indices.clear();
@@ -5986,6 +6049,45 @@ mod tests {
             parsed.archive_failure.unwrap().cause,
             CodexArchiveFailureCause::DecodedSizeLimit { limit_bytes: limit }
         );
+    }
+
+    #[test]
+    fn large_unknown_size_archive_is_probed_before_parsing_usage() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("unknown-size-probe.jsonl.zst");
+        let oversized = "x".repeat(513);
+        let content = format!("{oversized}\n{COMPRESSED_TURN_CONTEXT}\n{COMPRESSED_USAGE}\n");
+        // Concatenating small unknown-size frames adds enough frame overhead
+        // to enter the probe branch at both limits.
+        let bytes: Vec<_> = content
+            .as_bytes()
+            .chunks(4)
+            .flat_map(|chunk| zstd::encode_all(chunk, 0).unwrap())
+            .collect();
+        let size = content.len() as u64;
+        assert!(bytes.len() as u64 >= size);
+        std::fs::write(&path, bytes).unwrap();
+        let _record_limit = register_record_limit_override(&path, 512);
+
+        {
+            let limit = size - 1;
+            let _limit = register_archive_limit_override(&path, limit);
+            let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+            assert!(!parsed.parse_succeeded);
+            assert!(parsed.messages.is_empty());
+            assert_eq!(parsed.consumed_offset, size);
+            assert_eq!(parsed.skipped_oversized_records, 1);
+            assert_eq!(
+                parsed.archive_failure.unwrap().cause,
+                CodexArchiveFailureCause::DecodedSizeLimit { limit_bytes: limit }
+            );
+        }
+        let _limit = register_archive_limit_override(&path, size);
+        let parsed = parse_codex_file_incremental(&path, 0, CodexParseState::default());
+        assert!(parsed.parse_succeeded);
+        assert!(parsed.archive_failure.is_none());
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].tokens.total(), 160);
     }
 
     #[test]

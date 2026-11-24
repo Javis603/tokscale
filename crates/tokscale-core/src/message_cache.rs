@@ -13224,6 +13224,25 @@ mod tests {
             cache.take_codex(&source, Some(|_: &CodexHistory| true)),
             CodexCacheLookup::History(_)
         ));
+        // Leave the index intact while corrupting the payload so an indexed
+        // lookup must fall back to the canonical reader.
+        let indexed_bytes = fs::read(&shard).unwrap();
+        let mut damaged = indexed_bytes.clone();
+        let session = damaged[..v2.len()]
+            .windows(b"codex-session".len())
+            .position(|bytes| bytes == b"codex-session")
+            .unwrap();
+        damaged[session] = 0xff;
+        drop(cache);
+        fs::write(&shard, damaged).unwrap();
+        let cache = SourceMessageCache::load().with_codex_index(true);
+        assert!(matches!(
+            cache.take_codex(&source, Some(|_: &CodexHistory| true)),
+            CodexCacheLookup::Full(None)
+        ));
+        drop(cache);
+        fs::write(&shard, indexed_bytes).unwrap();
+        let mut cache = SourceMessageCache::load().with_codex_index(true);
         let mut dirty = entry.clone();
         dirty.messages[0].session_id = "dirty-session".into();
         cache.insert(dirty);
