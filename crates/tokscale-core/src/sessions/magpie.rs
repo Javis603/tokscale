@@ -33,7 +33,7 @@ struct LedgerRow {
     tier_served: Option<String>,
 }
 
-fn codex_response_id(message: &UnifiedMessage) -> Option<&str> {
+pub(crate) fn codex_response_id(message: &UnifiedMessage) -> Option<&str> {
     if message.client != "codex"
         || message.message_count != 1
         || message.model_attribution_conflicted

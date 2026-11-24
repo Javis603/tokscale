@@ -1297,13 +1297,15 @@ fn flushed_message_identity(
     ))
 }
 
-/// A per-call pricing optimization, never part of a persisted cache entry.
+/// Per-call date predicates, never part of a persisted cache entry.
 /// Dates must be tested in the same timezone as the final report flush.
 struct PricingWindow<'a> {
     year: Option<&'a str>,
     since: Option<&'a str>,
     until: Option<&'a str>,
     timezone: bucket_tz::BucketTimezone,
+    /// Only model reports without recovery may discard historical Codex rows.
+    discard_historical_codex: bool,
 }
 
 impl<'a> PricingWindow<'a> {
@@ -1316,7 +1318,14 @@ impl<'a> PricingWindow<'a> {
             since: options.since.as_deref(),
             until: options.until.as_deref(),
             timezone: bucket_tz::BucketTimezone::from_scanner_settings(settings),
+            discard_historical_codex: false,
         })
+    }
+
+    fn for_model_report(options: &'a ReportOptions, recovery_active: bool) -> Option<Self> {
+        let mut window = Self::new(options, &options.scanner_settings)?;
+        window.discard_historical_codex = !recovery_active;
+        Some(window)
     }
 
     fn matches(&self, message: &UnifiedMessage) -> bool {
@@ -1325,12 +1334,20 @@ impl<'a> PricingWindow<'a> {
             .is_pinned()
             .then(|| message.date_in_timezone(&self.timezone))
             .flatten();
-        date_passes_report_filter(
-            pinned_date.as_deref().unwrap_or(&message.date),
-            self.year,
-            self.since,
-            self.until,
-        )
+        self.matches_date(pinned_date.as_deref().unwrap_or(&message.date))
+    }
+
+    fn matches_timestamp(&self, timestamp: i64) -> bool {
+        let pinned_date = (self.timezone.is_pinned() && timestamp > 0)
+            .then(|| self.timezone.day_key(timestamp))
+            .filter(|date| !date.is_empty());
+        let date =
+            pinned_date.unwrap_or_else(|| bucket_tz::BucketTimezone::Local.day_key(timestamp));
+        self.matches_date(&date)
+    }
+
+    fn matches_date(&self, date: &str) -> bool {
+        date_passes_report_filter(date, self.year, self.since, self.until)
     }
 }
 
@@ -1749,13 +1766,21 @@ struct FlushContext<'a> {
 }
 
 fn matches_flush_filter(message: &UnifiedMessage, context: &FlushContext<'_>) -> bool {
-    context.include_all
-        || retain_for_requested_clients(
-            &message.client,
-            &message.model_id,
-            &message.provider_id,
-            &context.requested,
-        )
+    matches_flush_identity(
+        &message.client,
+        &message.model_id,
+        &message.provider_id,
+        context,
+    )
+}
+
+fn matches_flush_identity(
+    client: &str,
+    model: &str,
+    provider: &str,
+    context: &FlushContext<'_>,
+) -> bool {
+    context.include_all || retain_for_requested_clients(client, model, provider, &context.requested)
 }
 
 /// Apply the post-filter parse tail to a message whose source eligibility has
@@ -1848,6 +1873,8 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     cache_policy: SourceCachePolicy,
     price_window: Option<&ReportOptions>,
 ) -> Vec<UnifiedMessage> {
+    // The caller's scanner settings own the bucketing timezone.
+    let price_window = price_window.and_then(|window| PricingWindow::new(window, scanner_settings));
     parse_all_messages_with_coverage(
         home_dir,
         clients,
@@ -1855,7 +1882,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         use_env_roots,
         scanner_settings,
         cache_policy,
-        price_window,
+        price_window.as_ref(),
     )
     .0
 }
@@ -1867,11 +1894,8 @@ fn parse_all_messages_with_coverage(
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
     cache_policy: SourceCachePolicy,
-    price_window: Option<&ReportOptions>,
+    price_window: Option<&PricingWindow<'_>>,
 ) -> (Vec<UnifiedMessage>, Option<claude_desktop::Coverage>) {
-    // The scanner settings passed to this call are authoritative, just as they
-    // are for the final flush. ReportOptions carries only the date predicates.
-    let price_window = price_window.and_then(|window| PricingWindow::new(window, scanner_settings));
     let mut messages: Vec<UnifiedMessage> = Vec::new();
     let outcome = parse_all_messages_streaming(
         home_dir,
@@ -1880,7 +1904,7 @@ fn parse_all_messages_with_coverage(
         use_env_roots,
         scanner_settings,
         cache_policy,
-        price_window.as_ref(),
+        price_window,
         &mut messages,
     );
     // This established collection boundary never exposes deferred ownership.
@@ -2068,6 +2092,64 @@ fn emit_dsh_scan_warnings(warnings: Mutex<Vec<(PathBuf, String)>>) {
         vec![format!("Warning: {} incomplete DSH transcript(s). Only complete readable records are counted; totals may omit usage. These sources will be retried on the next scan. Examples: {examples}.", warnings.len())]
     };
     tui_signal::update_dsh_scan_warnings(messages);
+}
+
+/// Run file loads on Rayon and reduce their results in source order. Bounding
+/// the channel alone would let a slow first file grow the reorder buffer to
+/// the size of the scan. Finish sending one index window before starting the
+/// next, so the FIFO receiver can only reorder within the current window.
+fn consume_ordered_parallel<T: Sync, R: Send>(
+    sources: &[T],
+    bounded: bool,
+    load: impl Fn(&T) -> R + Sync,
+    mut consume: impl FnMut(&T, R) + Send,
+) {
+    if sources.len() <= 1 || rayon::current_num_threads() == 1 {
+        for source in sources {
+            consume(source, load(source));
+        }
+        return;
+    }
+    if !bounded {
+        let outcomes: Vec<_> = sources.par_iter().map(&load).collect();
+        for (source, outcome) in sources.iter().zip(outcomes) {
+            consume(source, outcome);
+        }
+        return;
+    }
+
+    let capacity = 2 * rayon::current_num_threads();
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        // Keep the receiver off Rayon so even a saturated pool can make
+        // progress when a worker is blocked sending an outcome.
+        scope.spawn(move || {
+            let mut pending = BTreeMap::new();
+            let mut next = 0;
+            for (index, outcome) in receiver {
+                pending.insert(index, outcome);
+                while let Some(outcome) = pending.remove(&next) {
+                    consume(&sources[next], outcome);
+                    next += 1;
+                }
+            }
+        });
+
+        for (batch, sources) in sources.chunks(capacity).enumerate() {
+            let start = batch * capacity;
+            if sources
+                .par_iter()
+                .enumerate()
+                .try_for_each_with(&sender, |sender, (offset, source)| {
+                    sender.send((start + offset, load(source)))
+                })
+                .is_err()
+            {
+                // The receiver panicked. The scope propagates that panic.
+                break;
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)] // price_window rides beside pricing through the shared loader chain
@@ -3422,7 +3504,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     fn load_or_parse_codex_source(
         path: &Path,
-        source_cache: &message_cache::SourceMessageCache,
+        cached: Option<message_cache::CachedSourceEntry>,
         pricing: Option<&pricing::PricingService>,
         price_window: Option<&PricingWindow<'_>>,
         headless_roots: &[PathBuf],
@@ -3467,9 +3549,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 None,
             )
         }
-        let identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
         let is_headless = is_headless_path(path, headless_roots);
-        let cached = source_cache.take(identity, path);
         if cached.is_none() {
             // The post-parse cache build computes the authoritative fingerprint
             // after reading the file. Avoid hashing an uncached source here
@@ -3645,6 +3725,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             message_cache::SourceMessageCache::load_for_scan(
                 (!use_env_roots).then_some(std::path::Path::new(home_dir)),
             )
+            .with_codex_index(price_window.is_some_and(|window| window.discard_historical_codex))
         }
         SourceCachePolicy::InMemory => message_cache::SourceMessageCache::default(),
     };
@@ -3969,66 +4050,152 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // its messages survive the client filter: the scanner also walks the Codex
     // roots for an OpenClaw-only request (as lookup inputs for the hand-off),
     // and nothing is counted under codex there, so the mirror stays the record
-    // of those turns. The messages themselves go to the lane buffer regardless
-    // and the flush filter decides — a `synthetic` request keeps the ones a
-    // synthetic gateway served, whether or not codex was asked for by name.
+    // of those turns. A `synthetic` request keeps the messages a synthetic
+    // gateway served, whether or not codex was asked for by name.
     let mut recorded_codex_turns = RecordedCodexTurns::default();
-    let codex_outcomes: Vec<(PathBuf, CodexSourceOutcome)> = scan_result
-        .get(ClientId::Codex)
-        .par_iter()
-        .map(|path| {
-            let mut outcome = load_or_parse_codex_source(
-                path,
-                &source_cache,
-                pricing,
-                price_window,
-                &headless_roots,
-            );
-            machine_labeler.label_messages(path, &mut outcome.0.messages);
-            (path.clone(), outcome)
-        })
-        .collect();
-    let mut codex_seen: HashSet<String> = HashSet::new();
-    let inspected_codex_files = codex_outcomes.len();
+    let codex_paths = scan_result.get(ClientId::Codex);
+    let inspected_codex_files = codex_paths.len();
     let include_codex_diagnostic = include_all || clients.iter().any(|client| client == "codex");
     let mut missing_codex_usage_files = 0;
     let mut codex_archive_failures = Vec::new();
-    for (path, (outcome, turn_coverage, missing_usage, archive_failure)) in codex_outcomes {
-        missing_codex_usage_files += usize::from(
-            missing_usage.0 && (include_codex_diagnostic || (include_synthetic && missing_usage.1)),
-        );
-        if let Some(failure) = archive_failure {
-            codex_archive_failures.push(failure);
-        }
-        let mut owned_thread: Option<String> = None;
-        let mut counted_under_codex = false;
-        for message in outcome.messages {
-            if message.client == sessions::codex::OPENCLAW_CLIENT_ID {
-                if owned_thread.is_none() {
-                    owned_thread = Some(message.session_id.to_string());
+
+    let codex_report_window = price_window.filter(|window| window.discard_historical_codex);
+    // Both gateway overlays arbitrate claims across the entire lane. Use
+    // the same OpenCodex index for pruning and attribution, and keep any
+    // historical row that could claim a gateway request.
+    let opencodex_index = (codex_report_window.is_some() && !codex_paths.is_empty())
+        .then(|| sessions::opencodex::load_codex_attribution_index(home_dir, use_env_roots))
+        .flatten();
+
+    enum CodexLaneOutcome {
+        Full(Box<CodexSourceOutcome>),
+        History(message_cache::CodexHistory),
+    }
+
+    // Defer mutations until all loaders have finished borrowing the cache.
+    // A single list preserves the order of inserts and invalidations.
+    let mut codex_cache_updates = Vec::new();
+    {
+        let mut codex_seen = HashSet::new();
+        consume_ordered_parallel(
+            codex_paths,
+            codex_report_window.is_some(),
+            |path| {
+                let use_summary = codex_report_window.map(|window| {
+                    let opencodex_index = opencodex_index.as_deref();
+                    move |history: &message_cache::CodexHistory| {
+                        let mut fallback_timestamp = None;
+                        history.rows.iter().all(|row| {
+                            let timestamp = row.timestamp.unwrap_or_else(|| {
+                                *fallback_timestamp.get_or_insert_with(|| {
+                                    sessions::utils::file_modified_timestamp_ms(path)
+                                })
+                            });
+                            let identity = &history.identities[row.identity];
+                            !window.matches_timestamp(timestamp)
+                                && !opencodex_index.is_some_and(|index| {
+                                    index.may_claim_source(
+                                        &identity.client,
+                                        timestamp,
+                                        &identity.model,
+                                    )
+                                })
+                        })
+                    }
+                });
+                let cached = source_cache.take_codex(path, use_summary);
+                let cached = match cached {
+                    message_cache::CodexCacheLookup::History(history) => {
+                        return CodexLaneOutcome::History(history);
+                    }
+                    message_cache::CodexCacheLookup::Full(entry) => entry.map(|entry| *entry),
+                };
+                let mut outcome = load_or_parse_codex_source(
+                    path,
+                    cached,
+                    pricing,
+                    price_window,
+                    &headless_roots,
+                );
+                machine_labeler.label_messages(path, &mut outcome.0.messages);
+                CodexLaneOutcome::Full(Box::new(outcome))
+            },
+            |path, outcome| {
+                let (outcome, turn_coverage, missing_usage, archive_failure) = match outcome {
+                    CodexLaneOutcome::Full(outcome) => *outcome,
+                    CodexLaneOutcome::History(history) => {
+                        missing_codex_usage_files += usize::from(
+                            history.missing_usage.0
+                                && (include_codex_diagnostic
+                                    || (include_synthetic && history.missing_usage.1)),
+                        );
+                        let mut counted_under_codex = false;
+                        for row in history.rows {
+                            if row.key.is_none_or(|key| codex_seen.insert(key)) {
+                                let identity = &history.identities[row.identity];
+                                counted_under_codex |= matches_flush_identity(
+                                    &identity.client,
+                                    &identity.model,
+                                    &identity.provider,
+                                    &flush_context,
+                                );
+                            }
+                        }
+                        if counted_under_codex {
+                            if let Some(thread) = sessions::codex::thread_id_from_rollout_path(path)
+                            {
+                                recorded_codex_turns.record(&thread, &history.coverage);
+                            }
+                        }
+                        return;
+                    }
+                };
+                missing_codex_usage_files += usize::from(
+                    missing_usage.0
+                        && (include_codex_diagnostic || (include_synthetic && missing_usage.1)),
+                );
+                if let Some(failure) = archive_failure {
+                    codex_archive_failures.push(failure);
                 }
-                openclaw_owned_rollouts.push(message);
-            } else if should_keep_deduped_message(&mut codex_seen, &message) {
-                counted_under_codex |= flush_context.include_all
-                    || retain_for_requested_clients(
-                        &message.client,
-                        &message.model_id,
-                        &message.provider_id,
-                        &flush_context.requested,
-                    );
-                all_messages.push(message);
-            }
-        }
-        if let Some(thread) = owned_thread {
-            recorded_codex_turns.record(&thread, &turn_coverage);
-        } else if counted_under_codex {
-            if let Some(thread) = sessions::codex::thread_id_from_rollout_path(&path) {
-                recorded_codex_turns.record(&thread, &turn_coverage);
-            }
-        }
-        if let Some(entry) = outcome.cache_entry {
+                let mut owned_thread = None;
+                let mut counted_under_codex = false;
+                for message in outcome.messages {
+                    if message.client == sessions::codex::OPENCLAW_CLIENT_ID {
+                        if owned_thread.is_none() {
+                            owned_thread = Some(message.session_id.to_string());
+                        }
+                        openclaw_owned_rollouts.push(message);
+                    } else if should_keep_deduped_message(&mut codex_seen, &message)
+                        && matches_flush_filter(&message, &flush_context)
+                    {
+                        counted_under_codex = true;
+                        if codex_report_window.is_none_or(|window| window.matches(&message))
+                            || opencodex_index
+                                .as_ref()
+                                .is_some_and(|index| index.may_claim(&message))
+                            || sessions::magpie::codex_response_id(&message).is_some()
+                        {
+                            all_messages.push(message);
+                        }
+                    }
+                }
+                if let Some(thread) = owned_thread {
+                    recorded_codex_turns.record(&thread, &turn_coverage);
+                } else if counted_under_codex {
+                    if let Some(thread) = sessions::codex::thread_id_from_rollout_path(path) {
+                        recorded_codex_turns.record(&thread, &turn_coverage);
+                    }
+                }
+                if outcome.cache_entry.is_some() || outcome.invalidate_cache {
+                    codex_cache_updates.push((path.clone(), outcome.cache_entry));
+                }
+            },
+        );
+    }
+    for (path, entry) in codex_cache_updates {
+        if let Some(entry) = entry {
             source_cache.insert(entry);
-        } else if outcome.invalidate_cache {
+        } else {
             source_cache.remove(
                 message_cache::CacheIdentity::for_client(ClientId::Codex),
                 &path,
@@ -4036,19 +4203,24 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
-    // Source-filter Codex before a physical-target overlay changes its
-    // model/provider. Re-filtering afterwards could drop a Synthetic-eligible
-    // virtual combo or include an originally ineligible row.
-    all_messages.retain(|message| matches_flush_filter(message, &flush_context));
+    if scan_result.get(ClientId::OpenClaw).is_empty() {
+        source_cache.finish_codex_index_reads();
+    }
 
-    // Correlate successful Responses-only OpenCodex combo attempts with
-    // physical models. This changes attribution, never token-counted rows.
-    let (opencodex_attributed, opencodex_claims) =
+    // The reducer above checks source eligibility before the gateway overlays
+    // rewrite model/provider. Keep the original selection through the flush.
+    let (opencodex_attributed, opencodex_claims) = if codex_report_window.is_some() {
+        opencodex_index.map_or_else(
+            || (0, HashSet::new()),
+            |index| sessions::opencodex::attribute_with_index(&index, &mut all_messages),
+        )
+    } else {
         sessions::opencodex::attribute_codex_messages_with_claims(
             home_dir,
             use_env_roots,
             &mut all_messages,
-        );
+        )
+    };
     let magpie_attributed = sessions::magpie::attribute_codex_responses(
         home_dir,
         use_env_roots,
@@ -4537,7 +4709,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .map(|path| {
                 let mut outcome = load_or_parse_codex_source(
                     path,
-                    &source_cache,
+                    source_cache.take(
+                        message_cache::CacheIdentity::for_client(ClientId::Codex),
+                        path,
+                    ),
                     pricing,
                     price_window,
                     &headless_roots,
@@ -4579,6 +4754,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 );
             }
         }
+
+        source_cache.finish_codex_index_reads();
 
         let openclaw_db_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
             .openclaw_dbs
@@ -4711,6 +4888,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     );
     apply_pricing_to_messages(&mut prime_agent_messages, pricing);
     all_messages.extend(prime_agent_messages);
+    source_cache.finish_codex_index_reads();
     flush_lane(&mut all_messages, &flush_context, sink);
 
     let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
@@ -6788,7 +6966,9 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
     );
     let mut sink = ModelReportSink::new(&options);
     let mut sessions = Vec::new();
-    let claude_desktop_cache = if recovery::applicable(&home_dir) || session_grouped {
+    let recovery_active = recovery::applicable(&home_dir);
+    let price_window = PricingWindow::for_model_report(&options, recovery_active);
+    let claude_desktop_cache = if recovery_active || session_grouped {
         let (messages, coverage) = parse_all_messages_with_coverage(
             &home_dir,
             &clients,
@@ -6796,7 +6976,7 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
             options.use_env_roots,
             &options.scanner_settings,
             SourceCachePolicy::Persistent,
-            Some(&options),
+            price_window.as_ref(),
         );
         let mut filtered = filter_messages_for_report(messages, &options);
         resolve_codex_parent_session_ids(&mut filtered);
@@ -6819,7 +6999,7 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
             options.use_env_roots,
             &options.scanner_settings,
             SourceCachePolicy::Persistent,
-            PricingWindow::new(&options, &options.scanner_settings).as_ref(),
+            price_window.as_ref(),
             &mut custom_sink,
         )
         .coverage
@@ -6927,6 +7107,13 @@ pub async fn get_model_reports_v2(
         year: None,
         ..options.clone()
     };
+    // An open-ended window usually needs the full cache, so keep the bulk
+    // reader for the combined Today, Month and All Time scan.
+    let price_window = if union.until.is_some() {
+        PricingWindow::for_model_report(&union, recovery::applicable(&home_dir))
+    } else {
+        PricingWindow::new(&union, &options.scanner_settings)
+    };
     let (mut messages, claude_desktop_cache) = parse_all_messages_with_coverage(
         &home_dir,
         &clients,
@@ -6934,7 +7121,7 @@ pub async fn get_model_reports_v2(
         options.use_env_roots,
         &options.scanner_settings,
         SourceCachePolicy::Persistent,
-        Some(&union),
+        price_window.as_ref(),
     );
 
     let mut labeler = WorkspaceLabeler::default();
@@ -33295,6 +33482,7 @@ mod tests {
             ModelReportV2, ModelUsage, ReportWindow,
         };
         use super::*;
+        use std::sync::Mutex;
 
         /// One Claude Code assistant response at `timestamp` (UTC).
         fn claude_line(timestamp: &str, id: &str, model: &str, input: i64, output: i64) -> String {
@@ -33587,6 +33775,308 @@ mod tests {
                 report.report.total_output,
                 report.report.total_messages,
             )
+        }
+
+        fn set_rollout_mtime(path: &Path, timestamp: &str) {
+            let modified: std::time::SystemTime = chrono::DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .into();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+
+        fn write_compressed_rollout(path: &Path, contents: &str) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, zstd::encode_all(contents.as_bytes(), 0).unwrap()).unwrap();
+        }
+
+        fn codex_day(home: &Path, date: &str) -> ReportOptions {
+            let mut options = options(
+                home,
+                "UTC",
+                GroupBy::ClientWorkspaceSession,
+                WorktreeRollup::Separate,
+                (Some(date), Some(date), None),
+            );
+            options.clients = Some(vec!["codex".into()]);
+            options
+        }
+
+        #[test]
+        #[serial]
+        fn codex_window_keeps_archive_events_after_its_mtime() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut env = redirect_cache_home(cache_home.path());
+            env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            let old = source_home
+                .path()
+                .join(".codex/archived_sessions/old.jsonl.zst");
+            let contents = codex_rollout("midnight", "2026-10-02T00:01:00Z", 10, 2);
+            write_compressed_rollout(&old, &contents);
+            set_rollout_mtime(&old, "2026-10-01T23:59:00Z");
+
+            let runtime = runtime();
+            let options = codex_day(source_home.path(), "2026-10-02");
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _observer = message_cache::install_test_source_cache_persist_observer(Arc::new({
+                let writes = Arc::clone(&writes);
+                move || {
+                    writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }));
+            let cold = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_eq!(day_totals(&cold), (10, 2, 1));
+            assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let warm = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert_same_report(&warm, &cold, "unchanged archive hits persisted cache");
+
+            // A live copy can appear after the archive was cached.
+            let live = source_home.path().join(".codex/sessions/copy.jsonl");
+            std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+            std::fs::write(live, contents).unwrap();
+            let with_live = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_eq!(day_totals(&with_live), (10, 2, 1));
+            let collected = runtime.block_on(collected_report(&options));
+            assert_same_report(&with_live, &collected, "live and archive duplicate");
+        }
+
+        #[test]
+        #[serial]
+        fn codex_window_rebuckets_both_sides_of_midnight_in_one_cached_file() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut env = redirect_cache_home(cache_home.path());
+            env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            let source = source_home
+                .path()
+                .join(".codex/sessions/spanning.jsonl.zst");
+            let contents = [
+                codex_rollout("spanning", "2026-10-01T15:59:59.999Z", 10, 2),
+                codex_rollout("spanning", "2026-10-01T16:00:00.000Z", 30, 3),
+            ]
+            .concat();
+            write_compressed_rollout(&source, &contents);
+
+            let runtime = runtime();
+            let mut report_options = codex_day(source_home.path(), "2026-10-02");
+            let utc = runtime
+                .block_on(get_model_report_v2(report_options.clone()))
+                .unwrap();
+            assert_eq!(day_totals(&utc), (0, 0, 0));
+
+            report_options.scanner_settings.bucket_timezone = Some("Asia/Hong_Kong".into());
+            let windows = [
+                ReportWindow {
+                    name: "before".into(),
+                    since: Some("2026-10-01".into()),
+                    until: Some("2026-10-01".into()),
+                },
+                ReportWindow {
+                    name: "after".into(),
+                    since: report_options.since.clone(),
+                    until: report_options.until.clone(),
+                },
+            ];
+            let reports = runtime
+                .block_on(get_model_reports_v2(report_options.clone(), &windows))
+                .unwrap();
+            assert_eq!(day_totals(&reports[0]), (10, 2, 1));
+            assert_eq!(day_totals(&reports[1]), (30, 3, 1));
+            let collected = runtime.block_on(collected_report(&report_options));
+            assert_same_report(
+                &reports[1],
+                &collected,
+                "pinned midnight after the cache was warmed in UTC",
+            );
+
+            let warm = runtime
+                .block_on(get_model_report_v2(report_options))
+                .unwrap();
+            assert_same_report(&warm, &reports[1], "single day and window report");
+        }
+
+        #[test]
+        #[serial]
+        fn codex_window_keeps_older_fallback_dedup_winner() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut env = redirect_cache_home(cache_home.path());
+            env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            let sessions = source_home.path().join(".codex/sessions");
+            let old = sessions.join("01/copy.jsonl.zst");
+            let live = sessions.join("02/copy.jsonl");
+            let contents = concat!(
+                r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+                "
+",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+                "
+",
+            );
+            write_compressed_rollout(&old, contents);
+            std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+            std::fs::write(&live, contents).unwrap();
+            set_rollout_mtime(&old, "2026-10-01T23:59:00Z");
+            set_rollout_mtime(&live, "2026-10-02T00:01:00Z");
+
+            let runtime = runtime();
+            let options = codex_day(source_home.path(), "2026-10-02");
+            let collected = runtime.block_on(collected_report(&options));
+            let cold = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_eq!(day_totals(&cold), (0, 0, 0));
+            assert_same_report(&cold, &collected, "old fallback duplicate wins");
+
+            {
+                let cache = message_cache::SourceMessageCache::load().with_codex_index(true);
+                let message_cache::CodexCacheLookup::History(history) =
+                    cache.take_codex(&old, Some(|_: &message_cache::CodexHistory| true))
+                else {
+                    panic!("the warm archive must supply metadata without its payload");
+                };
+                assert_eq!(history.rows.len(), 1);
+                assert!(history.rows[0].key.is_some());
+                assert_eq!(history.rows[0].timestamp, None);
+            }
+
+            let warm = runtime.block_on(get_model_report_v2(options)).unwrap();
+            assert_same_report(&warm, &cold, "metadata-only archive still wins dedup");
+        }
+
+        #[test]
+        #[serial]
+        fn codex_window_keeps_new_turn_of_child_replaying_old_parent() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut env = redirect_cache_home(cache_home.path());
+            env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            write_codex_user_fork_replay_fixture(source_home.path());
+            let archived = source_home.path().join(".codex/archived_sessions");
+            let parent = std::fs::read_dir(archived)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let contents = std::fs::read_to_string(&parent)
+                .unwrap()
+                .replace("2026-01-02", "2026-01-01");
+            std::fs::write(parent, contents).unwrap();
+
+            let runtime = runtime();
+            let options = codex_day(source_home.path(), "2026-01-02");
+            let cold = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_eq!(day_totals(&cold), (250, 30, 1));
+            assert_eq!(cold.report.total_cache_read, 50);
+            let warm = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_same_report(&warm, &cold, "warm fork replay");
+            let collected = runtime.block_on(collected_report(&options));
+            assert_same_report(&cold, &collected, "fork replay with older parent");
+        }
+
+        #[test]
+        #[serial]
+        fn codex_window_keeps_old_turn_coverage_for_openclaw_mirrors() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut env = redirect_cache_home(cache_home.path());
+            env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            let home = source_home.path();
+            let codex_dir = home.join(".codex/sessions");
+            std::fs::create_dir_all(&codex_dir).unwrap();
+            std::fs::write(
+                codex_dir.join(format!(
+                    "rollout-2026-08-30T10-00-00-{OPENCLAW_CODEX_THREAD}.jsonl"
+                )),
+                openclaw_codex_rollout_with_turns(
+                    OPENCLAW_CODEX_THREAD,
+                    "Codex Desktop",
+                    &[("turn-1", OPENCLAW_CODEX_TURN_1)],
+                ),
+            )
+            .unwrap();
+            // The mirror's timestamp places it inside the report window even
+            // though the original turn's responses are outside it.
+            let mirror_time = chrono::DateTime::parse_from_rfc3339("2026-08-31T00:00:00Z")
+                .unwrap()
+                .timestamp_millis();
+            seed_openclaw_agent_db(
+                home,
+                "main",
+                "sess-codex",
+                Some("codex"),
+                &[
+                    sessions::openclaw::test_fixtures::header_event("sess-codex"),
+                    openclaw_codex_mirror_event("m1", OPENCLAW_CODEX_THREAD, "turn-1", mirror_time),
+                    openclaw_assistant_event("a2", 30, 10, mirror_time + 1000),
+                ],
+            );
+            let mut options = codex_day(home, "2026-08-31");
+            options.clients.as_mut().unwrap().push("openclaw".into());
+            let runtime = runtime();
+            let cold = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_eq!(day_totals(&cold), (30, 10, 1));
+            let warm = runtime
+                .block_on(get_model_report_v2(options.clone()))
+                .unwrap();
+            assert_same_report(&warm, &cold, "warm mirror coverage");
+            let collected = runtime.block_on(collected_report(&options));
+            assert_same_report(
+                &warm,
+                &collected,
+                "older Codex turn still covers its mirror",
+            );
+        }
+
+        #[test]
+        fn codex_outcomes_are_consumed_in_order_across_parallel_batches() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            let sources: Vec<_> = (0..40).collect();
+            let completion_order = Mutex::new(Vec::new());
+            let mut consumed = Vec::new();
+            pool.install(|| {
+                super::super::consume_ordered_parallel(
+                    &sources,
+                    true,
+                    |&index| {
+                        if index == 0 {
+                            // Give another worker time to queue an outcome
+                            // before the first source can release the buffer.
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        completion_order.lock().unwrap().push(index);
+                        index
+                    },
+                    |&index, outcome| {
+                        assert_eq!(index, outcome);
+                        consumed.push(index);
+                    },
+                );
+            });
+            assert_ne!(completion_order.into_inner().unwrap()[0], 0);
+            assert_eq!(consumed, sources);
         }
 
         #[test]
