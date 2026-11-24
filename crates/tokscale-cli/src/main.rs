@@ -89,6 +89,15 @@ struct Cli {
     date: DateRangeFlags,
 
     #[arg(
+        long = "window",
+        value_name = "NAME:SINCE:UNTIL",
+        requires = "json",
+        conflicts_with_all = ["today", "yesterday", "week", "month", "since", "until", "year"],
+        help = "Report several date windows from one scan, keyed by NAME (repeatable, --json only). SINCE and UNTIL are inclusive YYYY-MM-DD days; leave either empty for an open bound"
+    )]
+    windows: Vec<String>,
+
+    #[arg(
         long,
         value_name = "PATH",
         global = true,
@@ -763,6 +772,7 @@ fn main() -> Result<()> {
 
     let cli = token_monitor::parse_cli(std::env::args_os());
     let bucket_timezone = validate_bucket_timezone(&cli)?;
+    let report_windows = parse_report_windows(&cli)?;
     if cli.offline {
         validate_offline_command(cli.command.as_ref())?;
         tokscale_core::network::go_offline();
@@ -1177,7 +1187,17 @@ fn main() -> Result<()> {
 
             let worktree_rollup = worktree_rollup_from_flag(cli.merge_worktrees);
 
-            if cli.json {
+            if !report_windows.is_empty() {
+                run_windowed_models_report(
+                    cli.home.clone(),
+                    bucket_timezone.as_deref(),
+                    clients,
+                    report_windows,
+                    group_by,
+                    worktree_rollup,
+                    cli.hide_zero,
+                )
+            } else if cli.json {
                 run_models_report(
                     cli.json,
                     cli.home.clone(),
@@ -2510,6 +2530,366 @@ fn worktree_rollup_from_flag(merge_worktrees: bool) -> tokscale_core::WorktreeRo
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelUsageJson {
+    client: String,
+    merged_clients: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_key: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine: Option<String>,
+    model: String,
+    provider: String,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+    message_count: i32,
+    cost: f64,
+    performance: tokscale_core::ModelPerformance,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMetaJson {
+    workspace_key: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionMetaJson {
+    client: String,
+    session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    first_active_ms: i64,
+    last_active_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelReportJson {
+    group_by: String,
+    entries: Vec<ModelUsageJson>,
+    /// Per-session facts for session-grouped reports, joined by
+    /// `(client, sessionId)`. Absent for every other grouping.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<SessionMetaJson>,
+    /// Decoded workspace identities, joined by `workspaceKey`. Absent
+    /// for groupings whose rows carry no workspace.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    workspaces: Vec<WorkspaceMetaJson>,
+    total_input: i64,
+    total_output: i64,
+    total_cache_read: i64,
+    total_cache_write: i64,
+    total_messages: i32,
+    total_cost: f64,
+    processing_time_ms: u32,
+    undated_tokens: ModelTokenBreakdownJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_desktop_cache: Option<tokscale_core::claude_desktop::Coverage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<client_diagnostics::ClientDiagnostic>,
+}
+
+/// The JSON shape of one model report. `--window` emits one per window, so
+/// each window reads exactly like the single-range report.
+fn model_report_json(
+    report: tokscale_core::ModelReport,
+    undated_tokens: tokscale_core::TokenBreakdown,
+    claude_desktop_cache: Option<tokscale_core::claude_desktop::Coverage>,
+    group_by: &tokscale_core::GroupBy,
+    warnings: Vec<String>,
+    diagnostics: Vec<client_diagnostics::ClientDiagnostic>,
+) -> ModelReportJson {
+    use tokscale_core::GroupBy;
+
+    let workspaces: Vec<WorkspaceMetaJson> = report
+        .workspaces
+        .into_iter()
+        .map(|w| WorkspaceMetaJson {
+            workspace_key: w.workspace_key,
+            label: w.label,
+            path: w.path,
+        })
+        .collect();
+    let sessions: Vec<SessionMetaJson> = report
+        .sessions
+        .into_iter()
+        .map(|s| SessionMetaJson {
+            client: s.client,
+            session_id: s.session_id,
+            title: s.title,
+            first_active_ms: s.first_active_ms,
+            last_active_ms: s.last_active_ms,
+            parent_session_id: s.parent_session_id,
+        })
+        .collect();
+    ModelReportJson {
+        group_by: group_by.to_string(),
+        sessions,
+        workspaces,
+        entries: report
+            .entries
+            .into_iter()
+            .map(|e| ModelUsageJson {
+                workspace_key: if matches!(
+                    group_by,
+                    GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+                ) {
+                    Some(
+                        e.workspace_key
+                            .map(serde_json::Value::String)
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                } else {
+                    None
+                },
+                workspace_label: if matches!(
+                    group_by,
+                    GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
+                ) {
+                    e.workspace_label
+                } else {
+                    None
+                },
+                session_id: if matches!(
+                    group_by,
+                    GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+                ) {
+                    e.session_id
+                } else {
+                    None
+                },
+                machine: if *group_by == GroupBy::MachineModel {
+                    e.machine
+                } else {
+                    None
+                },
+                client: e.client,
+                merged_clients: e.merged_clients,
+                model: e.model,
+                provider: e.provider,
+                input: e.input,
+                output: e.output,
+                cache_read: e.cache_read,
+                cache_write: e.cache_write,
+                reasoning: e.reasoning,
+                message_count: e.message_count,
+                cost: e.cost,
+                performance: e.performance,
+            })
+            .collect(),
+        total_input: report.total_input,
+        total_output: report.total_output,
+        total_cache_read: report.total_cache_read,
+        total_cache_write: report.total_cache_write,
+        total_messages: report.total_messages,
+        total_cost: report.total_cost,
+        processing_time_ms: report.processing_time_ms,
+        undated_tokens: undated_tokens.into(),
+        claude_desktop_cache,
+        warnings,
+        diagnostics,
+    }
+}
+
+/// Display-only `--hide-zero` filter: totals were computed in core over the
+/// full entry set and intentionally still include the hidden rows.
+fn retain_nonzero_entries(entries: &mut Vec<tokscale_core::ModelUsage>) {
+    entries.retain(|e| {
+        e.input != 0
+            || e.output != 0
+            || e.cache_read != 0
+            || e.cache_write != 0
+            || e.reasoning != 0
+            || e.cost != 0.0
+            || e.performance.total_duration_ms != 0
+    });
+}
+
+fn model_report_diagnostics(
+    context: &LocalReportContext,
+    entries: &[tokscale_core::ModelUsage],
+) -> Vec<client_diagnostics::ClientDiagnostic> {
+    let claude_message_count = entries
+        .iter()
+        .filter(|entry| model_usage_includes_client(entry, "claude"))
+        .map(|entry| entry.message_count)
+        .sum();
+    context
+        .effective_home_dir()
+        .as_deref()
+        .map(|home| {
+            client_diagnostics::diagnostics_for_empty_explicit_report(
+                home,
+                context.use_env_roots,
+                &context.clients,
+                claude_message_count,
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// `--window` values for the default model report, validated at the boundary.
+fn parse_report_windows(cli: &Cli) -> Result<Vec<tokscale_core::ReportWindow>> {
+    if cli.windows.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cli.command.is_some() {
+        anyhow::bail!("--window is supported only for the default JSON model report");
+    }
+    let mut seen = std::collections::HashSet::new();
+    cli.windows
+        .iter()
+        .map(|value| {
+            let window = parse_report_window(value)?;
+            if !seen.insert(window.name.clone()) {
+                anyhow::bail!("--window name '{}' is repeated", window.name);
+            }
+            Ok(window)
+        })
+        .collect()
+}
+
+fn parse_report_window(value: &str) -> Result<tokscale_core::ReportWindow> {
+    let mut parts = value.splitn(3, ':');
+    let (Some(name), Some(since), Some(until)) = (parts.next(), parts.next(), parts.next()) else {
+        anyhow::bail!("--window expects NAME:SINCE:UNTIL, got '{value}'");
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!("--window name must be letters, digits, '_' or '-', got '{name}'");
+    }
+    let day = |bound: &str| -> Result<Option<String>> {
+        if bound.is_empty() {
+            return Ok(None);
+        }
+        match chrono::NaiveDate::parse_from_str(bound, "%Y-%m-%d") {
+            Ok(date) if date.format("%Y-%m-%d").to_string() == bound => Ok(Some(bound.to_string())),
+            _ => {
+                anyhow::bail!("--window '{name}' bound must be YYYY-MM-DD or empty, got '{bound}'")
+            }
+        }
+    };
+    let since = day(since)?;
+    let until = day(until)?;
+    if let (Some(since), Some(until)) = (&since, &until) {
+        if since > until {
+            anyhow::bail!("--window '{name}' starts after it ends");
+        }
+    }
+    Ok(tokscale_core::ReportWindow {
+        name: name.to_string(),
+        since,
+        until,
+    })
+}
+
+/// `--window` output: one ordinary model report per window, keyed by window
+/// name in the order the windows were given.
+struct WindowedModelReports(Vec<(String, ModelReportJson)>);
+
+impl serde::Serialize for WindowedModelReports {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, report) in &self.0 {
+            map.serialize_entry(name, report)?;
+        }
+        map.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowedModelReportJson {
+    schema_version: u32,
+    windows: WindowedModelReports,
+}
+
+/// Several date windows from one scan. Each window's report is exactly what
+/// `--json --since SINCE --until UNTIL` prints for the same options.
+fn run_windowed_models_report(
+    home_dir: Option<String>,
+    bucket_timezone: Option<&str>,
+    clients: Option<Vec<String>>,
+    windows: Vec<tokscale_core::ReportWindow>,
+    group_by: tokscale_core::GroupBy,
+    worktree_rollup: tokscale_core::WorktreeRollup,
+    hide_zero: bool,
+) -> Result<()> {
+    use tokio::runtime::Runtime;
+
+    let mut context = LocalReportContext::new_in_timezone(
+        home_dir,
+        clients,
+        &DateRangeFlags::default(),
+        None,
+        bucket_timezone,
+    );
+    let rt = Runtime::new()?;
+    let reports = rt
+        .block_on(tokscale_core::get_model_reports_v2(
+            context.report_options_with_rollup(group_by.clone(), worktree_rollup),
+            &windows,
+        ))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    context.stop_spinner();
+    emit_cursor_sync_warning(
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
+    );
+
+    let mut output = Vec::with_capacity(windows.len());
+    for (window, report) in windows.into_iter().zip(reports) {
+        let tokscale_core::ModelReportV2 {
+            mut report,
+            undated_tokens,
+            claude_desktop_cache,
+        } = report;
+        if hide_zero {
+            retain_nonzero_entries(&mut report.entries);
+        }
+        let diagnostics = model_report_diagnostics(&context, &report.entries);
+        output.push((
+            window.name,
+            model_report_json(
+                report,
+                undated_tokens,
+                claude_desktop_cache,
+                &group_by,
+                context.cursor_setup_warnings.clone(),
+                diagnostics,
+            ),
+        ));
+    }
+    let output = WindowedModelReportJson {
+        schema_version: 1,
+        windows: WindowedModelReports(output),
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_models_report(
     json: bool,
@@ -2550,17 +2930,7 @@ fn run_models_report(
         claude_desktop_cache,
     } = report;
     if hide_zero {
-        // Display-only filter: totals were computed in core over the full
-        // entry set and intentionally still include the hidden rows.
-        report.entries.retain(|e| {
-            e.input != 0
-                || e.output != 0
-                || e.cache_read != 0
-                || e.cache_write != 0
-                || e.reasoning != 0
-                || e.cost != 0.0
-                || e.performance.total_duration_ms != 0
-        });
+        retain_nonzero_entries(&mut report.entries);
     }
     let report = report;
 
@@ -2571,192 +2941,19 @@ fn run_models_report(
         context.explicit_cursor_filter,
     );
     let processing_time_ms = context.start.elapsed().as_millis();
-    let claude_message_count = report
-        .entries
-        .iter()
-        .filter(|entry| model_usage_includes_client(entry, "claude"))
-        .map(|entry| entry.message_count)
-        .sum();
-    let diagnostics = context
-        .effective_home_dir()
-        .as_deref()
-        .map(|home| {
-            client_diagnostics::diagnostics_for_empty_explicit_report(
-                home,
-                context.use_env_roots,
-                &context.clients,
-                claude_message_count,
-            )
-        })
-        .unwrap_or_default();
+    let diagnostics = model_report_diagnostics(&context, &report.entries);
 
     let desktop_cache = claude_desktop_cache;
 
     if json {
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ModelUsageJson {
-            client: String,
-            merged_clients: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            workspace_key: Option<serde_json::Value>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            workspace_label: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            session_id: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            machine: Option<String>,
-            model: String,
-            provider: String,
-            input: i64,
-            output: i64,
-            cache_read: i64,
-            cache_write: i64,
-            reasoning: i64,
-            message_count: i32,
-            cost: f64,
-            performance: tokscale_core::ModelPerformance,
-        }
-
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct WorkspaceMetaJson {
-            workspace_key: String,
-            label: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            path: Option<String>,
-        }
-
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SessionMetaJson {
-            client: String,
-            session_id: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            title: Option<String>,
-            first_active_ms: i64,
-            last_active_ms: i64,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            parent_session_id: Option<String>,
-        }
-
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ModelReportJson {
-            group_by: String,
-            entries: Vec<ModelUsageJson>,
-            /// Per-session facts for session-grouped reports, joined by
-            /// `(client, sessionId)`. Absent for every other grouping.
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            sessions: Vec<SessionMetaJson>,
-            /// Decoded workspace identities, joined by `workspaceKey`. Absent
-            /// for groupings whose rows carry no workspace.
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            workspaces: Vec<WorkspaceMetaJson>,
-            total_input: i64,
-            total_output: i64,
-            total_cache_read: i64,
-            total_cache_write: i64,
-            total_messages: i32,
-            total_cost: f64,
-            processing_time_ms: u32,
-            undated_tokens: ModelTokenBreakdownJson,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            claude_desktop_cache: Option<tokscale_core::claude_desktop::Coverage>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            warnings: Vec<String>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            diagnostics: Vec<client_diagnostics::ClientDiagnostic>,
-        }
-
-        let workspaces: Vec<WorkspaceMetaJson> = report
-            .workspaces
-            .into_iter()
-            .map(|w| WorkspaceMetaJson {
-                workspace_key: w.workspace_key,
-                label: w.label,
-                path: w.path,
-            })
-            .collect();
-        let sessions: Vec<SessionMetaJson> = report
-            .sessions
-            .into_iter()
-            .map(|s| SessionMetaJson {
-                client: s.client,
-                session_id: s.session_id,
-                title: s.title,
-                first_active_ms: s.first_active_ms,
-                last_active_ms: s.last_active_ms,
-                parent_session_id: s.parent_session_id,
-            })
-            .collect();
-        let output = ModelReportJson {
-            group_by: group_by.to_string(),
-            sessions,
-            workspaces,
-            entries: report
-                .entries
-                .into_iter()
-                .map(|e| ModelUsageJson {
-                    workspace_key: if matches!(
-                        group_by,
-                        GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
-                    ) {
-                        Some(
-                            e.workspace_key
-                                .map(serde_json::Value::String)
-                                .unwrap_or(serde_json::Value::Null),
-                        )
-                    } else {
-                        None
-                    },
-                    workspace_label: if matches!(
-                        group_by,
-                        GroupBy::WorkspaceModel | GroupBy::ClientWorkspaceSession
-                    ) {
-                        e.workspace_label
-                    } else {
-                        None
-                    },
-                    session_id: if matches!(
-                        group_by,
-                        GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
-                    ) {
-                        e.session_id
-                    } else {
-                        None
-                    },
-                    machine: if group_by == GroupBy::MachineModel {
-                        e.machine
-                    } else {
-                        None
-                    },
-                    client: e.client,
-                    merged_clients: e.merged_clients,
-                    model: e.model,
-                    provider: e.provider,
-                    input: e.input,
-                    output: e.output,
-                    cache_read: e.cache_read,
-                    cache_write: e.cache_write,
-                    reasoning: e.reasoning,
-                    message_count: e.message_count,
-                    cost: e.cost,
-                    performance: e.performance,
-                })
-                .collect(),
-            total_input: report.total_input,
-            total_output: report.total_output,
-            total_cache_read: report.total_cache_read,
-            total_cache_write: report.total_cache_write,
-            total_messages: report.total_messages,
-            total_cost: report.total_cost,
-            processing_time_ms: report.processing_time_ms,
-            undated_tokens: undated_tokens.into(),
-            claude_desktop_cache: desktop_cache,
-            warnings: context.cursor_setup_warnings,
+        let output = model_report_json(
+            report,
+            undated_tokens,
+            desktop_cache,
+            &group_by,
+            context.cursor_setup_warnings,
             diagnostics,
-        };
+        );
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
@@ -9992,6 +10189,128 @@ mod tests {
             Ok(_) => panic!("expected `{}` to fail to parse", args.join(" ")),
             Err(err) => err,
         }
+    }
+
+    fn report_windows_for(args: &[&str]) -> Result<Vec<tokscale_core::ReportWindow>> {
+        parse_report_windows(&Cli::try_parse_from(args).unwrap())
+    }
+
+    #[test]
+    fn report_windows_parse_inclusive_days_and_open_bounds_in_order() {
+        let windows = report_windows_for(&[
+            "tokscale",
+            "--json",
+            "--window",
+            "today:2026-11-24:2026-11-24",
+            "--window",
+            "allTime:2024-01-01:",
+            "--window",
+            "upTo::2026-11-01",
+        ])
+        .unwrap();
+        let window =
+            |name: &str, since: Option<&str>, until: Option<&str>| tokscale_core::ReportWindow {
+                name: name.to_string(),
+                since: since.map(str::to_string),
+                until: until.map(str::to_string),
+            };
+        assert_eq!(
+            windows,
+            vec![
+                window("today", Some("2026-11-24"), Some("2026-11-24")),
+                window("allTime", Some("2024-01-01"), None),
+                window("upTo", None, Some("2026-11-01")),
+            ]
+        );
+        assert!(report_windows_for(&["tokscale", "--json"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn report_windows_reject_malformed_or_ambiguous_values() {
+        for value in [
+            "today",
+            "today:2026-11-24",
+            ":2026-11-24:2026-11-24",
+            "to day::",
+            "today:2026-11-31:",
+            "today:2026-1-01:",
+            "today:2026-11-24:2026-11-23",
+        ] {
+            assert!(
+                report_windows_for(&["tokscale", "--json", "--window", value]).is_err(),
+                "{value}"
+            );
+        }
+        let repeated =
+            report_windows_for(&["tokscale", "--json", "--window", "a::", "--window", "a::"]);
+        assert!(repeated.unwrap_err().to_string().contains("repeated"));
+        let subcommand = report_windows_for(&["tokscale", "--json", "--window", "a::", "monthly"]);
+        assert!(subcommand.is_err());
+    }
+
+    #[test]
+    fn report_windows_require_json_and_exclude_other_date_flags() {
+        let err = expect_parse_error(&["tokscale", "--window", "a::"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        for flag in ["--today", "--yesterday", "--week", "--month"] {
+            let err = expect_parse_error(&["tokscale", "--json", "--window", "a::", flag]);
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}"
+            );
+        }
+        for (flag, value) in [
+            ("--since", "2026-01-01"),
+            ("--until", "2026-01-01"),
+            ("--year", "2026"),
+        ] {
+            let err = expect_parse_error(&["tokscale", "--json", "--window", "a::", flag, value]);
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn windowed_report_json_keys_windows_in_request_order() {
+        let report = |name: &str| {
+            (
+                name.to_string(),
+                model_report_json(
+                    tokscale_core::ModelReport {
+                        entries: Vec::new(),
+                        sessions: Vec::new(),
+                        workspaces: Vec::new(),
+                        total_input: 0,
+                        total_output: 0,
+                        total_cache_read: 0,
+                        total_cache_write: 0,
+                        total_messages: 0,
+                        total_cost: 0.0,
+                        processing_time_ms: 0,
+                    },
+                    tokscale_core::TokenBreakdown::default(),
+                    None,
+                    &tokscale_core::GroupBy::ClientModel,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )
+        };
+        let output = WindowedModelReportJson {
+            schema_version: 1,
+            windows: WindowedModelReports(vec![report("zeta"), report("alpha")]),
+        };
+        let text = serde_json::to_string(&output).unwrap();
+        assert!(
+            text.starts_with(r#"{"schemaVersion":1,"windows":{"zeta":{"groupBy":"client,model""#)
+        );
+        assert!(text.find(r#""zeta""#).unwrap() < text.find(r#""alpha""#).unwrap());
     }
 
     #[test]
