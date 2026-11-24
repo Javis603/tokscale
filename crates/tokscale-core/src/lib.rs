@@ -6496,10 +6496,16 @@ struct ModelUsageFold {
 
 impl ModelUsageFold {
     fn new(group_by: &GroupBy, rollup: WorktreeRollup) -> Self {
+        Self::with_labeler(group_by, rollup, WorkspaceLabeler::default())
+    }
+
+    /// A fold that starts from lookups another fold already made.
+    /// [`Self::finish_with_labeler`] hands the extended labeler back.
+    fn with_labeler(group_by: &GroupBy, rollup: WorktreeRollup, labeler: WorkspaceLabeler) -> Self {
         Self {
             group_by: group_by.clone(),
             rollup,
-            labeler: WorkspaceLabeler::default(),
+            labeler,
             workspace_labels: WorkspaceLabelCollector::default(),
             rows: HashMap::new(),
         }
@@ -6845,6 +6851,154 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
             processing_time_ms: start.elapsed().as_millis() as u32,
         },
     })
+}
+
+/// One named date window for [`get_model_reports_v2`].
+///
+/// Bounds are inclusive `YYYY-MM-DD` day keys in the scan's bucket timezone, and
+/// `None` leaves that side open, exactly like [`ReportOptions::since`] and
+/// [`ReportOptions::until`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportWindow {
+    pub name: String,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+/// The narrowest bounds that contain every window: a side is open when any
+/// window leaves it open.
+fn report_window_union(windows: &[ReportWindow]) -> (Option<String>, Option<String>) {
+    let since = windows
+        .iter()
+        .map(|window| window.since.as_ref())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|bounds| bounds.into_iter().min().cloned());
+    let until = windows
+        .iter()
+        .map(|window| window.until.as_ref())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|bounds| bounds.into_iter().max().cloned());
+    (since, until)
+}
+
+/// One model report per window, from a single parse.
+///
+/// Each report matches [`get_model_report_v2`] run with the same options and that
+/// window's bounds (`year` is ignored). Discovery, the source cache, recovery and
+/// pricing run once. Every window then filters, links Codex parents, collects
+/// session metadata and folds on its own, so one window's messages cannot move
+/// another window's rows or links. Only workspace lookups are shared: a label or
+/// path is a function of its key alone, while label disambiguation stays inside
+/// each window's fold.
+///
+/// The last window takes the parsed messages instead of a copy, so callers should
+/// put their widest window last.
+pub async fn get_model_reports_v2(
+    options: ReportOptions,
+    windows: &[ReportWindow],
+) -> Result<Vec<ModelReportV2>, String> {
+    let start = Instant::now();
+    if windows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let home_dir = get_home_dir_string(&options.home_dir)?;
+
+    let clients: Vec<String> = options.clients.clone().unwrap_or_else(|| {
+        let mut clients: Vec<String> = ClientId::ALL
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        clients.push("synthetic".to_string());
+        clients
+    });
+
+    let pricing = load_pricing_for_local_parse().await;
+    let session_grouped = matches!(
+        options.group_by,
+        GroupBy::Session | GroupBy::ClientSession | GroupBy::ClientWorkspaceSession
+    );
+    // Estimated prices only matter inside some window. Pricing the union keeps
+    // that per-call saving without leaving any window's messages unpriced.
+    let (union_since, union_until) = report_window_union(windows);
+    let union = ReportOptions {
+        since: union_since,
+        until: union_until,
+        year: None,
+        ..options.clone()
+    };
+    let (mut messages, claude_desktop_cache) = parse_all_messages_with_coverage(
+        &home_dir,
+        &clients,
+        pricing.as_deref(),
+        options.use_env_roots,
+        &options.scanner_settings,
+        SourceCachePolicy::Persistent,
+        Some(&union),
+    );
+
+    let mut labeler = WorkspaceLabeler::default();
+    let mut reports = Vec::with_capacity(windows.len());
+    for (index, window) in windows.iter().enumerate() {
+        let window_options = ReportOptions {
+            since: window.since.clone(),
+            until: window.until.clone(),
+            year: None,
+            ..options.clone()
+        };
+        let mut filtered = if index + 1 == windows.len() {
+            filter_messages_for_report(std::mem::take(&mut messages), &window_options)
+        } else {
+            messages
+                .iter()
+                .filter(|message| message_passes_report_filter(message, &window_options))
+                .cloned()
+                .collect()
+        };
+        resolve_codex_parent_session_ids(&mut filtered);
+        let sessions = if session_grouped {
+            aggregate_session_metadata(&filtered)
+        } else {
+            Vec::new()
+        };
+        let mut fold = ModelUsageFold::with_labeler(
+            &options.group_by,
+            options.worktree_rollup,
+            std::mem::take(&mut labeler),
+        );
+        let mut undated_tokens = TokenBreakdown::default();
+        for message in &filtered {
+            if claude_desktop::is_undated_balance(message) {
+                undated_tokens.add_assign_saturating(&message.tokens);
+            }
+            fold.add(message);
+        }
+        drop(filtered);
+        let entries = fold.finish_with_labeler(&mut labeler);
+        let workspaces = workspace_metadata_for_entries(&entries, &mut labeler);
+
+        let (total_input, total_output, total_cache_read, total_cache_write) =
+            model_report_token_totals(&entries);
+        let total_messages: i32 = entries.iter().map(|e| e.message_count).sum();
+        let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
+        reports.push(ModelReportV2 {
+            undated_tokens,
+            claude_desktop_cache: claude_desktop_cache.clone(),
+            report: ModelReport {
+                entries,
+                sessions,
+                workspaces,
+                total_input,
+                total_output,
+                total_cache_read,
+                total_cache_write,
+                total_messages,
+                total_cost,
+                processing_time_ms: start.elapsed().as_millis() as u32,
+            },
+        });
+    }
+    Ok(reports)
 }
 
 #[derive(Default)]
@@ -33135,9 +33289,10 @@ mod tests {
     /// date range, including the recovery-ledger case that still collects.
     mod model_report_streaming {
         use super::super::{
-            claude_desktop, get_model_report_v2, load_pricing_for_local_parse,
-            model_report_token_totals, parse_all_messages_with_coverage, recovery, ModelReportSink,
-            ModelReportV2, ModelUsage,
+            claude_desktop, get_model_report_v2, get_model_reports_v2,
+            load_pricing_for_local_parse, model_report_token_totals,
+            parse_all_messages_with_coverage, recovery, report_window_union, ModelReportSink,
+            ModelReportV2, ModelUsage, ReportWindow,
         };
         use super::*;
 
@@ -33480,6 +33635,196 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        #[serial]
+        fn windowed_model_reports_match_one_report_per_window() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut cache_env = redirect_cache_home(cache_home.path());
+            cache_env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            write_fixture(source_home.path());
+            let runtime = runtime();
+
+            let window = |name: &str, since: Option<&str>, until: Option<&str>| ReportWindow {
+                name: name.to_string(),
+                since: since.map(str::to_string),
+                until: until.map(str::to_string),
+            };
+            // Token Monitor's today/month/all-time triple, overlapping and
+            // disjoint day windows, an empty future window, and a window list
+            // whose widest member is not last.
+            let window_sets = [
+                vec![
+                    window("today", Some("2026-05-02"), Some("2026-05-02")),
+                    window("month", Some("2026-05-01"), Some("2026-05-02")),
+                    window("allTime", Some("2020-01-01"), None),
+                ],
+                vec![
+                    window("first", Some("2026-05-01"), Some("2026-05-01")),
+                    window("second", Some("2026-05-02"), Some("2026-05-02")),
+                    window("future", Some("2027-01-01"), Some("2027-01-31")),
+                ],
+                vec![
+                    window("open", None, None),
+                    window("upTo", None, Some("2026-05-01")),
+                    window("from", Some("2026-05-02"), None),
+                ],
+            ];
+            for zone in ["Asia/Seoul", "UTC"] {
+                for group_by in GROUPINGS {
+                    let rollups = if group_by == GroupBy::WorkspaceModel {
+                        vec![WorktreeRollup::Separate, WorktreeRollup::MergeIntoRepo]
+                    } else {
+                        vec![WorktreeRollup::Separate]
+                    };
+                    for rollup in rollups {
+                        for windows in &window_sets {
+                            let base = options(
+                                source_home.path(),
+                                zone,
+                                group_by.clone(),
+                                rollup,
+                                (None, None, None),
+                            );
+                            let reports = runtime
+                                .block_on(get_model_reports_v2(base, windows))
+                                .unwrap();
+                            assert_eq!(reports.len(), windows.len());
+                            for (window, windowed) in windows.iter().zip(&reports) {
+                                let single = options(
+                                    source_home.path(),
+                                    zone,
+                                    group_by.clone(),
+                                    rollup,
+                                    (window.since.as_deref(), window.until.as_deref(), None),
+                                );
+                                let single = runtime.block_on(get_model_report_v2(single)).unwrap();
+                                let label = format!("{zone} {group_by} {rollup:?} {}", window.name);
+                                assert_same_report(windowed, &single, &label);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A Codex child links to the parent rollout that survives its own
+        /// window, so the windows must not share one resolution.
+        #[test]
+        #[serial]
+        fn windowed_model_reports_link_codex_children_within_each_window() {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let mut cache_env = redirect_cache_home(cache_home.path());
+            cache_env.set("TOKSCALE_PRICING_CACHE_ONLY", "1");
+            let sessions_dir = source_home.path().join(".codex/sessions");
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            let parent_thread = "01a12484-a122-7750-a32a-af42007c40a3";
+            let parent = format!("rollout-2026-05-01T10-00-00-{parent_thread}");
+            let continuation = format!(
+                "rollout-2026-05-02T10-00-00-{parent_thread}_01a124da-b978-7c03-8fb4-b589bdac49dd"
+            );
+            let child = "rollout-2026-05-02T11-00-00-01a12490-0000-7000-8000-000000000001";
+            std::fs::write(
+                sessions_dir.join(format!("{parent}.jsonl")),
+                codex_rollout(parent_thread, "2026-05-01T10:00:00Z", 10, 1),
+            )
+            .unwrap();
+            std::fs::write(
+                sessions_dir.join(format!("{continuation}.jsonl")),
+                codex_rollout(parent_thread, "2026-05-02T10:00:00Z", 20, 2),
+            )
+            .unwrap();
+            let child_rollout = codex_rollout(
+                "01a12490-0000-7000-8000-000000000001",
+                "2026-05-02T11:00:00Z",
+                30,
+                3,
+            )
+            .replacen(
+                r#""source":"interactive","#,
+                &format!(
+                    r#""source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent_thread}"}}}}}},"#
+                ),
+                1,
+            );
+            std::fs::write(sessions_dir.join(format!("{child}.jsonl")), child_rollout).unwrap();
+            let runtime = runtime();
+
+            let windows = [
+                ReportWindow {
+                    name: "day".to_string(),
+                    since: Some("2026-05-02".to_string()),
+                    until: Some("2026-05-02".to_string()),
+                },
+                ReportWindow {
+                    name: "allTime".to_string(),
+                    since: None,
+                    until: None,
+                },
+            ];
+            let base = options(
+                source_home.path(),
+                "UTC",
+                GroupBy::ClientSession,
+                WorktreeRollup::Separate,
+                (None, None, None),
+            );
+            let reports = runtime
+                .block_on(get_model_reports_v2(base, &windows))
+                .unwrap();
+            let child_parent = |report: &ModelReportV2| {
+                report
+                    .report
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == child)
+                    .and_then(|session| session.parent_session_id.clone())
+            };
+            assert_eq!(
+                child_parent(&reports[0]).as_deref(),
+                Some(continuation.as_str())
+            );
+            assert_eq!(child_parent(&reports[1]).as_deref(), Some(parent.as_str()));
+            for (window, windowed) in windows.iter().zip(&reports) {
+                let single = options(
+                    source_home.path(),
+                    "UTC",
+                    GroupBy::ClientSession,
+                    WorktreeRollup::Separate,
+                    (window.since.as_deref(), window.until.as_deref(), None),
+                );
+                let single = runtime.block_on(get_model_report_v2(single)).unwrap();
+                assert_same_report(windowed, &single, &window.name);
+            }
+        }
+
+        #[test]
+        fn report_window_union_opens_a_side_any_window_leaves_open() {
+            let window = |since: Option<&str>, until: Option<&str>| ReportWindow {
+                name: String::new(),
+                since: since.map(str::to_string),
+                until: until.map(str::to_string),
+            };
+            assert_eq!(
+                report_window_union(&[
+                    window(Some("2026-05-02"), Some("2026-05-02")),
+                    window(Some("2026-05-01"), Some("2026-05-03")),
+                ]),
+                (
+                    Some("2026-05-01".to_string()),
+                    Some("2026-05-03".to_string())
+                )
+            );
+            assert_eq!(
+                report_window_union(&[
+                    window(Some("2026-05-02"), None),
+                    window(None, Some("2026-05-03")),
+                ]),
+                (None, None)
+            );
         }
 
         #[test]
