@@ -504,7 +504,9 @@ impl SourceFingerprint {
         } else {
             cached.related_files.is_empty()
         };
-        related_match && primary_fingerprint_matches(path, cached) == Some(true)
+        related_match
+            && primary_fingerprint_matches(path, cached) == Some(true)
+            && metadata_signature(path).ok() == Some((cached.size, cached.modified_ns))
     }
 
     /// Check a non-Codex source without rebuilding its write-only whole-file
@@ -3993,7 +3995,7 @@ impl SourceMessageCache {
     pub(crate) fn take_codex(
         &self,
         path: &Path,
-        use_summary: Option<impl FnOnce(&CodexHistory) -> bool>,
+        use_summary: Option<impl FnOnce(&CodexHistory, i64) -> bool>,
     ) -> CodexCacheLookup {
         let identity = CacheIdentity::for_client(ClientId::Codex);
         let key = CacheKey::new(identity, path);
@@ -4010,8 +4012,10 @@ impl SourceMessageCache {
         drop(state);
 
         if let (Some(use_summary), Some(summary)) = (use_summary, indexed.summary.take()) {
-            if use_summary(&summary)
-                && SourceFingerprint::codex_path_matches(path, &indexed.fingerprint)
+            if use_summary(
+                &summary,
+                (indexed.fingerprint.modified_ns / 1_000_000) as i64,
+            ) && SourceFingerprint::codex_path_matches(path, &indexed.fingerprint)
             {
                 return CodexCacheLookup::History(summary);
             }
@@ -4065,7 +4069,7 @@ impl SourceMessageCache {
     pub(crate) fn take(&self, identity: CacheIdentity, path: &Path) -> Option<CachedSourceEntry> {
         if self.use_codex_index && identity == CacheIdentity::for_client(ClientId::Codex) {
             let CodexCacheLookup::Full(entry) =
-                self.take_codex(path, None::<fn(&CodexHistory) -> bool>)
+                self.take_codex(path, None::<fn(&CodexHistory, i64) -> bool>)
             else {
                 unreachable!("this lookup requires the full entry")
             };
@@ -13211,7 +13215,7 @@ mod tests {
 
         let mut cache = SourceMessageCache::load().with_codex_index(true);
         let CodexCacheLookup::Full(Some(full)) =
-            cache.take_codex(&source, Some(|_: &CodexHistory| true))
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true))
         else {
             panic!("the original v2 shard has no index yet");
         };
@@ -13219,9 +13223,18 @@ mod tests {
         cache.save_if_dirty();
         assert!(fs::read(&shard).unwrap().starts_with(&v2));
 
-        let mut cache = SourceMessageCache::load().with_codex_index(true);
+        let cache = SourceMessageCache::load().with_codex_index(true);
         assert!(matches!(
-            cache.take_codex(&source, Some(|_: &CodexHistory| true)),
+            cache.take_codex(
+                &source,
+                Some(|_: &CodexHistory, timestamp| {
+                    assert_eq!(
+                        timestamp,
+                        crate::sessions::utils::file_modified_timestamp_ms(&source)
+                    );
+                    true
+                })
+            ),
             CodexCacheLookup::History(_)
         ));
         // Leave the index intact while corrupting the payload so an indexed
@@ -13237,7 +13250,7 @@ mod tests {
         fs::write(&shard, damaged).unwrap();
         let cache = SourceMessageCache::load().with_codex_index(true);
         assert!(matches!(
-            cache.take_codex(&source, Some(|_: &CodexHistory| true)),
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true)),
             CodexCacheLookup::Full(None)
         ));
         drop(cache);
@@ -13247,7 +13260,7 @@ mod tests {
         dirty.messages[0].session_id = "dirty-session".into();
         cache.insert(dirty);
         let CodexCacheLookup::Full(Some(full)) =
-            cache.take_codex(&source, Some(|_: &CodexHistory| true))
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true))
         else {
             panic!("a dirty entry must still supply its payload");
         };
@@ -13257,7 +13270,7 @@ mod tests {
         fs::write(&source, b"codex\nchanged\n").unwrap();
         let mut cache = SourceMessageCache::load().with_codex_index(true);
         let CodexCacheLookup::Full(Some(full)) =
-            cache.take_codex(&source, Some(|_: &CodexHistory| true))
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true))
         else {
             panic!("a changed source needs its cached payload for the incremental parser");
         };

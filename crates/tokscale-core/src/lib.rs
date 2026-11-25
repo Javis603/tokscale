@@ -1912,13 +1912,18 @@ fn parse_all_messages_with_coverage(
     if let Some(pending_save) = outcome.pending_save {
         pending_save.persist();
     }
-    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
-    recovery::apply(
-        &mut messages,
-        home_dir,
-        clients,
-        timezone.is_pinned().then_some(&timezone),
-    );
+    // A report that enabled history pruning already established that no
+    // recovery ledger applied. Admit a newly installed ledger on the next
+    // report, when its reconciliation can see the complete native history.
+    if !price_window.is_some_and(|window| window.discard_historical_codex) {
+        let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+        recovery::apply(
+            &mut messages,
+            home_dir,
+            clients,
+            timezone.is_pinned().then_some(&timezone),
+        );
+    }
     // Reconcile recovery against source costs first, then apply current rates.
     // Overrides never enter source caches, so removing them restores the source.
     for message in &mut messages {
@@ -4083,14 +4088,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
             |path| {
                 let use_summary = codex_report_window.map(|window| {
                     let opencodex_index = opencodex_index.as_deref();
-                    move |history: &message_cache::CodexHistory| {
-                        let mut fallback_timestamp = None;
+                    move |history: &message_cache::CodexHistory, fallback_timestamp| {
                         history.rows.iter().all(|row| {
-                            let timestamp = row.timestamp.unwrap_or_else(|| {
-                                *fallback_timestamp.get_or_insert_with(|| {
-                                    sessions::utils::file_modified_timestamp_ms(path)
-                                })
-                            });
+                            let timestamp = row.timestamp.unwrap_or(fallback_timestamp);
                             let identity = &history.identities[row.identity];
                             !window.matches_timestamp(timestamp)
                                 && !opencodex_index.is_some_and(|index| {
@@ -33943,7 +33943,7 @@ mod tests {
             {
                 let cache = message_cache::SourceMessageCache::load().with_codex_index(true);
                 let message_cache::CodexCacheLookup::History(history) =
-                    cache.take_codex(&old, Some(|_: &message_cache::CodexHistory| true))
+                    cache.take_codex(&old, Some(|_: &message_cache::CodexHistory, _| true))
                 else {
                     panic!("the warm archive must supply metadata without its payload");
                 };
@@ -34055,18 +34055,27 @@ mod tests {
                 .unwrap();
             let sources: Vec<_> = (0..40).collect();
             let completion_order = Mutex::new(Vec::new());
+            let completed = std::sync::Condvar::new();
             let mut consumed = Vec::new();
             pool.install(|| {
                 super::super::consume_ordered_parallel(
                     &sources,
                     true,
                     |&index| {
+                        let mut order = completion_order.lock().unwrap();
                         if index == 0 {
-                            // Give another worker time to queue an outcome
-                            // before the first source can release the buffer.
-                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            let (recorded, timeout) = completed
+                                .wait_timeout_while(
+                                    order,
+                                    std::time::Duration::from_secs(10),
+                                    |recorded| recorded.is_empty(),
+                                )
+                                .unwrap();
+                            assert!(!timeout.timed_out(), "another worker must complete first");
+                            order = recorded;
                         }
-                        completion_order.lock().unwrap().push(index);
+                        order.push(index);
+                        completed.notify_one();
                         index
                     },
                     |&index, outcome| {
@@ -34421,6 +34430,23 @@ mod tests {
                     .map(|entry| entry.input)
                     .sum::<i64>()
             };
+
+            let day = codex_day(source_home.path(), "2026-05-02");
+            let ledger_path = recovery::path();
+            let observer_home = home.clone();
+            let observer =
+                message_cache::install_test_source_cache_persist_observer(Arc::new(move || {
+                    write_ledger(&observer_home)
+                }));
+            let first = runtime.block_on(get_model_report_v2(day.clone())).unwrap();
+            drop(observer);
+            assert!(
+                ledger_path.is_file(),
+                "the ledger was installed during the scan"
+            );
+            let second = runtime.block_on(get_model_report_v2(day)).unwrap();
+            assert_eq!(codex_input(&second), codex_input(&first) + 150);
+            std::fs::remove_file(ledger_path).unwrap();
 
             for (ledger_home, applies) in [(home.as_str(), true), ("/not/this/home", false)] {
                 write_ledger(ledger_home);
