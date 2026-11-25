@@ -159,7 +159,7 @@ pub(crate) fn read_bounded_line<R: BufRead>(
 }
 
 #[derive(Debug, Default)]
-struct AttributionIndex {
+pub(crate) struct AttributionIndex {
     by_selector: HashMap<String, Vec<IndexedRow>>,
 }
 
@@ -577,15 +577,38 @@ pub(crate) fn attribute_codex_messages_with_claims(
         return (0, HashSet::new());
     }
 
-    let path = usage_log_path(home_dir, use_env_roots);
-    let Some(index) = load_attribution_index(&path) else {
-        return (0, HashSet::new());
-    };
+    load_codex_attribution_index(home_dir, use_env_roots).map_or_else(
+        || (0, HashSet::new()),
+        |index| attribute_with_index(&index, messages),
+    )
+}
 
+pub(crate) fn load_codex_attribution_index(
+    home_dir: &str,
+    use_env_roots: bool,
+) -> Option<Arc<AttributionIndex>> {
+    load_attribution_index(&usage_log_path(home_dir, use_env_roots))
+}
+
+impl AttributionIndex {
+    /// A conservative check for rows that might affect another row's claim.
+    pub(crate) fn may_claim(&self, message: &UnifiedMessage) -> bool {
+        self.may_claim_source(&message.client, message.timestamp, &message.model_id)
+    }
+
+    pub(crate) fn may_claim_source(&self, client: &str, timestamp: i64, model: &str) -> bool {
+        client == "codex" && timestamp > 0 && self.by_selector.contains_key(model)
+    }
+}
+
+pub(crate) fn attribute_with_index(
+    index: &AttributionIndex,
+    messages: &mut [UnifiedMessage],
+) -> (usize, HashSet<usize>) {
     // Pass 1 uses the strict window, so it keeps every attribution that
     // window makes. Every row a strict candidate touched stays reserved, even
     // when that candidate was ambiguous.
-    let strict = collect_candidates(&index, messages, MAX_END_SKEW_MS as i64, |_, _, _| true);
+    let strict = collect_candidates(index, messages, MAX_END_SKEW_MS as i64, |_, _, _| true);
     let strict_claims = count_claims(messages, &strict);
     let reserved: HashSet<(&str, usize)> = messages
         .iter()
@@ -607,7 +630,7 @@ pub(crate) fn attribute_codex_messages_with_claims(
     // candidates still blocks rows here, but it can never take a late row:
     // its strict evidence was ambiguous, so it fails closed.
     let late = collect_candidates(
-        &index,
+        index,
         messages,
         MAX_LATE_END_SKEW_MS,
         |message_index, model_id, row_index| {

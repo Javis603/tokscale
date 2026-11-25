@@ -1,4 +1,7 @@
+mod codex_index;
 mod legacy_billing_timing;
+
+pub(crate) use codex_index::CodexHistory;
 
 use crate::clients::ClientId;
 use crate::sessions::codex::CodexParseState;
@@ -12,9 +15,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 // CACHE_FORMAT_VERSION changes only when the serialized storage layout or a
@@ -495,6 +496,17 @@ impl SourceFingerprint {
         }
 
         Self::from_codex_path(path).map(FingerprintStatus::Changed)
+    }
+
+    fn codex_path_matches(path: &Path, cached: &Self) -> bool {
+        let related_match = if crate::sessions::utils::is_zst_path(path) {
+            cached.related_files.as_slice() == [codex_archive_limit_fingerprint(path)]
+        } else {
+            cached.related_files.is_empty()
+        };
+        related_match
+            && primary_fingerprint_matches(path, cached) == Some(true)
+            && metadata_signature(path).ok() == Some((cached.size, cached.modified_ns))
     }
 
     /// Check a non-Codex source without rebuilding its write-only whole-file
@@ -3564,6 +3576,11 @@ struct CacheState {
     /// when the read fails so a broken cache directory cannot make every file
     /// in a lane retry the same I/O.
     loaded_namespaces: HashSet<&'static str>,
+    indexed_codex: HashMap<CacheKey, (Arc<Path>, codex_index::IndexedEntry)>,
+    taken_codex_fingerprints: HashMap<CacheKey, SourceFingerprint>,
+    // Keep the shard offsets and summaries on the same generation until the
+    // Codex and OpenClaw lanes have finished reading them.
+    codex_index_lock: Option<File>,
     dirty: bool,
     dirty_keys: HashSet<CacheKey>,
     deleted_keys: HashMap<CacheKey, DeletionReason>,
@@ -3609,12 +3626,18 @@ impl Drop for TestSourceCachePersistObserverGuard {
     }
 }
 
+pub(crate) enum CodexCacheLookup {
+    History(CodexHistory),
+    Full(Option<Box<CachedSourceEntry>>),
+}
+
 #[derive(Default)]
 pub(crate) struct SourceMessageCache {
     state: Mutex<CacheState>,
     /// `false` for [`SourceCachePolicy::InMemory`] callers, who must never
     /// touch the on-disk shards.
     persistent: bool,
+    use_codex_index: bool,
     /// Only an explicit home scan may prune cached WSL sources below that home.
     scan_home: Option<PathBuf>,
 }
@@ -3712,6 +3735,7 @@ impl SourceMessageCache {
         Self {
             state: Mutex::new(CacheState::default()),
             persistent: true,
+            use_codex_index: false,
             scan_home: None,
         }
     }
@@ -3721,6 +3745,18 @@ impl SourceMessageCache {
             scan_home: home.map(Path::to_path_buf),
             ..Self::load()
         }
+    }
+
+    pub(crate) fn with_codex_index(mut self, enabled: bool) -> Self {
+        self.use_codex_index = enabled;
+        self
+    }
+
+    pub(crate) fn finish_codex_index_reads(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        state.indexed_codex.clear();
+        state.taken_codex_fingerprints.clear();
+        state.codex_index_lock = None;
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, CacheState> {
@@ -3758,26 +3794,31 @@ impl SourceMessageCache {
         // the v1 monolith is provably unreachable. Doing it here rather than at
         // startup keeps it off the path of runs that never touch the cache.
         remove_legacy_monolith_cache_once();
-        let lock_file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                warn_cache_failure_once(
-                    "source message cache lock is unavailable",
-                    &lock_path,
-                    &error,
-                );
+        let index_codex = self.use_codex_index && namespace == ClientId::Codex.as_str();
+        let mut lock_file = None;
+        if state.codex_index_lock.is_none() {
+            let file = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    warn_cache_failure_once(
+                        "source message cache lock is unavailable",
+                        &lock_path,
+                        &error,
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = fs2::FileExt::lock_shared(&file) {
+                warn_cache_failure_once("source message cache lock failed", &lock_path, &error);
                 return;
             }
-        };
-        if let Err(error) = fs2::FileExt::lock_shared(&lock_file) {
-            warn_cache_failure_once("source message cache lock failed", &lock_path, &error);
-            return;
+            lock_file = Some(file);
         }
 
         let parser_dir = shard_root.join(namespace);
@@ -3803,6 +3844,26 @@ impl SourceMessageCache {
                 index,
             };
             let path = dir_entry.path();
+            if index_codex {
+                if let Some(entries) = codex_index::read(&path, identity, &shard_key) {
+                    let path: Arc<Path> = path.into();
+                    for entry in entries {
+                        let source = entry.path.to_path_buf();
+                        let key = CacheKey::new(identity, &source);
+                        if state.entries.contains_key(&key) || state.deleted_keys.contains_key(&key)
+                        {
+                            continue;
+                        }
+                        if source_missing_during_cache_load(&source, self.scan_home.as_deref()) {
+                            state.deleted_keys.insert(key, DeletionReason::Missing);
+                            state.dirty = true;
+                        } else {
+                            state.indexed_codex.insert(key, (Arc::clone(&path), entry));
+                        }
+                    }
+                    continue;
+                }
+            }
             let (entries, migrated) = match read_shard(&path, identity) {
                 ShardReadStatus::Loaded(entries) => (entries, false),
                 ShardReadStatus::Migrated(entries) => (entries, true),
@@ -3819,7 +3880,7 @@ impl SourceMessageCache {
                     continue;
                 }
             };
-            if migrated {
+            if migrated || (index_codex && codex_index::can_upgrade(&path, &entries)) {
                 state.rewrite_shards.insert(shard_key.clone());
                 state.dirty = true;
             }
@@ -3863,6 +3924,9 @@ impl SourceMessageCache {
                 state.entries.insert(key, entry);
             }
         }
+        if index_codex && !state.indexed_codex.is_empty() {
+            state.codex_index_lock = lock_file;
+        }
     }
 
     #[cfg(test)]
@@ -3875,6 +3939,8 @@ impl SourceMessageCache {
     pub(crate) fn insert(&mut self, entry: CachedSourceEntry) {
         let key = CacheKey::from_entry(&entry);
         let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        state.indexed_codex.remove(&key);
+        state.taken_codex_fingerprints.remove(&key);
         state.entries.insert(key.clone(), entry);
         state.deleted_keys.remove(&key);
         state.dirty_keys.insert(key);
@@ -3926,6 +3992,58 @@ impl SourceMessageCache {
             .cloned()
     }
 
+    pub(crate) fn take_codex(
+        &self,
+        path: &Path,
+        use_summary: Option<impl FnOnce(&CodexHistory, i64) -> bool>,
+    ) -> CodexCacheLookup {
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let key = CacheKey::new(identity, path);
+        let mut state = self.state();
+        self.ensure_namespace_loaded(&mut state, identity.namespace);
+        let Some((shard, mut indexed)) = state.indexed_codex.remove(&key) else {
+            return CodexCacheLookup::Full(
+                Self::take_loaded(&mut state, identity, &key).map(Box::new),
+            );
+        };
+        state
+            .taken_codex_fingerprints
+            .insert(key, indexed.fingerprint.clone());
+        drop(state);
+
+        if let (Some(use_summary), Some(summary)) = (use_summary, indexed.summary.take()) {
+            if use_summary(
+                &summary,
+                (indexed.fingerprint.modified_ns / 1_000_000) as i64,
+            ) && SourceFingerprint::codex_path_matches(path, &indexed.fingerprint)
+            {
+                return CodexCacheLookup::History(summary);
+            }
+        }
+        if let Some(entry) = indexed.read_payload(&shard) {
+            return CodexCacheLookup::Full(Some(Box::new(entry)));
+        }
+
+        // Use the canonical decoder for diagnostics and recovery if an
+        // indexed payload cannot be read (for example after disk damage).
+        let mut state = self.state();
+        let mut recovered = None;
+        match read_shard(&shard, identity) {
+            ShardReadStatus::Loaded(entries) | ShardReadStatus::Migrated(entries) => {
+                recovered = entries.into_iter().find(|entry| entry.path == indexed.path);
+            }
+            ShardReadStatus::Invalid(error) => {
+                warn_cache_failure_once("source message cache shard is invalid", &shard, &error);
+            }
+            ShardReadStatus::Missing | ShardReadStatus::Stale => {}
+        }
+        state
+            .rewrite_shards
+            .insert(CacheKey::new(identity, path).shard());
+        state.dirty = true;
+        CodexCacheLookup::Full(recovered.map(Box::new))
+    }
+
     /// Hands the entry for `path` to its one consumer, moving the message
     /// payload out of the cache and leaving the entry's metadata behind.
     ///
@@ -3949,12 +4067,28 @@ impl SourceMessageCache {
     /// * An entry already marked dirty is written back from memory by
     ///   `save_if_dirty`, so its payload has to still be there.
     pub(crate) fn take(&self, identity: CacheIdentity, path: &Path) -> Option<CachedSourceEntry> {
+        if self.use_codex_index && identity == CacheIdentity::for_client(ClientId::Codex) {
+            let CodexCacheLookup::Full(entry) =
+                self.take_codex(path, None::<fn(&CodexHistory, i64) -> bool>)
+            else {
+                unreachable!("this lookup requires the full entry")
+            };
+            return entry.map(|entry| *entry);
+        }
         let key = CacheKey::new(identity, path);
         let mut state = self.state();
         self.ensure_namespace_loaded(&mut state, identity.namespace);
+        Self::take_loaded(&mut state, identity, &key)
+    }
+
+    fn take_loaded(
+        state: &mut CacheState,
+        identity: CacheIdentity,
+        key: &CacheKey,
+    ) -> Option<CachedSourceEntry> {
         let retains_history = retained_history_key_filter(identity.namespace).is_some();
-        let dirty = state.dirty_keys.contains(&key);
-        let entry = state.entries.get_mut(&key)?;
+        let dirty = state.dirty_keys.contains(key);
+        let entry = state.entries.get_mut(key)?;
         if !entry.matches_identity(identity) {
             return None;
         }
@@ -3976,11 +4110,22 @@ impl SourceMessageCache {
         // replacing, and an unread namespace holds no entry to record.
         let mut state = self.state();
         self.ensure_namespace_loaded(&mut state, identity.namespace);
-        if let Some(entry) = state.entries.remove(&key) {
+        let fingerprint = state
+            .entries
+            .remove(&key)
+            .map(|entry| entry.fingerprint)
+            .or_else(|| {
+                state
+                    .indexed_codex
+                    .remove(&key)
+                    .map(|(_, entry)| entry.fingerprint)
+            })
+            .or_else(|| state.taken_codex_fingerprints.remove(&key));
+        if let Some(fingerprint) = fingerprint {
             state.dirty_keys.remove(&key);
             state
                 .deleted_keys
-                .insert(key, DeletionReason::Invalidated(entry.fingerprint));
+                .insert(key, DeletionReason::Invalidated(fingerprint));
             state.dirty = true;
         }
     }
@@ -4068,6 +4213,7 @@ impl SourceMessageCache {
     }
 
     fn save_if_dirty_with_limit(&mut self, max_shard_bytes: u64) {
+        self.finish_codex_index_reads();
         #[cfg(test)]
         let persist_observer =
             TEST_SOURCE_CACHE_PERSIST_OBSERVER.with(|slot| slot.borrow().clone());
@@ -4902,6 +5048,9 @@ fn write_shard_with_limit(
         parser_version: identity.parser_version,
         payload,
     };
+    let index = (identity.namespace == ClientId::Codex.as_str())
+        .then(|| codex_index::encode(&envelope, entries, max_shard_bytes))
+        .flatten();
     let parent = final_path
         .parent()
         .ok_or_else(|| std::io::Error::other("cache shard has no parent directory"))?;
@@ -4930,6 +5079,9 @@ fn write_shard_with_limit(
             .with_limit(max_shard_bytes)
             .serialize_into(&mut writer, &envelope)
             .map_err(std::io::Error::other)?;
+        if let Some(index) = index {
+            writer.write_all(&index)?;
+        }
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);
@@ -13028,6 +13180,104 @@ mod tests {
             Some(taken.fingerprint.clone()),
             "the husk still has to answer fingerprint and invalidation lookups"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_index_upgrades_v2_and_checks_fingerprints_before_skipping_payload() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let source = temp_home.path().join("rollout.jsonl");
+        fs::write(&source, b"codex\n").unwrap();
+        let mut entry = test_entry(identity, &source, "codex-session");
+        entry.codex_incremental = Some(CodexIncrementalCache {
+            state: CodexParseState::default(),
+            consumed_offset: entry.fingerprint.size,
+            ends_with_newline: true,
+            prefix_hash: entry.fingerprint.content_hash,
+        });
+
+        let key = CacheKey::from_entry(&entry).shard();
+        let shard = shard_path(&cache_shard_dir().unwrap(), &key);
+        fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        let v2 = bincode::options()
+            .serialize(&CachedShardEnvelope {
+                format_version: CACHE_FORMAT_VERSION,
+                parser_namespace: identity.namespace.into(),
+                parser_version: identity.parser_version,
+                payload: bincode::options()
+                    .serialize(std::slice::from_ref(&entry))
+                    .unwrap(),
+            })
+            .unwrap();
+        fs::write(&shard, &v2).unwrap();
+
+        let mut cache = SourceMessageCache::load().with_codex_index(true);
+        let CodexCacheLookup::Full(Some(full)) =
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true))
+        else {
+            panic!("the original v2 shard has no index yet");
+        };
+        assert_eq!(full.messages[0].session_id, "codex-session");
+        cache.save_if_dirty();
+        assert!(fs::read(&shard).unwrap().starts_with(&v2));
+
+        let cache = SourceMessageCache::load().with_codex_index(true);
+        assert!(matches!(
+            cache.take_codex(
+                &source,
+                Some(|_: &CodexHistory, timestamp| {
+                    assert_eq!(
+                        timestamp,
+                        crate::sessions::utils::file_modified_timestamp_ms(&source)
+                    );
+                    true
+                })
+            ),
+            CodexCacheLookup::History(_)
+        ));
+        // Leave the index intact while corrupting the payload so an indexed
+        // lookup must fall back to the canonical reader.
+        let indexed_bytes = fs::read(&shard).unwrap();
+        let mut damaged = indexed_bytes.clone();
+        let session = damaged[..v2.len()]
+            .windows(b"codex-session".len())
+            .position(|bytes| bytes == b"codex-session")
+            .unwrap();
+        damaged[session] = 0xff;
+        drop(cache);
+        fs::write(&shard, damaged).unwrap();
+        let cache = SourceMessageCache::load().with_codex_index(true);
+        assert!(matches!(
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true)),
+            CodexCacheLookup::Full(None)
+        ));
+        drop(cache);
+        fs::write(&shard, indexed_bytes).unwrap();
+        let mut cache = SourceMessageCache::load().with_codex_index(true);
+        let mut dirty = entry.clone();
+        dirty.messages[0].session_id = "dirty-session".into();
+        cache.insert(dirty);
+        let CodexCacheLookup::Full(Some(full)) =
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true))
+        else {
+            panic!("a dirty entry must still supply its payload");
+        };
+        assert_eq!(full.messages[0].session_id, "dirty-session");
+        cache.save_if_dirty();
+
+        fs::write(&source, b"codex\nchanged\n").unwrap();
+        let mut cache = SourceMessageCache::load().with_codex_index(true);
+        let CodexCacheLookup::Full(Some(full)) =
+            cache.take_codex(&source, Some(|_: &CodexHistory, _| true))
+        else {
+            panic!("a changed source needs its cached payload for the incremental parser");
+        };
+        assert_eq!(full.messages[0].session_id, "dirty-session");
+        cache.remove(identity, &source);
+        cache.save_if_dirty();
+        assert!(SourceMessageCache::load().get(identity, &source).is_none());
     }
 
     /// A drained clean entry is still on disk, so a shard rewrite driven by a
