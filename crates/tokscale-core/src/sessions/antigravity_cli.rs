@@ -62,6 +62,7 @@ use super::utils::{open_readonly_sqlite_opt, sqlite_for_each_row_on, SqliteScan}
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{pricing, provider_identity, TokenBreakdown};
 use rusqlite::{Connection, OptionalExtension};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::Path;
@@ -69,8 +70,8 @@ use std::time::Duration;
 
 /// Bump when parsing behavior for Antigravity generation databases changes.
 /// The CLI and IDE extension clients share this parser and cache generation.
-// v3 retires snapshots cached before the WAL publication-window guard.
-pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 3;
+// v4 retires snapshots with potentially stale inferred timestamps.
+pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 4;
 
 /// Parse an Antigravity CLI conversation database.
 pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
@@ -106,7 +107,8 @@ fn parse_antigravity_db_file_with_v1(
     path: &Path,
     client: &'static str,
 ) -> (Vec<UnifiedMessage>, Vec<UnifiedMessage>, bool) {
-    let scan = parse_antigravity_db_file_inner(path, client, true);
+    let scan =
+        parse_antigravity_db_file_inner(path, client, true, chrono::Utc::now().timestamp_millis());
     (
         scan.current.messages,
         scan.v1_messages,
@@ -118,6 +120,7 @@ fn parse_antigravity_db_file_with_v1(
 pub(crate) struct AntigravityDbScan {
     pub messages: Vec<UnifiedMessage>,
     pub complete: bool,
+    pub timestamp_pending: bool,
 }
 
 #[derive(Default)]
@@ -130,13 +133,22 @@ struct AntigravityDbRead {
 /// Read one SQLite snapshot, distinguishing an empty database from a failed
 /// read so callers never persist a transient failure as a successful cache hit.
 pub(crate) fn scan_antigravity_db_file(path: &Path, client: &'static str) -> AntigravityDbScan {
-    parse_antigravity_db_file_inner(path, client, false).current
+    scan_antigravity_db_file_at(path, client, chrono::Utc::now().timestamp_millis())
+}
+
+pub(crate) fn scan_antigravity_db_file_at(
+    path: &Path,
+    client: &'static str,
+    now_ms: i64,
+) -> AntigravityDbScan {
+    parse_antigravity_db_file_inner(path, client, false, now_ms).current
 }
 
 fn parse_antigravity_db_file_inner(
     path: &Path,
     client: &'static str,
     include_v1: bool,
+    now_ms: i64,
 ) -> AntigravityDbRead {
     let Some(conn) = open_readonly_sqlite_opt(path) else {
         return AntigravityDbRead::default();
@@ -197,6 +209,8 @@ fn parse_antigravity_db_file_inner(
         session_anchor: meta.created_ms,
         session_models: &session_models,
         step_timestamps: &step_timestamps,
+        now_ms,
+        timestamp_pending: Cell::new(false),
     };
 
     let mut messages = Vec::new();
@@ -232,6 +246,7 @@ fn parse_antigravity_db_file_inner(
         current: AntigravityDbScan {
             messages,
             complete: meta_complete && steps_complete && rows_complete && read_complete,
+            timestamp_pending: ctx.timestamp_pending.get(),
         },
         v1_messages,
         usage_read_complete: read_complete,
@@ -407,6 +422,8 @@ struct GenContext<'a> {
     session_anchor: Option<i64>,
     session_models: &'a SessionModels,
     step_timestamps: &'a StepTimestamps,
+    now_ms: i64,
+    timestamp_pending: Cell<bool>,
 }
 
 fn parse_gen_metadata(
@@ -495,10 +512,7 @@ fn parse_gen_metadata_with_mode(
         })
         .or_else(|| gen_idx.and_then(|idx| ctx.step_timestamps.by_gen_idx.get(&idx).copied()));
     let timestamp = generation_started_at
-        .or_else(|| {
-            message_field(chat_model, 9)
-                .and_then(|gen| generation_timestamp_ms(gen, ctx.session_anchor))
-        })
+        .or_else(|| message_field(chat_model, 9).and_then(|gen| generation_timestamp_ms(gen, ctx)))
         .unwrap_or(ctx.session_timestamp);
 
     let response_model = non_empty_string_field(chat_model, 19);
@@ -781,7 +795,7 @@ fn read_step_timestamps(conn: &Connection, path: &Path) -> (StepTimestamps, bool
 /// missing or would not decode, or the value it did decode to is not positive —
 /// no inferred reading is accepted at all, and the row keeps whatever dating it
 /// had before the 1.1.18 layout was handled, mtime fallback included.
-fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i64> {
+fn generation_timestamp_ms(gen: &[u8], ctx: &GenContext<'_>) -> Option<i64> {
     // agy <= 1.1.17. Tried first and kept on its original `ms > 0` filter, with
     // no session bound: existing databases and older installs still write it,
     // and it is an explicitly typed Timestamp read off real databases rather
@@ -795,7 +809,14 @@ fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i6
     // agy 1.1.18. `#9.#2` is deliberately never consulted: the only value ever
     // observed there is the unset sentinel, and `epoch_scalar_to_ms` rejects
     // that value outright should it reach any other candidate path.
-    message_field(gen, 10).and_then(|payload| inferred_epoch_ms(payload, session_anchor))
+    message_field(gen, 10).and_then(|payload| {
+        infer_timestamp(
+            payload,
+            ctx.session_anchor,
+            ctx.now_ms,
+            &ctx.timestamp_pending,
+        )
+    })
 }
 
 /// Decode the agy 1.1.18 `chatModel.#9.#10` payload as an epoch time.
@@ -847,24 +868,26 @@ fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i6
 /// is a believable date but not a believable date *for this session* is
 /// discarded rather than allowed to mask a later candidate. A payload with no
 /// trustworthy session anchor is declined outright.
-fn inferred_epoch_ms(payload: &[u8], session_anchor: Option<i64>) -> Option<i64> {
-    inferred_epoch_ms_at(
-        payload,
-        session_anchor,
-        chrono::Utc::now().timestamp_millis(),
-    )
+#[cfg(test)]
+fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64) -> Option<i64> {
+    infer_timestamp(payload, session_anchor, now_ms, &Cell::new(false))
 }
 
-/// [`inferred_epoch_ms`] evaluated as of `now_ms` instead of the wall clock,
-/// so a test can hold the bytes and the anchor fixed and vary only the moment
-/// of the scan. `now_ms` is the only clock the verdict reads: it closes the
-/// session window, while the absolute [`plausible_epoch_ms`] band is fixed,
-/// so identical bytes and anchor yield one verdict on every scan day.
-fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64) -> Option<i64> {
-    // Sampled once so every candidate for this payload is judged against the
-    // same window, and so a missing anchor short-circuits before any decode.
+fn infer_timestamp(
+    payload: &[u8],
+    session_anchor: Option<i64>,
+    now_ms: i64,
+    timestamp_pending: &Cell<bool>,
+) -> Option<i64> {
     let window = session_window_ms(session_anchor?, now_ms)?;
-    let accepted = |ms: i64| window.contains(&ms);
+    let accepted = |ms: i64| {
+        // A candidate rejected solely by the moving upper bound can replace
+        // the fallback (or a lower-priority candidate) in a later scan.
+        if ms >= *window.start() && ms > *window.end() {
+            timestamp_pending.set(true);
+        }
+        window.contains(&ms)
+    };
 
     if let Some(ms) =
         proto_timestamp_ms(payload).filter(|&ms| plausible_epoch_ms(ms) && accepted(ms))
@@ -1348,6 +1371,8 @@ mod tests {
             session_anchor: anchor,
             session_models: &models,
             step_timestamps: &step_timestamps,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+            timestamp_pending: Cell::new(false),
         };
         parse_gen_metadata(&build_row_with_gen9(gen9, "resp"), &ctx, &mut seen, None)
             .expect("row parses")
@@ -1372,6 +1397,8 @@ mod tests {
             session_anchor: Some(session_timestamp),
             session_models: &models,
             step_timestamps: &step_timestamps,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+            timestamp_pending: Cell::new(false),
         };
         parse_gen_metadata(blob, &ctx, seen_response_ids, None)
     }

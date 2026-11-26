@@ -695,3 +695,69 @@ fn antigravity_db_cache_metadata_failures_and_nonfiles_fail_closed() {
         directory.path()
     )));
 }
+
+#[test]
+#[serial_test::serial]
+fn antigravity_pending_timestamp_does_not_survive_in_the_warm_cache() {
+    use sessions::antigravity_cli::scan_antigravity_db_file_at;
+
+    const ANCHOR_SECS: u64 = 1_781_502_653;
+    const TURN_SECS: u64 = ANCHOR_SECS + 2 * 24 * 3_600;
+    const TURN_MS: i64 = TURN_SECS as i64 * 1_000;
+    const ELIGIBLE_MS: i64 = TURN_MS - 3_600_000;
+
+    for (surface, client) in [
+        ("antigravity-cli", ClientId::AntigravityCli),
+        ("antigravity", ClientId::AntigravityExtension),
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let _env = cache_env(home.path());
+        let (path, conn) = database(home.path(), surface, "pending timestamp");
+        let trajectory = blob(2, &number(1, ANCHOR_SECS));
+        conn.execute("UPDATE trajectory_metadata_blob SET data=?1", [trajectory])
+            .unwrap();
+        let inferred = blob(10, &number(1, TURN_SECS));
+        let usage = number(2, 100);
+        let chat = [
+            blob(4, &usage),
+            blob(9, &inferred),
+            blob(19, b"gemini-3-flash-a"),
+        ]
+        .concat();
+        conn.execute("UPDATE gen_metadata SET data=?1", [blob(1, &chat)])
+            .unwrap();
+        drop(conn);
+
+        let mut cache = SourceMessageCache::load();
+        let (early, entry) =
+            load_or_parse_antigravity_db_source(&path, client, &cache, |path, client| {
+                scan_antigravity_db_file_at(path, client, ELIGIBLE_MS - 1)
+            });
+        assert_eq!(early[0].timestamp, ANCHOR_SECS as i64 * 1_000);
+        assert_eq!(early[0].tokens.input, 100);
+        // Simulate the next process, loading any shard the early scan published.
+        if let Some(entry) = entry {
+            cache.insert(entry);
+        }
+        cache.save_if_dirty();
+
+        let mut cache = SourceMessageCache::load();
+        let (late, entry) =
+            load_or_parse_antigravity_db_source(&path, client, &cache, |path, client| {
+                scan_antigravity_db_file_at(path, client, ELIGIBLE_MS)
+            });
+        assert_eq!(late[0].timestamp, TURN_MS);
+        assert_ne!(early[0].date, late[0].date);
+        assert_eq!(early[0].tokens, late[0].tokens);
+        cache.insert(entry.expect("settled timestamp can be cached"));
+        cache.save_if_dirty();
+
+        let (warm, _) = load_or_parse_antigravity_db_source(
+            &path,
+            client,
+            &SourceMessageCache::load(),
+            |_, _| panic!("settled timestamp must reuse the cache"),
+        );
+        assert_eq!(warm, late);
+    }
+}

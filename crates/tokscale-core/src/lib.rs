@@ -10600,7 +10600,9 @@ fn load_or_parse_antigravity_db_source(
         )
     });
     let cache_eligible_after = antigravity_db_cache_eligible(path);
-    if scan.complete && (!cache_eligible_before || !cache_eligible_after || !stable) {
+    if scan.complete
+        && (scan.timestamp_pending || !cache_eligible_before || !cache_eligible_after || !stable)
+    {
         // A successful fresh read remains useful even when it cannot be cached.
         // Reserve the old-entry fallback for failed or incomplete reads.
         return (scan.messages, None);
