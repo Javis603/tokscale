@@ -633,9 +633,10 @@ fn read_trajectory_meta(conn: &Connection, path: &Path) -> (TrajectoryMeta, bool
         .query_row(
             "SELECT data FROM trajectory_metadata_blob LIMIT 1",
             [],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| row.get::<_, Option<Vec<u8>>>(0),
         )
-        .optional();
+        .optional()
+        .map(Option::flatten);
     let complete = result.is_ok() || optional_table_absent(conn, "trajectory_metadata_blob");
     let blob = result.ok().flatten();
 

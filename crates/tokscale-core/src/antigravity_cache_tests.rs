@@ -761,3 +761,40 @@ fn antigravity_pending_timestamp_does_not_survive_in_the_warm_cache() {
         assert_eq!(warm, late);
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn antigravity_null_trajectory_metadata_keeps_warm_usage_current() {
+    for (surface, client) in [
+        ("antigravity-cli", "antigravity-cli"),
+        ("antigravity", "antigravity-extension"),
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let _env = cache_env(home.path());
+        let (path, conn) = database(home.path(), surface, "nullable metadata");
+        let clients = [client];
+        let total =
+            |rows: Vec<UnifiedMessage>| rows.iter().map(|row| row.tokens.input).sum::<i64>();
+
+        assert_eq!(total(scan(home.path(), &clients)), 100);
+        insert(&conn, 1, "new-response", 200);
+        conn.execute("UPDATE trajectory_metadata_blob SET data = NULL", [])
+            .unwrap();
+        {
+            let _cold = cache_env(&home.path().join("cold"));
+            assert_eq!(total(scan(home.path(), &clients)), 300);
+        }
+        assert_eq!(total(scan(home.path(), &clients)), 300);
+        let identity = CacheIdentity::for_client(ClientId::from_str(client).unwrap());
+        let cached = SourceMessageCache::load().get(identity, &path).unwrap();
+        assert_eq!(total(cached.messages), 300);
+
+        insert(&conn, 2, "later-response", 400);
+        conn.execute(
+            "UPDATE trajectory_metadata_blob SET data = 'invalid blob type'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(total(scan(home.path(), &clients)), 300);
+    }
+}
