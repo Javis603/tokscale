@@ -5090,8 +5090,15 @@ fn write_shard_with_limit(
         crate::fs_atomic::replace_file(&tmp_path, final_path)?;
         #[cfg(test)]
         abort_source_cache_save_at("after-rename");
-        let final_file = OpenOptions::new().read(true).write(true).open(final_path)?;
-        final_file.sync_all()?;
+        // On macOS these shards can be rebuilt from the original conversation
+        // DB if a crash loses the rename. The temp file is already synced.
+        let rebuildable_antigravity = cfg!(target_os = "macos")
+            && (identity.namespace == ClientId::AntigravityCli.as_str()
+                || identity.namespace == ClientId::AntigravityExtension.as_str());
+        if !rebuildable_antigravity {
+            let final_file = OpenOptions::new().read(true).write(true).open(final_path)?;
+            final_file.sync_all()?;
+        }
         Ok(())
     })();
 
@@ -8484,6 +8491,42 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn antigravity_old_snapshot_shards_are_rejected() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        for client in [ClientId::AntigravityCli, ClientId::AntigravityExtension] {
+            let source = home.path().join(format!("{}.db", client.as_str()));
+            fs::write(&source, b"unchanged source bytes").unwrap();
+            let identity = CacheIdentity::for_client(client);
+            assert_eq!(identity.parser_version, 4);
+            for parser_version in [2, 3] {
+                let old_identity = CacheIdentity {
+                    parser_version,
+                    ..identity
+                };
+                let fingerprint = SourceFingerprint::from_sqlite_path(&source).unwrap();
+                let stale = CachedSourceEntry::new(
+                    old_identity,
+                    &source,
+                    fingerprint,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
+                let shard = cache_shard_path(identity, &source);
+                ensure_cache_dir(shard.parent().unwrap()).unwrap();
+                write_shard_with_limit(&shard, old_identity, &[stale], MAX_CACHE_SHARD_BYTES)
+                    .unwrap();
+                assert!(
+                    SourceMessageCache::load().get(identity, &source).is_none(),
+                    "v{parser_version} must not survive the cache generation bump"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn openclaw_v8_sqlite_shards_are_reparsed_with_archived_rows() {
         use crate::sessions::openclaw::{scan_openclaw_sqlite, test_fixtures::*};
         let temp_home = TempDir::new().unwrap();
@@ -11246,16 +11289,13 @@ mod tests {
     #[test]
     fn test_antigravity_family_bump_moves_the_parser_generation() {
         assert_eq!(parser_version(ClientId::Antigravity), 2);
-        assert_eq!(parser_version(ClientId::AntigravityCli), 2);
-        assert_eq!(parser_version(ClientId::AntigravityExtension), 2);
+        assert_eq!(parser_version(ClientId::AntigravityCli), 4);
+        assert_eq!(parser_version(ClientId::AntigravityExtension), 4);
 
         let pre_bump_generation = parser_generation_for_versions(
             ClientId::ALL.iter().copied().map(|c| {
-                if c == ClientId::Antigravity
-                    || c == ClientId::AntigravityCli
-                    || c == ClientId::AntigravityExtension
-                {
-                    1
+                if c == ClientId::AntigravityCli || c == ClientId::AntigravityExtension {
+                    3
                 } else {
                     parser_version(c)
                 }
@@ -11265,8 +11305,8 @@ mod tests {
         assert_ne!(
             parser_generation(),
             pre_bump_generation,
-            "bumping Antigravity family to v2 must invalidate parser_generation(), \
-             preventing stale warm caches from reusing pre-v2 totals"
+            "bumping Antigravity databases to v4 must invalidate parser_generation(), \
+             preventing stale warm caches from reusing pre-v4 totals"
         );
     }
 

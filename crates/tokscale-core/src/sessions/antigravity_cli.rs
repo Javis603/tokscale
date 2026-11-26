@@ -61,7 +61,8 @@
 use super::utils::{open_readonly_sqlite_opt, sqlite_for_each_row_on, SqliteScan};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{pricing, provider_identity, TokenBreakdown};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::Path;
@@ -69,7 +70,8 @@ use std::time::Duration;
 
 /// Bump when parsing behavior for Antigravity generation databases changes.
 /// The CLI and IDE extension clients share this parser and cache generation.
-pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 2;
+// v4 retires snapshots with potentially stale inferred timestamps.
+pub const ANTIGRAVITY_DB_PARSER_BASE_VERSION: u32 = 4;
 
 /// Parse an Antigravity CLI conversation database.
 pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
@@ -98,28 +100,63 @@ pub fn parse_antigravity_extension_file_with_v1(
 }
 
 fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMessage> {
-    parse_antigravity_db_file_inner(path, client, false).0
+    scan_antigravity_db_file(path, client).messages
 }
 
 fn parse_antigravity_db_file_with_v1(
     path: &Path,
     client: &'static str,
 ) -> (Vec<UnifiedMessage>, Vec<UnifiedMessage>, bool) {
-    parse_antigravity_db_file_inner(path, client, true)
+    let scan =
+        parse_antigravity_db_file_inner(path, client, true, chrono::Utc::now().timestamp_millis());
+    (
+        scan.current.messages,
+        scan.v1_messages,
+        scan.usage_read_complete,
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct AntigravityDbScan {
+    pub messages: Vec<UnifiedMessage>,
+    pub complete: bool,
+    pub timestamp_pending: bool,
+}
+
+#[derive(Default)]
+struct AntigravityDbRead {
+    current: AntigravityDbScan,
+    v1_messages: Vec<UnifiedMessage>,
+    usage_read_complete: bool,
+}
+
+/// Read one SQLite snapshot, distinguishing an empty database from a failed
+/// read so callers never persist a transient failure as a successful cache hit.
+pub(crate) fn scan_antigravity_db_file(path: &Path, client: &'static str) -> AntigravityDbScan {
+    scan_antigravity_db_file_at(path, client, chrono::Utc::now().timestamp_millis())
+}
+
+pub(crate) fn scan_antigravity_db_file_at(
+    path: &Path,
+    client: &'static str,
+    now_ms: i64,
+) -> AntigravityDbScan {
+    parse_antigravity_db_file_inner(path, client, false, now_ms).current
 }
 
 fn parse_antigravity_db_file_inner(
     path: &Path,
     client: &'static str,
     include_v1: bool,
-) -> (Vec<UnifiedMessage>, Vec<UnifiedMessage>, bool) {
+    now_ms: i64,
+) -> AntigravityDbRead {
     let Some(conn) = open_readonly_sqlite_opt(path) else {
-        return (Vec::new(), Vec::new(), false);
+        return AntigravityDbRead::default();
     };
     if conn.busy_timeout(Duration::from_millis(100)).is_err()
         || conn.execute_batch("BEGIN").is_err()
     {
-        return (Vec::new(), Vec::new(), false);
+        return AntigravityDbRead::default();
     }
 
     let session_id = path
@@ -128,8 +165,8 @@ fn parse_antigravity_db_file_inner(
         .unwrap_or("unknown")
         .to_string();
 
-    let meta = read_trajectory_meta(&conn, path);
-    let step_timestamps = read_step_timestamps(&conn, path);
+    let (meta, meta_complete) = read_trajectory_meta(&conn, path);
+    let (step_timestamps, steps_complete) = read_step_timestamps(&conn, path);
 
     // Buffered rather than streamed so a row missing its own `#19` can borrow
     // attribution from anywhere in the conversation, not just from rows that
@@ -138,15 +175,21 @@ fn parse_antigravity_db_file_inner(
     // Quiet: a database without `gen_metadata` is not an Antigravity generation
     // database at all, so there is nothing to warn about.
     let mut rows: Vec<(Option<i64>, Vec<u8>)> = Vec::new();
+    let mut rows_complete = true;
     let scan = sqlite_for_each_row_on(
         &conn,
         path,
         "SELECT idx, data FROM gen_metadata ORDER BY idx",
         None,
         &mut |row| {
-            let idx = row.get::<_, Option<i64>>(0)?;
-            let data: Vec<u8> = row.get(1)?;
-            rows.push((idx, data));
+            let decoded = (|| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Vec<u8>>(1)?)))();
+            match decoded {
+                Ok(row) => rows.push(row),
+                Err(error) => {
+                    rows_complete = false;
+                    return Err(error);
+                }
+            }
             Ok(())
         },
     );
@@ -166,6 +209,8 @@ fn parse_antigravity_db_file_inner(
         session_anchor: meta.created_ms,
         session_models: &session_models,
         step_timestamps: &step_timestamps,
+        now_ms,
+        timestamp_pending: Cell::new(false),
     };
 
     let mut messages = Vec::new();
@@ -197,7 +242,15 @@ fn parse_antigravity_db_file_inner(
         }
     }
 
-    (messages, v1_messages, read_complete)
+    AntigravityDbRead {
+        current: AntigravityDbScan {
+            messages,
+            complete: meta_complete && steps_complete && rows_complete && read_complete,
+            timestamp_pending: ctx.timestamp_pending.get(),
+        },
+        v1_messages,
+        usage_read_complete: read_complete,
+    }
 }
 
 /// Whether the database has the `gen_metadata` table Antigravity writes. A
@@ -369,6 +422,8 @@ struct GenContext<'a> {
     session_anchor: Option<i64>,
     session_models: &'a SessionModels,
     step_timestamps: &'a StepTimestamps,
+    now_ms: i64,
+    timestamp_pending: Cell<bool>,
 }
 
 fn parse_gen_metadata(
@@ -457,10 +512,7 @@ fn parse_gen_metadata_with_mode(
         })
         .or_else(|| gen_idx.and_then(|idx| ctx.step_timestamps.by_gen_idx.get(&idx).copied()));
     let timestamp = generation_started_at
-        .or_else(|| {
-            message_field(chat_model, 9)
-                .and_then(|gen| generation_timestamp_ms(gen, ctx.session_anchor))
-        })
+        .or_else(|| message_field(chat_model, 9).and_then(|gen| generation_timestamp_ms(gen, ctx)))
         .unwrap_or(ctx.session_timestamp);
 
     let response_model = non_empty_string_field(chat_model, 19);
@@ -561,20 +613,32 @@ struct TrajectoryMeta {
     workspace_label: Option<String>,
 }
 
+fn optional_table_absent(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
 /// Read the session-level created-at timestamp and workspace from the single
 /// `trajectory_metadata_blob` row. The created-at dates the conversation as a
 /// whole; the per-row fallback for any `gen_metadata` row missing its own
 /// per-generation `#9` wall-clock stamp drops to the file mtime when the blob
 /// is absent or undecodable. See [`TrajectoryMeta`] for why the two are
 /// reported separately.
-fn read_trajectory_meta(conn: &Connection, path: &Path) -> TrajectoryMeta {
-    let blob: Option<Vec<u8>> = conn
+fn read_trajectory_meta(conn: &Connection, path: &Path) -> (TrajectoryMeta, bool) {
+    let result = conn
         .query_row(
             "SELECT data FROM trajectory_metadata_blob LIMIT 1",
             [],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| row.get::<_, Option<Vec<u8>>>(0),
         )
-        .ok();
+        .optional()
+        .map(Option::flatten);
+    let complete = result.is_ok() || optional_table_absent(conn, "trajectory_metadata_blob");
+    let blob = result.ok().flatten();
 
     let mut created_ms = None;
     let mut workspace_key = None;
@@ -591,12 +655,15 @@ fn read_trajectory_meta(conn: &Connection, path: &Path) -> TrajectoryMeta {
         }
     }
 
-    TrajectoryMeta {
-        created_ms,
-        fallback_ms: created_ms.unwrap_or_else(|| file_modified_ms(path)),
-        workspace_key,
-        workspace_label,
-    }
+    (
+        TrajectoryMeta {
+            created_ms,
+            fallback_ms: created_ms.unwrap_or_else(|| file_modified_ms(path)),
+            workspace_key,
+            workspace_label,
+        },
+        complete,
+    )
 }
 
 fn session_created_ms(blob: &[u8]) -> Option<i64> {
@@ -626,17 +693,40 @@ struct StepTimestamps {
 /// In modern agy versions (1.1.18+), `chatModel.#9` in `gen_metadata` no longer carries
 /// a turn timestamp (it holds cache metadata instead). Looking up by `responseId`
 /// (or generation index) restores the genuine per-turn execution time.
-fn read_step_timestamps(conn: &Connection, path: &Path) -> StepTimestamps {
+fn read_step_timestamps(conn: &Connection, path: &Path) -> (StepTimestamps, bool) {
+    // Some IDE schemas have step_payload but no metadata timestamp column.
+    // Confirm its absence rather than treating every query failure as optional.
+    match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('steps') WHERE name = 'metadata' COLLATE NOCASE)",
+        [],
+        |row| row.get::<_, bool>(0),
+    ) {
+        Ok(true) => {}
+        Ok(false) => return (StepTimestamps::default(), true),
+        Err(_) => return (StepTimestamps::default(), false),
+    }
     let mut timestamps = StepTimestamps::default();
+    let mut rows_complete = true;
     let scan = sqlite_for_each_row_on(
         conn,
         path,
         "SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL",
         None,
         &mut |row| {
-            let idx: Option<i64> = row.get(0)?;
-            let step_type: Option<i64> = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
+            let decoded = (|| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })();
+            let (idx, step_type, blob) = match decoded {
+                Ok(row) => row,
+                Err(error) => {
+                    rows_complete = false;
+                    return Err(error);
+                }
+            };
             if let Some(ts_ms) = message_field(&blob, 1).and_then(proto_timestamp_ms) {
                 if ts_ms > 0 {
                     if let Some(idx) = idx {
@@ -665,9 +755,12 @@ fn read_step_timestamps(conn: &Connection, path: &Path) -> StepTimestamps {
         },
     );
     if scan.completed() {
-        timestamps
+        (timestamps, rows_complete)
     } else {
-        StepTimestamps::default()
+        (
+            StepTimestamps::default(),
+            optional_table_absent(conn, "steps"),
+        )
     }
 }
 
@@ -703,7 +796,7 @@ fn read_step_timestamps(conn: &Connection, path: &Path) -> StepTimestamps {
 /// missing or would not decode, or the value it did decode to is not positive —
 /// no inferred reading is accepted at all, and the row keeps whatever dating it
 /// had before the 1.1.18 layout was handled, mtime fallback included.
-fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i64> {
+fn generation_timestamp_ms(gen: &[u8], ctx: &GenContext<'_>) -> Option<i64> {
     // agy <= 1.1.17. Tried first and kept on its original `ms > 0` filter, with
     // no session bound: existing databases and older installs still write it,
     // and it is an explicitly typed Timestamp read off real databases rather
@@ -717,7 +810,14 @@ fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i6
     // agy 1.1.18. `#9.#2` is deliberately never consulted: the only value ever
     // observed there is the unset sentinel, and `epoch_scalar_to_ms` rejects
     // that value outright should it reach any other candidate path.
-    message_field(gen, 10).and_then(|payload| inferred_epoch_ms(payload, session_anchor))
+    message_field(gen, 10).and_then(|payload| {
+        infer_timestamp(
+            payload,
+            ctx.session_anchor,
+            ctx.now_ms,
+            &ctx.timestamp_pending,
+        )
+    })
 }
 
 /// Decode the agy 1.1.18 `chatModel.#9.#10` payload as an epoch time.
@@ -769,24 +869,26 @@ fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i6
 /// is a believable date but not a believable date *for this session* is
 /// discarded rather than allowed to mask a later candidate. A payload with no
 /// trustworthy session anchor is declined outright.
-fn inferred_epoch_ms(payload: &[u8], session_anchor: Option<i64>) -> Option<i64> {
-    inferred_epoch_ms_at(
-        payload,
-        session_anchor,
-        chrono::Utc::now().timestamp_millis(),
-    )
+#[cfg(test)]
+fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64) -> Option<i64> {
+    infer_timestamp(payload, session_anchor, now_ms, &Cell::new(false))
 }
 
-/// [`inferred_epoch_ms`] evaluated as of `now_ms` instead of the wall clock,
-/// so a test can hold the bytes and the anchor fixed and vary only the moment
-/// of the scan. `now_ms` is the only clock the verdict reads: it closes the
-/// session window, while the absolute [`plausible_epoch_ms`] band is fixed,
-/// so identical bytes and anchor yield one verdict on every scan day.
-fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64) -> Option<i64> {
-    // Sampled once so every candidate for this payload is judged against the
-    // same window, and so a missing anchor short-circuits before any decode.
+fn infer_timestamp(
+    payload: &[u8],
+    session_anchor: Option<i64>,
+    now_ms: i64,
+    timestamp_pending: &Cell<bool>,
+) -> Option<i64> {
     let window = session_window_ms(session_anchor?, now_ms)?;
-    let accepted = |ms: i64| window.contains(&ms);
+    let accepted = |ms: i64| {
+        // A candidate rejected solely by the moving upper bound can replace
+        // the fallback (or a lower-priority candidate) in a later scan.
+        if ms >= *window.start() && ms > *window.end() {
+            timestamp_pending.set(true);
+        }
+        window.contains(&ms)
+    };
 
     if let Some(ms) =
         proto_timestamp_ms(payload).filter(|&ms| plausible_epoch_ms(ms) && accepted(ms))
@@ -1270,6 +1372,8 @@ mod tests {
             session_anchor: anchor,
             session_models: &models,
             step_timestamps: &step_timestamps,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+            timestamp_pending: Cell::new(false),
         };
         parse_gen_metadata(&build_row_with_gen9(gen9, "resp"), &ctx, &mut seen, None)
             .expect("row parses")
@@ -1294,6 +1398,8 @@ mod tests {
             session_anchor: Some(session_timestamp),
             session_models: &models,
             step_timestamps: &step_timestamps,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+            timestamp_pending: Cell::new(false),
         };
         parse_gen_metadata(blob, &ctx, seen_response_ids, None)
     }
