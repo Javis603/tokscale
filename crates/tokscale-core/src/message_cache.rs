@@ -5090,8 +5090,15 @@ fn write_shard_with_limit(
         crate::fs_atomic::replace_file(&tmp_path, final_path)?;
         #[cfg(test)]
         abort_source_cache_save_at("after-rename");
-        let final_file = OpenOptions::new().read(true).write(true).open(final_path)?;
-        final_file.sync_all()?;
+        // On macOS these shards can be rebuilt from the original conversation
+        // DB if a crash loses the rename. The temp file is already synced.
+        let rebuildable_antigravity = cfg!(target_os = "macos")
+            && (identity.namespace == ClientId::AntigravityCli.as_str()
+                || identity.namespace == ClientId::AntigravityExtension.as_str());
+        if !rebuildable_antigravity {
+            let final_file = OpenOptions::new().read(true).write(true).open(final_path)?;
+            final_file.sync_all()?;
+        }
         Ok(())
     })();
 
