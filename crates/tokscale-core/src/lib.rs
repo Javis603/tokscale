@@ -5619,12 +5619,24 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .into_iter()
         .map(|db_path| {
             let mut messages =
-                parse_hermes_sqlite_with_pricing(&db_path, pricing, &hermes_bucket_timezone);
+                sessions::hermes::parse_hermes_sqlite_in(&db_path, &hermes_bucket_timezone);
             machine_labeler.label_messages(&db_path, &mut messages);
             messages
         })
         .collect();
-    all_messages.extend(select_best_covered_hermes_groups(hermes_databases));
+    // Select before estimating: copies are compared on the database's own
+    // totals, and a log-split copy's estimate legitimately differs from an
+    // unsplit copy's once its calls are priced per request.
+    all_messages.extend(
+        select_best_covered_hermes_groups(hermes_databases)
+            .into_iter()
+            .map(|mut msg| {
+                if msg.cost <= 0.0 {
+                    apply_pricing_if_available(&mut msg, pricing);
+                }
+                msg
+            }),
+    );
 
     if let Some(db_path) = &scan_result.goose_db {
         let mut goose_messages: Vec<UnifiedMessage> = sessions::goose::parse_goose_sqlite(db_path)
@@ -8496,20 +8508,26 @@ fn hermes_candidates_have_same_usage(a: &[UnifiedMessage], b: &[UnifiedMessage])
     a_tokens == b_tokens && (a_cost - b_cost).abs() <= 1e-9 * cost_scale
 }
 
-fn hermes_candidate_day_coverage(messages: &[UnifiedMessage]) -> usize {
-    messages
-        .iter()
-        .filter_map(sessions::hermes::message_logged_day)
-        .collect::<HashSet<_>>()
-        .len()
+fn hermes_candidate_log_coverage(messages: &[UnifiedMessage]) -> (usize, usize) {
+    let mut logged_days = HashSet::new();
+    let mut logged_calls = 0_usize;
+    for message in messages {
+        if let Some(day) = sessions::hermes::message_logged_day(message) {
+            logged_days.insert(day);
+            logged_calls += 1;
+        }
+    }
+    (logged_days.len(), logged_calls)
 }
 
 /// Select one copy of each Hermes (session, model, provider) group when the
 /// same database is discovered through default and extra roots. A log-split
 /// copy beats a start-day fallback only when their authoritative token and cost
 /// totals agree. Among matching copies, the one covering the most distinct log
-/// days wins; ties keep the first database. Mismatched totals always keep the
-/// first database rather than replacing a complete row with a stale partial copy.
+/// days wins; equal day coverage prefers the copy with more logged call
+/// messages, and full ties keep the first database. Mismatched totals always
+/// keep the first database rather than replacing a complete row with a stale
+/// partial copy.
 ///
 /// `message_count` belongs to the session rather than any model group. Group-
 /// by-group selection can mix copies from different databases whose primary
@@ -8564,12 +8582,12 @@ fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec
         let candidates = group_candidates.remove(&group).unwrap_or_default();
         let best = candidates.first().map_or(0, |baseline| {
             let mut best_index = 0;
-            let mut best_coverage = hermes_candidate_day_coverage(baseline);
+            let mut best_coverage = hermes_candidate_log_coverage(baseline);
             for (index, messages) in candidates.iter().enumerate().skip(1) {
                 if !hermes_candidates_have_same_usage(baseline, messages) {
                     continue;
                 }
-                let coverage = hermes_candidate_day_coverage(messages);
+                let coverage = hermes_candidate_log_coverage(messages);
                 if coverage > best_coverage {
                     best_index = index;
                     best_coverage = coverage;
@@ -8594,22 +8612,6 @@ fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec
         };
     }
     selected
-}
-
-fn parse_hermes_sqlite_with_pricing(
-    db_path: &Path,
-    pricing: Option<&pricing::PricingService>,
-    bucket_timezone: &bucket_tz::BucketTimezone,
-) -> Vec<UnifiedMessage> {
-    sessions::hermes::parse_hermes_sqlite_in(db_path, bucket_timezone)
-        .into_iter()
-        .map(|mut msg| {
-            if msg.cost <= 0.0 {
-                apply_pricing_if_available(&mut msg, pricing);
-            }
-            msg
-        })
-        .collect()
 }
 
 fn select_local_parse_pricing<F>(
@@ -30060,6 +30062,203 @@ mod tests {
             (parsed.messages.iter().map(|m| m.cost).sum::<f64>() - 0.07).abs() < 1e-9,
             "the split days must carry the row's cost, and only once"
         );
+    }
+
+    /// Copies are compared on the database's totals before estimating. A
+    /// zero-cost row priced per logged call must not lose to an unsplit copy
+    /// parsed first just because that copy's aggregate crosses a tier.
+    #[test]
+    fn test_priced_hermes_selection_compares_copies_before_estimating() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(3e-6),
+                input_cost_per_token_above_200k_tokens: Some(6e-6),
+                output_cost_per_token: Some(15e-6),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        // Default database, parsed first: no logs, so the whole 300K-input
+        // row is one estimate past the 200K tier.
+        let default_dir = temp_dir.path().join(".hermes");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_conn = create_hermes_sqlite_db(&default_dir.join("state.db"));
+        let session = "shared-hermes-session";
+        insert_hermes_session(
+            &default_conn,
+            session,
+            "claude-sonnet-4",
+            2,
+            300_000,
+            75_000,
+            0.0,
+        );
+        drop(default_conn);
+
+        // Profile database: the same row, logged as two 150K-input calls.
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(profile_dir.join("logs")).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let profile_conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &profile_conn,
+            session,
+            "claude-sonnet-4",
+            2,
+            300_000,
+            75_000,
+            0.0,
+        );
+        drop(profile_conn);
+        std::fs::write(
+            profile_dir.join("logs/agent.log"),
+            format!(
+                "{}\n{}\n",
+                hermes_api_call_log_line(session, 1, "2026-03-05 12:00:00,000", 150_000),
+                hermes_api_call_log_line(session, 2, "2026-03-06 12:00:00,000", 150_000),
+            ),
+        )
+        .unwrap();
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
+        let options = LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        };
+        let messages = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::parse_local_unified_messages_with_pricing_uncached(
+                options,
+                Some(&pricing),
+            ))
+            .unwrap();
+
+        assert_eq!(messages.len(), 2, "the split copy wins");
+        assert!(messages
+            .iter()
+            .all(|m| sessions::hermes::message_logged_day(m).is_some()));
+        let per_call = 300_000.0 * 3e-6 + 75_000.0 * 15e-6;
+        let cost: f64 = messages.iter().map(|m| m.cost).sum();
+        assert!((cost - per_call).abs() < 1e-9, "estimated {cost}");
+    }
+
+    /// Equal distinct-day coverage still prefers the copy preserving more
+    /// logged calls: those messages carry per-call timing and pricing evidence
+    /// that a same-day residual cannot reconstruct.
+    #[test]
+    fn test_hermes_selection_prefers_more_logged_calls_when_day_coverage_ties() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(3e-6),
+                output_cost_per_token: Some(15e-6),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let session = "shared-hermes-session";
+
+        // Default database, parsed first: one logged call covers half of the
+        // row and the other half is an untimed residual on the start day.
+        let default_dir = temp_dir.path().join(".hermes");
+        std::fs::create_dir_all(default_dir.join("logs")).unwrap();
+        let default_conn = create_hermes_sqlite_db(&default_dir.join("state.db"));
+        insert_hermes_session(
+            &default_conn,
+            session,
+            "claude-sonnet-4",
+            2,
+            300_000,
+            75_000,
+            0.0,
+        );
+        drop(default_conn);
+        std::fs::write(
+            default_dir.join("logs/agent.log"),
+            format!(
+                "{}\n",
+                hermes_api_call_log_line(session, 1, "2026-03-05 12:00:00,000", 150_000),
+            ),
+        )
+        .unwrap();
+
+        // Profile database: identical totals, but both calls survive in the
+        // log on the same day. It has the same distinct-day count and more
+        // per-call evidence.
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(profile_dir.join("logs")).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let profile_conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &profile_conn,
+            session,
+            "claude-sonnet-4",
+            2,
+            300_000,
+            75_000,
+            0.0,
+        );
+        drop(profile_conn);
+        std::fs::write(
+            profile_dir.join("logs/agent.log"),
+            format!(
+                "{}\n{}\n",
+                hermes_api_call_log_line(session, 1, "2026-03-05 12:00:00,000", 150_000),
+                hermes_api_call_log_line(session, 2, "2026-03-05 13:00:00,000", 150_000),
+            ),
+        )
+        .unwrap();
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
+        let options = LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        };
+        let messages = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::parse_local_unified_messages_with_pricing_uncached(
+                options,
+                Some(&pricing),
+            ))
+            .unwrap();
+
+        assert_eq!(messages.len(), 2, "the two-call copy wins");
+        assert!(messages.iter().all(|message| {
+            sessions::hermes::message_logged_day(message).is_some()
+                && message.performance_duration_ms().is_some()
+        }));
+        let per_call = 150_000.0 * 3e-6 + 37_500.0 * 15e-6;
+        assert!(messages
+            .iter()
+            .all(|message| { (message.cost - per_call).abs() < 1e-9 }));
     }
 
     #[test]
