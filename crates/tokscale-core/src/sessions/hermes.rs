@@ -17,6 +17,10 @@
 //! (rotated-away calls, or turns that never reach the log) stays on the
 //! session's start day — and a row whose logs over-report its buckets keeps
 //! its whole total on the start day.
+//!
+//! Native delegated-parent links and the latest `messages.timestamp` are read
+//! on the same connection. Last activity is session metadata only: it does not
+//! move accounting timestamps, change day shares, or supply request latency.
 
 use super::utils::{
     lossy_lines, open_readonly_sqlite, resolved_provider, sqlite_for_each_row_on,
@@ -746,6 +750,91 @@ fn has_session_model_usage(db_path: &Path, conn: &Connection) -> bool {
     }
 }
 
+// Read metadata on the parser's existing connection. The newest message is
+// activity evidence, never a reason to move the session's accounting date.
+fn session_metadata(
+    db_path: &Path,
+    conn: &Connection,
+) -> HashMap<String, (Option<String>, Option<i64>)> {
+    let columns = |table: &str| {
+        let mut columns = HashSet::new();
+        sqlite_for_each_row_on(
+            conn,
+            db_path,
+            &format!("PRAGMA table_info({table})"),
+            Some("Hermes metadata schema"),
+            &mut |row| {
+                columns.insert(row.get::<_, String>(1)?);
+                Ok(())
+            },
+        );
+        columns
+    };
+    let session_columns = columns("sessions");
+    let source = if session_columns.contains("source") {
+        "source"
+    } else {
+        "NULL"
+    };
+    let parent = if session_columns.contains("parent_session_id") {
+        "parent_session_id"
+    } else {
+        "NULL"
+    };
+    // Gateway children retain their gateway source. The marker names the
+    // immediate parent; a compression continuation can inherit an older one.
+    let marker = if session_columns.contains("model_config") {
+        "CAST(json_extract(CASE WHEN json_valid(model_config) THEN model_config ELSE '{}' END, '$._delegate_from') AS TEXT)"
+    } else {
+        "NULL"
+    };
+    let query = format!("SELECT id, {source}, {parent}, {marker} FROM sessions");
+    let mut metadata = HashMap::new();
+    sqlite_for_each_row_on(
+        conn,
+        db_path,
+        &query,
+        Some("Hermes parent metadata"),
+        &mut |row| {
+            let id = row.get::<_, String>(0)?;
+            let source = row.get::<_, Option<String>>(1)?;
+            let parent = row.get::<_, Option<String>>(2)?;
+            let marker = row.get::<_, Option<String>>(3)?;
+            let parent = parent
+                .as_deref()
+                .map(str::trim)
+                .filter(|parent| {
+                    !parent.is_empty()
+                        && *parent != id
+                        && marker
+                            .as_deref()
+                            .map_or(source.as_deref() == Some("subagent"), |marker| {
+                                marker == *parent
+                            })
+                })
+                .map(str::to_owned);
+            metadata.insert(id, (parent, None));
+            Ok(())
+        },
+    );
+    let message_columns = columns("messages");
+    if message_columns.contains("session_id") && message_columns.contains("timestamp") {
+        // Match Hermes' coerce_epoch window (hermes_cli/timefmt.py). Filter
+        // before MAX so one corrupt cell cannot hide a valid recent message.
+        sqlite_for_each_row_on(conn, db_path,
+            "SELECT session_id, MAX(timestamp) FROM messages WHERE timestamp BETWEEN 0 AND 4200000000 GROUP BY session_id",
+            Some("Hermes last activity"), &mut |row| {
+                let id = row.get::<_, String>(0)?;
+                let at = row.get::<_, Option<f64>>(1)?;
+                if let Some(entry) = metadata.get_mut(&id) {
+                    entry.1 = at.map(timestamp_secs_to_ms).filter(|at| *at > 0);
+                }
+                Ok(())
+            });
+    }
+    metadata
+}
+
 pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
     parse_hermes_sqlite_in(db_path, &BucketTimezone::Local)
 }
@@ -906,5 +995,12 @@ pub fn parse_hermes_sqlite_in(
         );
     }
 
+    let metadata = session_metadata(db_path, &conn);
+    for message in &mut messages {
+        if let Some((parent, last_active)) = metadata.get(message.session_id.as_str()) {
+            message.parent_session_id = parent.as_deref().map(Into::into);
+            message.hermes_last_active_ms = *last_active;
+        }
+    }
     messages
 }

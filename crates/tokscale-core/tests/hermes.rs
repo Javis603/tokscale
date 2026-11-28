@@ -1984,3 +1984,65 @@ fn test_parse_hermes_sqlite_copies_session_title() {
     assert_eq!(totals.tokens.input, 40);
     assert_eq!(totals.dedup_key.as_deref(), Some("session-totals"));
 }
+
+#[test]
+fn native_metadata_links_gateway_delegation_but_not_inherited_continuations() {
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
+         ALTER TABLE sessions ADD COLUMN model_config TEXT;
+         INSERT INTO sessions (id, source, model, started_at, input_tokens, parent_session_id, model_config) VALUES
+         ('gateway', 'telegram', 'gpt-5', 1775001102, 10, 'parent', '{\"_delegate_from\":\"parent\"}'),
+         ('continued', 'telegram', 'gpt-5', 1775001102, 10, 'gateway', '{\"_delegate_from\":\"parent\"}'),
+         ('sub-continued', 'subagent', 'gpt-5', 1775001102, 10, 'gateway', '{\"_delegate_from\":\"parent\"}'),
+         ('legacy', 'subagent', 'gpt-5', 1775001102, 10, 'parent', NULL),
+         ('malformed', 'subagent', 'gpt-5', 1775001102, 10, 'parent', '{broken'),
+         ('ordinary', 'cli', 'gpt-5', 1775001102, 10, 'parent', '{}');",
+    ).unwrap();
+    let messages = parse_hermes_sqlite(&db_path);
+    let parent = |id: &str| {
+        messages
+            .iter()
+            .find(|message| message.session_id == id)
+            .unwrap()
+            .parent_session_id
+            .as_deref()
+    };
+    assert_eq!(parent("gateway"), Some("parent"));
+    assert_eq!(parent("continued"), None);
+    assert_eq!(parent("sub-continued"), None);
+    assert_eq!(parent("legacy"), Some("parent"));
+    assert_eq!(parent("malformed"), Some("parent"));
+    assert_eq!(parent("ordinary"), None);
+}
+
+#[test]
+fn native_metadata_uses_latest_valid_epoch_before_taking_the_maximum() {
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO sessions (id, source, model, started_at, input_tokens) VALUES
+         ('active', 'cli', 'gpt-5', 1775001102, 10), ('invalid', 'cli', 'gpt-5', 1775001102, 10);
+         CREATE TABLE messages (session_id TEXT, timestamp REAL);
+         INSERT INTO messages VALUES ('active', 1775004702.125), ('active', 1775008302.5),
+          ('active', -1), ('active', 4.2e246), ('active', 'not-a-time'),
+          ('invalid', 4.2e246), ('invalid', 'not-a-time');",
+    )
+    .unwrap();
+    let messages = parse_hermes_sqlite(&db_path);
+    let activity = |id: &str| {
+        messages
+            .iter()
+            .find(|message| message.session_id == id)
+            .unwrap()
+            .hermes_last_active_ms
+    };
+    assert_eq!(activity("active"), Some(1775008302500));
+    assert_eq!(activity("invalid"), None);
+    assert!(messages
+        .iter()
+        .all(|message| message.timestamp == 1775001102000));
+}

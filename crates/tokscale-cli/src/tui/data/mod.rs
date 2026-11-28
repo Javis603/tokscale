@@ -2153,6 +2153,7 @@ mod tests {
             pricing_model_id: None,
             estimate_status: tokscale_core::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
+            hermes_last_active_ms: None,
             claude_entry_uuid: Default::default(),
             machine_label: None,
         };
